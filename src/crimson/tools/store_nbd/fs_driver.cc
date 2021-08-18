@@ -71,7 +71,7 @@ seastar::future<bufferlist> FSDriver::read(
       return seastar::make_ready_future<bufferlist>(std::move(bl));
     }),
     crimson::ct_error::assert_all{"Unrecoverable error in FSDriver::read"}
-  ).then([this, size](auto &&bl) {
+  ).then([size](auto &&bl) {
     if (bl.length() < size) {
       bl.append_zero(size - bl.length());
     }
@@ -159,8 +159,10 @@ seastar::future<> FSDriver::close()
 
 void FSDriver::init()
 {
+  fs.reset();
   fs = FuturizedStore::create(
     config.get_fs_type(),
     *config.path,
-    crimson::common::local_conf().get_config_values());
+    crimson::common::local_conf().get_config_values(),
+    alien);
 }

@@ -44,13 +44,7 @@
 #include <libnl3/netlink/genl/ctrl.h>
 #include <libnl3/netlink/genl/mngt.h>
 
-#if __has_include(<filesystem>)
 #include <filesystem>
-namespace fs = std::filesystem;
-#else
-#include <experimental/filesystem>
-namespace fs = std::experimental::filesystem;
-#endif
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -86,6 +80,9 @@ namespace fs = std::experimental::filesystem;
 #undef dout_prefix
 #define dout_prefix *_dout << "rbd-nbd: "
 
+using namespace std;
+namespace fs = std::filesystem;
+
 using boost::endian::big_to_native;
 using boost::endian::native_to_big;
 
@@ -105,6 +102,7 @@ struct Config {
   int reattach_timeout = 30;
 
   bool exclusive = false;
+  bool notrim = false;
   bool quiesce = false;
   bool readonly = false;
   bool set_max_part = false;
@@ -155,6 +153,7 @@ static void usage()
             << "                                (possible values: luks1, luks2)\n"
             << "  --encryption-passphrase-file  Path of file containing passphrase for unlocking image encryption\n"
             << "  --exclusive                   Forbid writes by other clients\n"
+            << "  --notrim                      Turn off trim/discard\n"
             << "  --io-timeout <sec>            Set nbd IO timeout\n"
             << "  --max_part <limit>            Override for module param max_part\n"
             << "  --nbds_max <limit>            Override for module param nbds_max\n"
@@ -1695,7 +1694,10 @@ static int do_map(int argc, const char *argv[], Config *cfg, bool reconnect)
   if (r < 0)
     goto close_fd;
 
-  flags = NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM | NBD_FLAG_HAS_FLAGS;
+  flags = NBD_FLAG_SEND_FLUSH | NBD_FLAG_HAS_FLAGS;
+  if (!cfg->notrim) {
+    flags |= NBD_FLAG_SEND_TRIM;
+  }
   if (!cfg->snapname.empty() || cfg->readonly) {
     flags |= NBD_FLAG_READ_ONLY;
     read_only = 1;
@@ -2036,6 +2038,8 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
       }
     } else if (ceph_argparse_flag(args, i, "--exclusive", (char *)NULL)) {
       cfg->exclusive = true;
+    } else if (ceph_argparse_flag(args, i, "--notrim", (char *)NULL)) {
+      cfg->notrim = true;
     } else if (ceph_argparse_witharg(args, i, &cfg->io_timeout, err,
                                      "--timeout", (char *)NULL)) {
       if (!err.str().empty()) {

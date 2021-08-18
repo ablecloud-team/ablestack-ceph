@@ -73,8 +73,8 @@ curl-based installation
 
 * Although the standalone script is sufficient to get a cluster started, it is
   convenient to have the ``cephadm`` command installed on the host.  To install
-  the packages that provide the ``cephadm`` command for the Octopus release,
-  run the following commands:
+  the packages that provide the ``cephadm`` command, run the following
+  commands:
 
   .. prompt:: bash #
      :substitutions:
@@ -172,6 +172,11 @@ immediately to know more about ``cephadm bootstrap``, read the list below.
 
 Also, you can run ``cephadm bootstrap -h`` to see all of ``cephadm``'s
 available options.
+
+* By default, Ceph daemons send their log output to stdout/stderr, which is picked
+  up by the container runtime (docker or podman) and (on most systems) sent to
+  journald.  If you want Ceph to write traditional log files to ``/var/log/ceph/$fsid``,
+  use ``--log-to-file`` option during bootstrap.
 
 * Larger Ceph clusters perform better when (external to the Ceph cluster)
   public network traffic is separated from (internal to the Ceph cluster)

@@ -76,6 +76,9 @@
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, mds)
+
+using namespace std;
+
 static ostream& _prefix(std::ostream *_dout, MDSRank *mds) {
   return *_dout << "mds." << mds->get_nodeid() << ".cache ";
 }
@@ -441,6 +444,8 @@ void MDCache::create_empty_hierarchy(MDSGather *gather)
   rootdir->commit(0, gather->new_sub());
 
   root->store(gather->new_sub());
+  root->mark_dirty_parent(mds->mdlog->get_current_segment(), true);
+  root->store_backtrace(gather->new_sub());
 }
 
 void MDCache::create_mydir_hierarchy(MDSGather *gather)
@@ -5325,7 +5330,7 @@ void MDCache::rejoin_open_ino_finish(inodeno_t ino, int ret)
   cap_imports_num_opening--;
 
   if (cap_imports_num_opening == 0) {
-    if (rejoin_gather.empty())
+    if (rejoin_gather.empty() && rejoin_ack_gather.count(mds->get_nodeid()))
       rejoin_gather_finish();
     else if (rejoin_gather.count(mds->get_nodeid()))
       process_imported_caps();
@@ -5347,7 +5352,7 @@ void MDCache::rejoin_open_sessions_finish(map<client_t,pair<Session*,uint64_t> >
   dout(10) << "rejoin_open_sessions_finish" << dendl;
   mds->server->finish_force_open_sessions(session_map);
   rejoin_session_map.swap(session_map);
-  if (rejoin_gather.empty())
+  if (rejoin_gather.empty() && rejoin_ack_gather.count(mds->get_nodeid()))
     rejoin_gather_finish();
 }
 
@@ -5971,7 +5976,7 @@ bool MDCache::open_undef_inodes_dirfrags()
   MDSGatherBuilder gather(g_ceph_context,
       new MDSInternalContextWrapper(mds,
 	new LambdaContext([this](int r) {
-	    if (rejoin_gather.empty())
+	    if (rejoin_gather.empty() && rejoin_ack_gather.count(mds->get_nodeid()))
 	      rejoin_gather_finish();
 	  })
 	)
@@ -6360,14 +6365,19 @@ void MDCache::identify_files_to_recover()
 
 void MDCache::start_files_to_recover()
 {
+  int count = 0;
   for (CInode *in : rejoin_check_q) {
     if (in->filelock.get_state() == LOCK_XLOCKSNAP)
       mds->locker->issue_caps(in);
     mds->locker->check_inode_max_size(in);
+    if (!(++count % 1000))
+      mds->heartbeat_reset();
   }
   rejoin_check_q.clear();
   for (CInode *in : rejoin_recover_q) {
     mds->locker->file_recover(&in->filelock);
+    if (!(++count % 1000))
+      mds->heartbeat_reset();
   }
   if (!rejoin_recover_q.empty()) {
     rejoin_recover_q.clear();
@@ -8147,7 +8157,7 @@ int MDCache::path_traverse(MDRequestRef& mdr, MDSContextFactory& cf,
   if (mdr)
     mdr->snapid = snapid;
 
-  client_t client = (mdr && mdr->reqid.name.is_client()) ? mdr->reqid.name.num() : -1;
+  client_t client = mdr ? mdr->get_client() : -1;
 
   if (mds->logger) mds->logger->inc(l_mds_traverse);
 
@@ -8648,7 +8658,7 @@ void MDCache::open_remote_dentry(CDentry *dn, bool projected, MDSContext *fin, b
   dout(10) << "open_remote_dentry " << *dn << dendl;
   CDentry::linkage_t *dnl = projected ? dn->get_projected_linkage() : dn->get_linkage();
   inodeno_t ino = dnl->get_remote_ino();
-  int64_t pool = dnl->get_remote_d_type() == DT_DIR ? mds->mdsmap->get_metadata_pool() : -1;
+  int64_t pool = dnl->get_remote_d_type() == DT_DIR ? mds->get_metadata_pool() : -1;
   open_ino(ino, pool,
       new C_MDC_OpenRemoteDentry(this, dn, ino, fin, want_xlocked), true, want_xlocked); // backtrace
 }
@@ -8778,7 +8788,7 @@ void MDCache::_open_ino_backtrace_fetched(inodeno_t ino, bufferlist& bl, int err
       return;
     }
   } else if (err == -CEPHFS_ENOENT) {
-    int64_t meta_pool = mds->mdsmap->get_metadata_pool();
+    int64_t meta_pool = mds->get_metadata_pool();
     if (info.pool != meta_pool) {
       dout(10) << " no object in pool " << info.pool
 	       << ", retrying pool " << meta_pool << dendl;
@@ -9023,7 +9033,7 @@ void MDCache::do_open_ino(inodeno_t ino, open_ino_info_t& info, int err)
   } else {
     ceph_assert(!info.ancestors.empty());
     info.checking = mds->get_nodeid();
-    open_ino(info.ancestors[0].dirino, mds->mdsmap->get_metadata_pool(),
+    open_ino(info.ancestors[0].dirino, mds->get_metadata_pool(),
 	     new C_MDC_OpenInoParentOpened(this, ino), info.want_replica);
   }
 }
@@ -11949,7 +11959,7 @@ void MDCache::_fragment_committed(dirfrag_t basedirfrag, const MDRequestRef& mdr
       mds->finisher));
 
   SnapContext nullsnapc;
-  object_locator_t oloc(mds->mdsmap->get_metadata_pool());
+  object_locator_t oloc(mds->get_metadata_pool());
   for (const auto& fg : uf.old_frags) {
     object_t oid = CInode::get_object_name(basedirfrag.ino, fg, "");
     ObjectOperation op;
@@ -12513,21 +12523,21 @@ void MDCache::dump_tree(CInode *in, const int cur_depth, const int max_depth, Fo
   f->close_section();
 }
 
-int MDCache::dump_cache(std::string_view file_name)
+int MDCache::dump_cache(std::string_view file_name, double timeout)
 {
-  return dump_cache(file_name, NULL);
+  return dump_cache(file_name, NULL, timeout);
 }
 
-int MDCache::dump_cache(Formatter *f)
+int MDCache::dump_cache(Formatter *f, double timeout)
 {
-  return dump_cache(std::string_view(""), f);
+  return dump_cache(std::string_view(""), f, timeout);
 }
 
 /**
  * Dump the metadata cache, either to a Formatter, if
  * provided, else to a plain text file.
  */
-int MDCache::dump_cache(std::string_view fn, Formatter *f)
+int MDCache::dump_cache(std::string_view fn, Formatter *f, double timeout)
 {
   int r = 0;
 
@@ -12613,22 +12623,50 @@ int MDCache::dump_cache(std::string_view fn, Formatter *f)
     return 1;
   };
 
+  auto start = mono_clock::now();
+  int64_t count = 0;
   for (auto &p : inode_map) {
     r = dump_func(p.second);
     if (r < 0)
       goto out;
+    if (!(++count % 1000) &&
+	timeout > 0 &&
+	std::chrono::duration<double>(mono_clock::now() - start).count() > timeout) {
+      r = -ETIMEDOUT;
+      goto out;
+    }
   }
   for (auto &p : snap_inode_map) {
     r = dump_func(p.second);
     if (r < 0)
       goto out;
+    if (!(++count % 1000) &&
+		timeout > 0 &&
+	std::chrono::duration<double>(mono_clock::now() - start).count() > timeout) {
+      r = -ETIMEDOUT;
+      goto out;
+    }
+
   }
   r = 0;
 
  out:
   if (f) {
+    if (r == -ETIMEDOUT)
+    {
+      f->close_section();
+      f->open_object_section("result");
+      f->dump_string("error", "the operation timeout");
+    }
     f->close_section();  // inodes
   } else {
+    if (r == -ETIMEDOUT)
+    {
+      CachedStackStringStream css;
+      *css << "error : the operation timeout" << std::endl;
+      auto sv = css->strv();
+      r = safe_write(fd, sv.data(), sv.size());
+    }
     ::close(fd);
   }
   return r;

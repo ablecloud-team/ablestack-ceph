@@ -8,7 +8,7 @@
 
 namespace {
   seastar::logger& logger() {
-    return crimson::get_logger(ceph_subsys_filestore);
+    return crimson::get_logger(ceph_subsys_seastore);
   }
 }
 
@@ -143,6 +143,23 @@ void SpaceTrackerDetailed::dump_usage(segment_id_t id) const
   segment_usage[id].dump_usage(block_size);
 }
 
+SegmentCleaner::SegmentCleaner(config_t config, bool detailed)
+  : detailed(detailed),
+    config(config),
+    gc_process(*this)
+{
+  register_metrics();
+}
+
+void SegmentCleaner::register_metrics()
+{
+  namespace sm = seastar::metrics;
+  metrics.add_group("segment_cleaner", {
+    sm::make_counter("segments_released", stats.segments_released,
+		     sm::description("total number of extents released by SegmentCleaner")),
+  });
+}
+
 SegmentCleaner::get_segment_ret SegmentCleaner::get_segment()
 {
   for (size_t i = 0; i < segments.size(); ++i) {
@@ -203,14 +220,15 @@ SegmentCleaner::rewrite_dirty_ret SegmentCleaner::rewrite_dirty(
   Transaction &t,
   journal_seq_t limit)
 {
-  return ecb->get_next_dirty_extents(
-    limit,
-    config.journal_rewrite_per_cycle
-  ).then([=, &t](auto dirty_list) {
+  return trans_intr::make_interruptible(
+    ecb->get_next_dirty_extents(
+      limit,
+      config.journal_rewrite_per_cycle)
+  ).then_interruptible([=, &t](auto dirty_list) {
     return seastar::do_with(
       std::move(dirty_list),
       [this, &t](auto &dirty_list) {
-	return crimson::do_for_each(
+	return trans_intr::do_for_each(
 	  dirty_list,
 	  [this, &t](auto &e) {
 	    logger().debug(
@@ -263,18 +281,15 @@ SegmentCleaner::gc_cycle_ret SegmentCleaner::do_gc_cycle()
 
 SegmentCleaner::gc_trim_journal_ret SegmentCleaner::gc_trim_journal()
 {
-  return repeat_eagain(
-    [this] {
-      return seastar::do_with(
-	ecb->create_transaction(),
-	[this](auto &t) {
-	  return rewrite_dirty(*t, get_dirty_tail()
-	  ).safe_then([this, &t] {
-	    return ecb->submit_transaction_direct(
-	      std::move(t));
-	  });
-	});
+  return repeat_eagain([this] {
+    return ecb->with_transaction_intr(
+        Transaction::src_t::CLEANER, [this](auto& t) {
+      return rewrite_dirty(t, get_dirty_tail()
+      ).si_then([this, &t] {
+        return ecb->submit_transaction_direct(t);
+      });
     });
+  });
 }
 
 SegmentCleaner::gc_reclaim_space_ret SegmentCleaner::gc_reclaim_space()
@@ -303,54 +318,53 @@ SegmentCleaner::gc_reclaim_space_ret SegmentCleaner::gc_reclaim_space()
     config.reclaim_bytes_stride
   ).safe_then([this](auto &&_extents) {
     return seastar::do_with(
-      std::move(_extents),
-      [this](auto &extents) {
-	return repeat_eagain([this, &extents]() mutable {
-	  logger().debug(
-	    "SegmentCleaner::gc_reclaim_space: processing {} extents",
-	    extents.size());
-	  return seastar::do_with(
-	    ecb->create_transaction(),
-	    [this, &extents](auto &t) mutable {
-	      return crimson::do_for_each(
-		extents,
-		[this, &t](auto &extent) {
-		  auto &[addr, info] = extent;
-		  logger().debug(
-		    "SegmentCleaner::gc_reclaim_space: checking extent {}",
-		    info);
-		  return ecb->get_extent_if_live(
-		    *t,
-		    info.type,
-		    addr,
-		    info.addr,
-		    info.len
-		  ).safe_then([addr=addr, &t, this](CachedExtentRef ext) {
-		    if (!ext) {
-		      logger().debug(
-			"SegmentCleaner::gc_reclaim_space: addr {} dead, skipping",
-			addr);
-		      return ExtentCallbackInterface::rewrite_extent_ertr::now();
-		    } else {
-		      logger().debug(
-			"SegmentCleaner::gc_reclaim_space: addr {} alive, gc'ing {}",
-			addr,
-			*ext);
-		      return ecb->rewrite_extent(
-			*t,
-			ext);
-		    }
-		  });
-		}
-	      ).safe_then([this, &t] {
-		if (scan_cursor->is_complete()) {
-		  t->mark_segment_to_release(scan_cursor->get_offset().segment);
-		}
-		return ecb->submit_transaction_direct(std::move(t));
-	      });
-	    });
-	});
+        std::move(_extents),
+        [this](auto &extents) {
+      return repeat_eagain([this, &extents]() mutable {
+        logger().debug(
+          "SegmentCleaner::gc_reclaim_space: processing {} extents",
+          extents.size());
+        return ecb->with_transaction_intr(
+            Transaction::src_t::CLEANER,
+            [this, &extents](auto& t) {
+          return trans_intr::do_for_each(
+              extents,
+              [this, &t](auto &extent) {
+            auto &[addr, info] = extent;
+            logger().debug(
+              "SegmentCleaner::gc_reclaim_space: checking extent {}",
+              info);
+            return ecb->get_extent_if_live(
+              t,
+              info.type,
+              addr,
+              info.addr,
+              info.len
+            ).si_then([addr=addr, &t, this](CachedExtentRef ext) {
+              if (!ext) {
+                logger().debug(
+                  "SegmentCleaner::gc_reclaim_space: addr {} dead, skipping",
+                  addr);
+                return ExtentCallbackInterface::rewrite_extent_iertr::now();
+              } else {
+                logger().debug(
+                  "SegmentCleaner::gc_reclaim_space: addr {} alive, gc'ing {}",
+                  addr,
+                  *ext);
+                return ecb->rewrite_extent(
+                  t,
+                  ext);
+              }
+            });
+          }).si_then([this, &t] {
+            if (scan_cursor->is_complete()) {
+              t.mark_segment_to_release(scan_cursor->get_offset().segment);
+            }
+            return ecb->submit_transaction_direct(t);
+          });
+        });
       });
+    });
   }).safe_then([this] {
     if (scan_cursor->is_complete()) {
       scan_cursor.reset();

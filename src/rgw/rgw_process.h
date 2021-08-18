@@ -44,7 +44,7 @@ class RGWFrontendConfig;
 class RGWRequest;
 
 class RGWProcess {
-  deque<RGWRequest*> m_req_queue;
+  std::deque<RGWRequest*> m_req_queue;
 protected:
   CephContext *cct;
   rgw::sal::Store* store;
@@ -137,24 +137,6 @@ public:
   }
 }; /* RGWProcess */
 
-class RGWFCGXProcess : public RGWProcess {
-  int max_connections;
-public:
-
-  /* have a bit more connections than threads so that requests are
-   * still accepted even if we're still processing older requests */
-  RGWFCGXProcess(CephContext* const cct,
-                 RGWProcessEnv* const pe,
-                 const int num_threads,
-                 RGWFrontendConfig* const conf)
-    : RGWProcess(cct, pe, num_threads, conf),
-      max_connections(num_threads + (num_threads >> 3)) {
-  }
-
-  void run() override;
-  void handle_request(const DoutPrefixProvider *dpp, RGWRequest* req) override;
-};
-
 class RGWProcessControlThread : public Thread {
   RGWProcess *pprocess;
 public:
@@ -175,7 +157,7 @@ public:
   void run() override;
   void checkpoint();
   void handle_request(const DoutPrefixProvider *dpp, RGWRequest* req) override;
-  void gen_request(const string& method, const string& resource,
+  void gen_request(const std::string& method, const std::string& resource,
 		  int content_length, std::atomic<bool>* fail_flag);
 
   void set_access_key(RGWAccessKey& key) { access_key = key; }

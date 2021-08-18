@@ -59,8 +59,6 @@ class ShardServices : public md_config_obs_t {
   const char** get_tracked_conf_keys() const final;
   void handle_conf_change(const ConfigProxy& conf,
                           const std::set <std::string> &changed) final;
-  template<class MsgT>
-  seastar::future<> do_send_to_osd(int peer, MsgT m, epoch_t from_epoch);
 
 public:
   ShardServices(
@@ -71,11 +69,6 @@ public:
     crimson::mon::Client &monc,
     crimson::mgr::Client &mgrc,
     crimson::os::FuturizedStore &store);
-
-  seastar::future<> send_to_osd(
-    int peer,
-    MessageRef m,
-    epoch_t from_epoch);
 
   seastar::future<> send_to_osd(
     int peer,
@@ -154,11 +147,11 @@ private:
     std::vector<int> acting;
     bool forced = false;
   };
-  map<pg_t, pg_temp_t> pg_temp_wanted;
-  map<pg_t, pg_temp_t> pg_temp_pending;
+  std::map<pg_t, pg_temp_t> pg_temp_wanted;
+  std::map<pg_t, pg_temp_t> pg_temp_pending;
   friend std::ostream& operator<<(std::ostream&, const pg_temp_t&);
 public:
-  void queue_want_pg_temp(pg_t pgid, const vector<int>& want,
+  void queue_want_pg_temp(pg_t pgid, const std::vector<int>& want,
 			  bool forced = false);
   void remove_want_pg_temp(pg_t pgid);
   void requeue_pg_temp();
@@ -173,7 +166,7 @@ public:
 
   // PG Created State
 private:
-  set<pg_t> pg_created;
+  std::set<pg_t> pg_created;
 public:
   seastar::future<> send_pg_created(pg_t pgid);
   seastar::future<> send_pg_created();

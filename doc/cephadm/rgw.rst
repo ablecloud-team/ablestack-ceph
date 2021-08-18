@@ -82,6 +82,41 @@ something like:
 See :ref:`orchestrator-cli-placement-spec` for details of the placement
 specification.  See :ref:`multisite` for more information of setting up multisite RGW.
 
+Setting up HTTPS
+----------------
+
+In order to enable HTTPS for RGW services, apply a spec file following this scheme:
+
+.. code-block:: yaml
+
+  service_type: rgw
+  service_id: myrgw
+  spec:
+    rgw_frontend_ssl_certificate: | 
+      -----BEGIN PRIVATE KEY-----
+      V2VyIGRhcyBsaWVzdCBpc3QgZG9vZi4gTG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFt
+      ZXQsIGNvbnNldGV0dXIgc2FkaXBzY2luZyBlbGl0ciwgc2VkIGRpYW0gbm9udW15
+      IGVpcm1vZCB0ZW1wb3IgaW52aWR1bnQgdXQgbGFib3JlIGV0IGRvbG9yZSBtYWdu
+      YSBhbGlxdXlhbSBlcmF0LCBzZWQgZGlhbSB2b2x1cHR1YS4gQXQgdmVybyBlb3Mg
+      ZXQgYWNjdXNhbSBldCBqdXN0byBkdW8=
+      -----END PRIVATE KEY-----
+      -----BEGIN CERTIFICATE-----
+      V2VyIGRhcyBsaWVzdCBpc3QgZG9vZi4gTG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFt
+      ZXQsIGNvbnNldGV0dXIgc2FkaXBzY2luZyBlbGl0ciwgc2VkIGRpYW0gbm9udW15
+      IGVpcm1vZCB0ZW1wb3IgaW52aWR1bnQgdXQgbGFib3JlIGV0IGRvbG9yZSBtYWdu
+      YSBhbGlxdXlhbSBlcmF0LCBzZWQgZGlhbSB2b2x1cHR1YS4gQXQgdmVybyBlb3Mg
+      ZXQgYWNjdXNhbSBldCBqdXN0byBkdW8=
+      -----END CERTIFICATE-----
+    ssl: true
+
+Then apply this yaml document:
+
+.. prompt:: bash #
+
+  ceph orch apply -i myrgw.yaml
+
+Note the value of ``rgw_frontend_ssl_certificate`` is a literal string as
+indicated by a ``|`` character preserving newline characters. 
 
 .. _orchestrator-haproxy-service-spec:
 
@@ -112,18 +147,21 @@ elected as master, and the virtual IP will be moved to that node.
 The active haproxy acts like a load balancer, distributing all RGW requests
 between all the RGW daemons available.
 
-**Prerequisites:**
+Prerequisites
+-------------
 
 * An existing RGW service, without SSL.  (If you want SSL service, the certificate
   should be configured on the ingress service, not the RGW service.)
 
-**Deploy of the high availability service for RGW**
+Deploying
+---------
 
 Use the command::
 
     ceph orch apply -i <ingress_spec_file>
 
-**Service specification file:**
+Service specification
+---------------------
 
 It is a yaml format file with the following properties:
 
@@ -171,7 +209,10 @@ where the properties of this service specification are:
     SSL certificate, if SSL is to be enabled. This must contain the both the certificate and
     private key blocks in .pem format.
 
-**Selecting ethernet interfaces for the virtual IP:**
+.. _ingress-virtual-ip:
+
+Selecting ethernet interfaces for the virtual IP
+------------------------------------------------
 
 You cannot simply provide the name of the network interface on which
 to configure the virtual IP because interface names tend to vary
@@ -204,7 +245,8 @@ configuring a "dummy" IP address is an unroutable network on the correct interfa
 and reference that dummy network in the networks list (see above).
 
 
-**Useful hints for ingress:**
+Useful hints for ingress
+------------------------
 
-* Good to have at least 3 RGW daemons
-* Use at least 3 hosts for the ingress
+* It is good to have at least 3 RGW daemons.
+* We recommend at least 3 hosts for the ingress service.

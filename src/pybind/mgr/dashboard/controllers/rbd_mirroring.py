@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-from __future__ import absolute_import
 
 import json
 import logging
 import re
 from functools import partial
+from typing import no_type_check
 
 import cherrypy
 import rbd
@@ -18,12 +18,6 @@ from ..tools import ViewCache
 from . import ApiController, BaseController, ControllerDoc, Endpoint, \
     EndpointDoc, ReadPermission, RESTController, Task, UpdatePermission, \
     allow_empty_body
-
-try:
-    from typing import no_type_check
-except ImportError:
-    no_type_check = object()  # Just for type checking
-
 
 logger = logging.getLogger('controllers.rbd_mirror')
 

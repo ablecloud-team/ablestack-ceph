@@ -600,7 +600,7 @@ Options
 
 .. option:: --max-entries=<entries>
 
-	Optional for listing operations to specify the max entires
+	Optional for listing operations to specify the max entries.
 
 .. option:: --purge-data
 
@@ -805,7 +805,7 @@ Options
 
 .. option:: --caps=<caps>
 
-	List of caps (e.g., "usage=read, write; user=read".
+	List of caps (e.g., "usage=read, write; user=read").
 
 .. option:: --compression=<compression-algorithm>
 

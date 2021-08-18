@@ -30,15 +30,14 @@
 %bcond_without tcmalloc
 %endif
 %bcond_with system_pmdk
-%if 0%{?fedora} || 0%{?rhel}
-%bcond_without selinux
-%ifarch x86_64 ppc64le
-%bcond_without rbd_rwl_cache
 %bcond_without rbd_ssd_cache
+%ifarch x86_64
+%bcond_without rbd_rwl_cache
 %else
 %bcond_with rbd_rwl_cache
-%bcond_with rbd_ssd_cache
 %endif
+%if 0%{?fedora} || 0%{?rhel}
+%bcond_without selinux
 %if 0%{?rhel} >= 8
 %bcond_with cephfs_java
 %else
@@ -60,12 +59,8 @@
 %bcond_with libradosstriper
 %ifarch x86_64 aarch64 ppc64le
 %bcond_without lttng
-%bcond_without rbd_rwl_cache
-%bcond_without rbd_ssd_cache
 %else
 %bcond_with lttng
-%bcond_with rbd_rwl_cache
-%bcond_with rbd_ssd_cache
 %endif
 %bcond_with ocf
 %bcond_with selinux
@@ -117,8 +112,6 @@
 %{!?python3_version_nodots: %global python3_version_nodots 3}
 %{!?python3_version: %global python3_version 3}
 
-# disable dwz which compresses the debuginfo
-%global _find_debuginfo_dwz_opts %{nil}
 %if ! 0%{?suse_version}
 # use multi-threaded xz compression: xz level 7 using ncpus threads
 %global _source_payload w7T%{_smp_build_ncpus}.xzdio
@@ -127,7 +120,7 @@
 
 %define smp_limit_mem_per_job() %( \
   kb_per_job=%1 \
-  kb_total=$(head -1 /proc/meminfo | sed 's/MemTotal:\\s*\\(.*\\) kB.*/\\1/') \
+  kb_total=$(head -3 /proc/meminfo | sed -n 's/MemAvailable:\\s*\\(.*\\) kB.*/\\1/p') \
   jobs=$(( $kb_total / $kb_per_job )) \
   [ $jobs -lt 1 ] && jobs=1 \
   echo $jobs )
@@ -137,8 +130,11 @@
 # 32-bit builds can use 3G memory max, which is not enough even for -j2
 %global _smp_ncpus_max 1
 %else
-# 2.5 GiB mem per job
-%global _smp_ncpus_max %{smp_limit_mem_per_job 2500000}
+# 3.0 GiB mem per job
+# SUSE distros use limit_build in the place of smp_limit_mem_per_job, please
+# be sure to update it (in the build section, below) as well when changing this
+# number.
+%global _smp_ncpus_max %{smp_limit_mem_per_job 3000000}
 %endif
 %endif
 
@@ -187,7 +183,7 @@ BuildRequires:	gperf
 BuildRequires:  cmake > 3.5
 BuildRequires:	cryptsetup
 BuildRequires:	fuse-devel
-%if 0%{with seastar}
+%if 0%{with seastar} && 0%{?rhel}
 BuildRequires:	gcc-toolset-9-gcc-c++ >= 9.2.1-2.3
 %else
 BuildRequires:	gcc-c++
@@ -211,7 +207,7 @@ BuildRequires:	libblkid-devel >= 2.17
 BuildRequires:	cryptsetup-devel
 BuildRequires:	libcurl-devel
 BuildRequires:	libcap-ng-devel
-BuildRequires:	fmt-devel >= 5.2.1
+BuildRequires:	fmt-devel >= 6.2.1
 BuildRequires:	pkgconfig(libudev)
 BuildRequires:	libnl3-devel
 BuildRequires:	liboath-devel
@@ -241,6 +237,9 @@ BuildRequires:	xfsprogs-devel
 BuildRequires:	xmlstarlet
 BuildRequires:	nasm
 BuildRequires:	lua-devel
+%if 0%{with seastar} || 0%{with jaeger}
+BuildRequires:  yaml-cpp-devel >= 0.6
+%endif
 %if 0%{with amqp_endpoint}
 BuildRequires:  librabbitmq-devel
 %endif
@@ -258,7 +257,6 @@ BuildRequires:	python%{python3_pkgversion}-nose
 BuildRequires:	python%{python3_pkgversion}-pecan
 BuildRequires:	python%{python3_pkgversion}-requests
 BuildRequires:	python%{python3_pkgversion}-dateutil
-BuildRequires:	python%{python3_pkgversion}-virtualenv
 BuildRequires:	python%{python3_pkgversion}-coverage
 BuildRequires:	python%{python3_pkgversion}-pyOpenSSL
 BuildRequires:	socat
@@ -269,6 +267,7 @@ BuildRequires:  libzbd-devel
 %if 0%{with jaeger}
 BuildRequires:  bison
 BuildRequires:  flex
+BuildRequires:  thrift-devel >= 0.13.0
 %if 0%{?fedora} || 0%{?rhel}
 BuildRequires:  json-devel
 %endif
@@ -276,7 +275,6 @@ BuildRequires:  json-devel
 BuildRequires:  nlohmann_json-devel
 %endif
 BuildRequires:  libevent-devel
-BuildRequires:  yaml-cpp-devel
 %endif
 %if 0%{with system_pmdk}
 BuildRequires:  libpmem-devel
@@ -288,10 +286,8 @@ BuildRequires:  gnutls-devel
 BuildRequires:  hwloc-devel
 BuildRequires:  libpciaccess-devel
 BuildRequires:  lksctp-tools-devel
-BuildRequires:  protobuf-devel
 BuildRequires:  ragel
 BuildRequires:  systemtap-sdt-devel
-BuildRequires:  yaml-cpp-devel
 %if 0%{?fedora}
 BuildRequires:  libubsan
 BuildRequires:  libasan
@@ -354,6 +350,7 @@ BuildRequires:	lz4-devel >= 1.7
 %if 0%{with make_check}
 %if 0%{?fedora} || 0%{?rhel}
 BuildRequires:	golang-github-prometheus
+BuildRequires:	jsonnet
 BuildRequires:	libtool-ltdl-devel
 BuildRequires:	ninja-build
 BuildRequires:	xmlsec1
@@ -372,6 +369,7 @@ BuildRequires:	python%{python3_pkgversion}-pyOpenSSL
 %endif
 %if 0%{?suse_version}
 BuildRequires:	golang-github-prometheus-prometheus
+BuildRequires:	jsonnet
 BuildRequires:	libxmlsec1-1
 BuildRequires:	libxmlsec1-nss1
 BuildRequires:	libxmlsec1-openssl1
@@ -410,7 +408,6 @@ BuildRequires:  redhat-rpm-config
 %if 0%{?fedora} || 0%{?rhel}
 BuildRequires:  cryptopp-devel
 BuildRequires:  numactl-devel
-BuildRequires:  protobuf-compiler
 %endif
 %if 0%{?suse_version}
 BuildRequires:  libcryptopp-devel
@@ -450,7 +447,6 @@ Requires:      grep
 Requires:      logrotate
 Requires:      parted
 Requires:      psmisc
-Requires:      python%{python3_pkgversion}-setuptools
 Requires:      util-linux
 Requires:      xfsprogs
 Requires:      which
@@ -810,6 +806,8 @@ Requires:	lvm2
 Requires:	sudo
 Requires:	libstoragemgmt
 Requires:	python%{python3_pkgversion}-ceph-common = %{_epoch_prefix}%{version}-%{release}
+Requires:	python%{python3_pkgversion}-setuptools
+
 %if 0%{?weak_deps}
 Recommends:	nvme-cli
 %if 0%{?suse_version}
@@ -1065,7 +1063,6 @@ Group:		System/Libraries
 %endif
 Provides: 	libjaegertracing.so.0()(64bit)
 Provides:	libopentracing.so.1()(64bit)
-Provides:	libthrift.so.0.13.0()(64bit)
 %description -n libjaeger
 This package contains libraries needed to provide distributed
 tracing for Ceph.
@@ -1237,9 +1234,11 @@ This package provides Ceph default alerts for Prometheus.
 %autosetup -p1 -n @TARBALL_BASENAME@
 
 %build
-# LTO can be enabled as soon as the following GCC bug is fixed:
-# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=48200
+# Disable lto on systems that do not support symver attribute
+# See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=48200 for details
+%if ( 0%{?rhel} && 0%{?rhel} < 9 ) || ( 0%{?suse_version} && 0%{?suse_version} <= 1500 )
 %define _lto_cflags %{nil}
+%endif
 
 %if 0%{with seastar} && 0%{?rhel}
 . /opt/rh/gcc-toolset-9/enable
@@ -1253,7 +1252,7 @@ done
 %endif
 
 %if 0%{?suse_version}
-%limit_build -m 2600
+%limit_build -m 3000
 %endif
 
 export CPPFLAGS="$java_inc"
@@ -1342,10 +1341,16 @@ cmake .. \
 %if 0%{with system_pmdk}
     -DWITH_SYSTEM_PMDK:BOOL=ON \
 %endif
+%if 0%{with jaeger}
+    -DWITH_JAEGER:BOOL=ON \
+%endif
 %if 0%{?suse_version}
     -DBOOST_J:STRING=%{jobs} \
 %else
     -DBOOST_J:STRING=%{_smp_build_ncpus} \
+%endif
+%if 0%{?rhel}
+    -DWITH_FMT_HEADER_ONLY:BOOL=ON \
 %endif
     -DWITH_GRAFANA:BOOL=ON
 
@@ -1498,10 +1503,6 @@ rm -rf %{buildroot}
 %{_fillupdir}/sysconfig.*
 %endif
 %{_unitdir}/ceph.target
-%dir %{python3_sitelib}/ceph_volume
-%{python3_sitelib}/ceph_volume/*
-%{python3_sitelib}/ceph_volume-*
-%{_mandir}/man8/ceph-deploy.8*
 %{_mandir}/man8/ceph-create-keys.8*
 %{_mandir}/man8/ceph-run.8*
 %{_mandir}/man8/crushtool.8*
@@ -2010,9 +2011,8 @@ fi
 %endif
 
 %postun immutable-object-cache
-test -n "$FIRST_ARG" || FIRST_ARG=$1
 %systemd_postun ceph-immutable-object-cache@\*.service ceph-immutable-object-cache.target
-if [ $FIRST_ARG -ge 1 ] ; then
+if [ $1 -ge 1 ] ; then
   # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
   # "yes". In any case: if units are not running, do not touch them.
   SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
@@ -2092,6 +2092,9 @@ fi
 %{_libexecdir}/ceph/ceph-osd-prestart.sh
 %{_sbindir}/ceph-volume
 %{_sbindir}/ceph-volume-systemd
+%dir %{python3_sitelib}/ceph_volume
+%{python3_sitelib}/ceph_volume/*
+%{python3_sitelib}/ceph_volume-*
 %{_mandir}/man8/ceph-clsinfo.8*
 %{_mandir}/man8/ceph-osd.8*
 %{_mandir}/man8/ceph-bluestore-tool.8*
@@ -2293,7 +2296,6 @@ fi
 %if %{with jaeger}
 %files -n libjaeger
 %{_libdir}/libopentracing.so.*
-%{_libdir}/libthrift.so.*
 %{_libdir}/libjaegertracing.so.*
 %post -n libjaeger -p /sbin/ldconfig
 %postun -n libjaeger -p /sbin/ldconfig
@@ -2329,7 +2331,6 @@ fi
 %files -n ceph-test
 %{_bindir}/ceph-client-debug
 %{_bindir}/ceph_bench_log
-%{_bindir}/ceph_kvstorebench
 %{_bindir}/ceph_multi_stress_watch
 %{_bindir}/ceph_erasure_code_benchmark
 %{_bindir}/ceph_omapbench
@@ -2402,13 +2403,21 @@ if diff ${FILE_CONTEXT} ${FILE_CONTEXT}.pre > /dev/null 2>&1; then
    exit 0
 fi
 
+# Stop ceph.target while relabeling if CEPH_AUTO_RESTART_ON_UPGRADE=yes
+SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
+if [ -f $SYSCONF_CEPH -a -r $SYSCONF_CEPH ] ; then
+    source $SYSCONF_CEPH
+fi
+
 # Check whether the daemons are running
 /usr/bin/systemctl status ceph.target > /dev/null 2>&1
 STATUS=$?
 
 # Stop the daemons if they were running
 if test $STATUS -eq 0; then
-    /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+    if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+        /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+    fi
 fi
 
 # Relabel the files fix for first package install
@@ -2420,7 +2429,9 @@ rm -f ${FILE_CONTEXT}.pre
 
 # Start the daemons iff they were running before
 if test $STATUS -eq 0; then
-    /usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+    if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+        /usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+    fi
 fi
 exit 0
 
@@ -2440,13 +2451,21 @@ if [ $1 -eq 0 ]; then
         exit 0
     fi
 
+    # Stop ceph.target while relabeling if CEPH_AUTO_RESTART_ON_UPGRADE=yes
+    SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
+    if [ -f $SYSCONF_CEPH -a -r $SYSCONF_CEPH ] ; then
+        source $SYSCONF_CEPH
+    fi
+
     # Check whether the daemons are running
     /usr/bin/systemctl status ceph.target > /dev/null 2>&1
     STATUS=$?
 
     # Stop the daemons if they were running
     if test $STATUS -eq 0; then
-        /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+        if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+            /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+        fi
     fi
 
     /usr/sbin/fixfiles -C ${FILE_CONTEXT}.pre restore 2> /dev/null
@@ -2456,7 +2475,9 @@ if [ $1 -eq 0 ]; then
 
     # Start the daemons if they were running before
     if test $STATUS -eq 0; then
-	/usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+        if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+	    /usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+        fi
     fi
 fi
 exit 0

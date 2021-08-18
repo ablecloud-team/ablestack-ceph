@@ -22,7 +22,9 @@ constexpr int dout_subsys = ceph_subsys_rgw;
 }
 
 using std::bitset;
+using std::dec;
 using std::find;
+using std::hex;
 using std::int64_t;
 using std::move;
 using std::pair;
@@ -79,6 +81,7 @@ static const actpair actpairs[] =
  { "s3:GetAccelerateConfiguration", s3GetAccelerateConfiguration },
  { "s3:GetBucketAcl", s3GetBucketAcl },
  { "s3:GetBucketCORS", s3GetBucketCORS },
+ { "s3:GetBucketEncryption", s3GetBucketEncryption },
  { "s3:GetBucketLocation", s3GetBucketLocation },
  { "s3:GetBucketLogging", s3GetBucketLogging },
  { "s3:GetBucketNotification", s3GetBucketNotification },
@@ -111,6 +114,7 @@ static const actpair actpairs[] =
  { "s3:PutAccelerateConfiguration", s3PutAccelerateConfiguration },
  { "s3:PutBucketAcl", s3PutBucketAcl },
  { "s3:PutBucketCORS", s3PutBucketCORS },
+ { "s3:PutBucketEncryption", s3PutBucketEncryption },
  { "s3:PutBucketLogging", s3PutBucketLogging },
  { "s3:PutBucketNotification", s3PutBucketNotification },
  { "s3:PutBucketPolicy", s3PutBucketPolicy },
@@ -976,9 +980,9 @@ ostream& operator <<(ostream& m, const Condition& c) {
 
 Effect Statement::eval(const Environment& e,
 		       boost::optional<const rgw::auth::Identity&> ida,
-		       uint64_t act, const ARN& res) const {
+		       uint64_t act, const ARN& res, boost::optional<PolicyPrincipal&> princ_type) const {
 
-  if (eval_principal(e, ida) == Effect::Deny) {
+  if (eval_principal(e, ida, princ_type) == Effect::Deny) {
     return Effect::Pass;
   }
 
@@ -1012,13 +1016,34 @@ Effect Statement::eval(const Environment& e,
 }
 
 Effect Statement::eval_principal(const Environment& e,
-		       boost::optional<const rgw::auth::Identity&> ida) const {
+		       boost::optional<const rgw::auth::Identity&> ida, boost::optional<PolicyPrincipal&> princ_type) const {
+  if (princ_type) {
+    *princ_type = PolicyPrincipal::Other;
+  }
   if (ida) {
     if (princ.empty() && noprinc.empty()) {
       return Effect::Deny;
     }
-    if (!princ.empty() && !ida->is_identity(princ)) {
+    if (ida->get_identity_type() != TYPE_ROLE && !princ.empty() && !ida->is_identity(princ)) {
       return Effect::Deny;
+    }
+    if (ida->get_identity_type() == TYPE_ROLE && !princ.empty()) {
+      bool princ_matched = false;
+      for (auto p : princ) { // Check each principal to determine the type of the one that has matched
+        boost::container::flat_set<Principal> id;
+        id.insert(p);
+        if (ida->is_identity(id)) {
+          if (p.is_assumed_role() || p.is_user()) {
+            if (princ_type) *princ_type = PolicyPrincipal::Session;
+          } else {
+            if (princ_type) *princ_type = PolicyPrincipal::Role;
+          }
+          princ_matched = true;
+        }
+      }
+      if (!princ_matched) {
+        return Effect::Deny;
+      }
     } else if (!noprinc.empty() && ida->is_identity(noprinc)) {
       return Effect::Deny;
     }
@@ -1114,6 +1139,12 @@ const char* action_bit_string(uint64_t action) {
 
   case s3PutBucketCORS:
     return "s3:PutBucketCORS";
+
+  case s3GetBucketEncryption:
+    return "s3:GetBucketEncryption";
+
+  case s3PutBucketEncryption:
+    return "s3:PutBucketEncryption";
 
   case s3GetBucketVersioning:
     return "s3:GetBucketVersioning";
@@ -1391,10 +1422,11 @@ Policy::Policy(CephContext* cct, const string& tenant,
 
 Effect Policy::eval(const Environment& e,
 		    boost::optional<const rgw::auth::Identity&> ida,
-		    std::uint64_t action, const ARN& resource) const {
+		    std::uint64_t action, const ARN& resource,
+        boost::optional<PolicyPrincipal&> princ_type) const {
   auto allowed = false;
   for (auto& s : statements) {
-    auto g = s.eval(e, ida, action, resource);
+    auto g = s.eval(e, ida, action, resource, princ_type);
     if (g == Effect::Deny) {
       return g;
     } else if (g == Effect::Allow) {
@@ -1405,10 +1437,10 @@ Effect Policy::eval(const Environment& e,
 }
 
 Effect Policy::eval_principal(const Environment& e,
-		    boost::optional<const rgw::auth::Identity&> ida) const {
+		    boost::optional<const rgw::auth::Identity&> ida, boost::optional<PolicyPrincipal&> princ_type) const {
   auto allowed = false;
   for (auto& s : statements) {
-    auto g = s.eval_principal(e, ida);
+    auto g = s.eval_principal(e, ida, princ_type);
     if (g == Effect::Deny) {
       return g;
     } else if (g == Effect::Allow) {

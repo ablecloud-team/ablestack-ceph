@@ -101,18 +101,18 @@ struct requested_scrub_t {
   bool check_repair{false};
 };
 
-ostream& operator<<(ostream& out, const requested_scrub_t& sf);
+std::ostream& operator<<(std::ostream& out, const requested_scrub_t& sf);
 
 /**
  *  The interface used by the PG when requesting scrub-related info or services
  */
 struct ScrubPgIF {
 
-  virtual ~ScrubPgIF(){};
+  virtual ~ScrubPgIF() = default;
 
-  friend ostream& operator<<(ostream& out, const ScrubPgIF& s) { return s.show(out); }
+  friend std::ostream& operator<<(std::ostream& out, const ScrubPgIF& s) { return s.show(out); }
 
-  virtual ostream& show(ostream& out) const = 0;
+  virtual std::ostream& show(std::ostream& out) const = 0;
 
   // --------------- triggering state-machine events:
 
@@ -137,6 +137,22 @@ struct ScrubPgIF {
   virtual void send_start_replica(epoch_t epoch_queued) = 0;
 
   virtual void send_sched_replica(epoch_t epoch_queued) = 0;
+
+  virtual void send_full_reset(epoch_t epoch_queued) = 0;
+
+  virtual void send_chunk_free(epoch_t epoch_queued) = 0;
+
+  virtual void send_chunk_busy(epoch_t epoch_queued) = 0;
+
+  virtual void send_local_map_done(epoch_t epoch_queued) = 0;
+
+  virtual void send_get_next_chunk(epoch_t epoch_queued) = 0;
+
+  virtual void send_scrub_is_finished(epoch_t epoch_queued) = 0;
+
+  virtual void send_maps_compared(epoch_t epoch_queued) = 0;
+
+  virtual void on_applied_when_primary(const eversion_t &applied_version) = 0;
 
   // --------------------------------------------------
 
@@ -189,10 +205,6 @@ struct ScrubPgIF {
 					      unsigned int suggested_priority) const = 0;
 
   virtual void add_callback(Context* context) = 0;
-
-  /// should we requeue blocked ops?
-  [[nodiscard]] virtual bool should_requeue_blocked_ops(
-    eversion_t last_recovery_applied) const = 0;
 
   /// add to scrub statistics, but only if the soid is below the scrub start
   virtual void stats_of_handled_objects(const object_stat_sum_t& delta_stats,
@@ -263,4 +275,11 @@ struct ScrubPgIF {
   virtual void scrub_requested(scrub_level_t scrub_level,
 			       scrub_type_t scrub_type,
 			       requested_scrub_t& req_flags) = 0;
+
+  // --------------- debugging via the asok ------------------------------
+
+  virtual int asok_debug(std::string_view cmd,
+			 std::string param,
+			 Formatter* f,
+			 std::stringstream& ss) = 0;
 };

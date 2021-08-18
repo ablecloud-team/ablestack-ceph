@@ -34,6 +34,7 @@
 
 #define dout_subsys ceph_subsys_rgw
 
+using namespace std;
 using namespace rgw;
 
 namespace rgw {
@@ -1825,12 +1826,9 @@ namespace rgw {
         version_id = state->object->get_instance();
       }
     }
-    processor.emplace(&*aio, get_store(), state->bucket.get(),
-                      &state->dest_placement,
-                      state->bucket_owner.get_id(),
-                      *static_cast<RGWObjectCtx *>(state->obj_ctx),
-                      state->object->clone(), olh_epoch, state->req_id,
-		      this, state->yield);
+    processor = get_store()->get_atomic_writer(this, state->yield, state->object->clone(),
+					 state->bucket_owner.get_id(), *state->obj_ctx,
+					 &state->dest_placement, 0, state->req_id);
 
     op_ret = processor->prepare(state->yield);
     if (op_ret < 0) {
@@ -1868,7 +1866,7 @@ namespace rgw {
       return -EIO;
     }
 
-    op_ret = state->bucket->check_quota(user_quota, bucket_quota, real_ofs, null_yield, true);
+    op_ret = state->bucket->check_quota(this, user_quota, bucket_quota, real_ofs, null_yield, true);
     /* max_size exceed */
     if (op_ret < 0)
       return -EIO;
@@ -1910,7 +1908,7 @@ namespace rgw {
       goto done;
     }
 
-    op_ret = state->bucket->check_quota(user_quota, bucket_quota, state->obj_size, null_yield, true);
+    op_ret = state->bucket->check_quota(this, user_quota, bucket_quota, state->obj_size, null_yield, true);
     /* max_size exceed */
     if (op_ret < 0) {
       goto done;

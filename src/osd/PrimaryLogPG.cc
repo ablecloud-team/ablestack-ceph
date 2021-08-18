@@ -15,8 +15,15 @@
  *
  */
 
-#include "boost/tuple/tuple.hpp"
-#include "boost/intrusive_ptr.hpp"
+#include <errno.h>
+
+#include <charconv>
+#include <sstream>
+#include <utility>
+
+#include <boost/intrusive_ptr.hpp>
+#include <boost/tuple/tuple.hpp>
+
 #include "PG.h"
 #include "pg_scrubber.h"
 #include "PrimaryLogPG.h"
@@ -30,9 +37,12 @@
 
 #include "cls/cas/cls_cas_ops.h"
 #include "common/ceph_crypto.h"
+#include "common/config.h"
 #include "common/errno.h"
 #include "common/scrub_types.h"
 #include "common/perf_counters.h"
+#include "common/CDC.h"
+#include "common/EventTrace.h"
 
 #include "messages/MOSDOp.h"
 #include "messages/MOSDBackoff.h"
@@ -46,9 +56,7 @@
 #include "messages/MOSDPGUpdateLogMissingReply.h"
 #include "messages/MCommandReply.h"
 #include "messages/MOSDScrubReserve.h"
-#include "common/EventTrace.h"
 
-#include "common/config.h"
 #include "include/compat.h"
 #include "mon/MonClient.h"
 #include "osdc/Objecter.h"
@@ -69,22 +77,18 @@
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, this)
 
-#include <sstream>
-#include <utility>
-
-#include <errno.h>
 #ifdef HAVE_JAEGER
 #include "common/tracer.h"
 #endif
 
-#include <common/CDC.h>
-
 MEMPOOL_DEFINE_OBJECT_FACTORY(PrimaryLogPG, replicatedpg, osd);
 
+using std::less;
 using std::list;
 using std::ostream;
 using std::pair;
 using std::make_pair;
+using std::make_unique;
 using std::map;
 using std::ostringstream;
 using std::set;
@@ -104,6 +108,7 @@ using ceph::encode_destructively;
 
 using namespace ceph::osd::scheduler;
 using TOPNSPC::common::cmd_getval;
+using TOPNSPC::common::cmd_getval_or;
 
 template <typename T>
 static ostream& _prefix(std::ostream *_dout, T *pg) {
@@ -1145,8 +1150,7 @@ void PrimaryLogPG::do_command(
   else if (prefix == "scrub" ||
 	   prefix == "deep_scrub") {
     bool deep = (prefix == "deep_scrub");
-    int64_t time;
-    cmd_getval(cmdmap, "time", time, (int64_t)0);
+    int64_t time = cmd_getval_or<int64_t>(cmdmap, "time", 0);
 
     if (is_primary()) {
       const pg_pool_t *p = &pool.info;
@@ -1184,6 +1188,21 @@ void PrimaryLogPG::do_command(
     outbl.append(ss.str());
   }
 
+  else if (prefix == "block" || prefix == "unblock") {
+    string value;
+    cmd_getval(cmdmap, "value", value);
+
+    if (is_primary()) {
+      ret = m_scrubber->asok_debug(prefix, value, f.get(), ss);
+      f->open_object_section("result");
+      f->dump_bool("success", true);
+      f->close_section();
+    } else {
+      ss << "Not primary";
+      ret = -EPERM;
+    }
+    outbl.append(ss.str());
+  }
   else {
     ret = -ENOSYS;
     ss << "prefix '" << prefix << "' not implemented";
@@ -3425,7 +3444,7 @@ int PrimaryLogPG::get_manifest_ref_count(ObjectContextRef obc, std::string& fp_o
     if (!clone_obc) {
       break;
     }
-    if (recover_adjacent_clones(obc, op)) {
+    if (recover_adjacent_clones(clone_obc, op)) {
       return -EAGAIN;
     }
     get_adjacent_clones(clone_obc, obc_l, obc_g);
@@ -3445,7 +3464,17 @@ int PrimaryLogPG::get_manifest_ref_count(ObjectContextRef obc, std::string& fp_o
 
 bool PrimaryLogPG::recover_adjacent_clones(ObjectContextRef obc, OpRequestRef op)
 {
-  if (!obc->obs.oi.manifest.is_chunked() || !obc->ssc || !obc->ssc->snapset.clones.size()) {
+  if (!obc->ssc || !obc->ssc->snapset.clones.size()) {
+    return false;
+  }
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
+  bool has_manifest_op = std::any_of(
+    begin(m->ops),
+    end(m->ops),
+    [](const auto& osd_op) {
+       return osd_op.op.op == CEPH_OSD_OP_SET_CHUNK;
+    });
+  if (!obc->obs.oi.manifest.is_chunked() && !has_manifest_op) {
     return false;
   }
   ceph_assert(op);
@@ -3699,7 +3728,7 @@ ceph_tid_t PrimaryLogPG::refcount_manifest(hobject_t src_soid, hobject_t tgt_soi
     cls_cas_chunk_create_or_get_ref_op get_call;
     get_call.source = src_soid.get_head();
     ceph_assert(chunk);
-    get_call.data = move(*chunk);
+    get_call.data = std::move(*chunk);
     ::encode(get_call, in);
     obj_op.call("cas", "chunk_create_or_get_ref", in);
   } else {
@@ -4782,7 +4811,7 @@ int PrimaryLogPG::trim_object(
 	ctx->mtime,
 	0)
       );
-    derr << "removing snap head" << dendl;
+    dout(10) << "removing snap head" << dendl;
     object_info_t& oi = head_obc->obs.oi;
     ctx->delta_stats.num_objects--;
     if (oi.is_dirty()) {
@@ -4831,7 +4860,7 @@ int PrimaryLogPG::trim_object(
     head_obc->obs.oi.prior_version = head_obc->obs.oi.version;
     head_obc->obs.oi.version = ctx->at_version;
 
-    map <string, bufferlist> attrs;
+    map <string, bufferlist, less<>> attrs;
     bl.clear();
     encode(snapset, bl);
     attrs[SS_ATTR] = std::move(bl);
@@ -4885,58 +4914,53 @@ void PrimaryLogPG::snap_trimmer(epoch_t queued)
   return;
 }
 
-int PrimaryLogPG::do_xattr_cmp_u64(int op, __u64 v1, bufferlist& xattr)
+namespace {
+
+template<typename U, typename V>
+int do_cmp_xattr(int op, const U& lhs, const V& rhs)
 {
-  __u64 v2;
-
-  string v2s(xattr.c_str(), xattr.length());
-  if (v2s.length())
-    v2 = strtoull(v2s.c_str(), NULL, 10);
-  else
-    v2 = 0;
-
-  dout(20) << "do_xattr_cmp_u64 '" << v1 << "' vs '" << v2 << "' op " << op << dendl;
-
   switch (op) {
   case CEPH_OSD_CMPXATTR_OP_EQ:
-    return (v1 == v2);
+    return lhs == rhs;
   case CEPH_OSD_CMPXATTR_OP_NE:
-    return (v1 != v2);
+    return lhs != rhs;
   case CEPH_OSD_CMPXATTR_OP_GT:
-    return (v1 > v2);
+    return lhs > rhs;
   case CEPH_OSD_CMPXATTR_OP_GTE:
-    return (v1 >= v2);
+    return lhs >= rhs;
   case CEPH_OSD_CMPXATTR_OP_LT:
-    return (v1 < v2);
+    return lhs < rhs;
   case CEPH_OSD_CMPXATTR_OP_LTE:
-    return (v1 <= v2);
+    return lhs <= rhs;
   default:
     return -EINVAL;
   }
 }
 
+} // anonymous namespace
+
+int PrimaryLogPG::do_xattr_cmp_u64(int op, uint64_t v1, bufferlist& xattr)
+{
+  uint64_t v2;
+
+  if (xattr.length()) {
+    const char* first = xattr.c_str();
+    if (auto [p, ec] = std::from_chars(first, first + xattr.length(), v2);
+	ec != std::errc()) {
+      return -EINVAL;
+    }
+  } else {
+    v2 = 0;
+  }
+  dout(20) << "do_xattr_cmp_u64 '" << v1 << "' vs '" << v2 << "' op " << op << dendl;
+  return do_cmp_xattr(op, v1, v2);
+}
+
 int PrimaryLogPG::do_xattr_cmp_str(int op, string& v1s, bufferlist& xattr)
 {
-  string v2s(xattr.c_str(), xattr.length());
-
+  string_view v2s(xattr.c_str(), xattr.length());
   dout(20) << "do_xattr_cmp_str '" << v1s << "' vs '" << v2s << "' op " << op << dendl;
-
-  switch (op) {
-  case CEPH_OSD_CMPXATTR_OP_EQ:
-    return (v1s.compare(v2s) == 0);
-  case CEPH_OSD_CMPXATTR_OP_NE:
-    return (v1s.compare(v2s) != 0);
-  case CEPH_OSD_CMPXATTR_OP_GT:
-    return (v1s.compare(v2s) > 0);
-  case CEPH_OSD_CMPXATTR_OP_GTE:
-    return (v1s.compare(v2s) >= 0);
-  case CEPH_OSD_CMPXATTR_OP_LT:
-    return (v1s.compare(v2s) < 0);
-  case CEPH_OSD_CMPXATTR_OP_LTE:
-    return (v1s.compare(v2s) <= 0);
-  default:
-    return -EINVAL;
-  }
+  return do_cmp_xattr(op, v1s, v2s);
 }
 
 int PrimaryLogPG::do_writesame(OpContext *ctx, OSDOp& osd_op)
@@ -5286,11 +5310,11 @@ struct FillInVerifyExtent : public Context {
     r(r), rval(rv), outdatap(blp), maybe_crc(mc),
     size(size), osd(osd), soid(soid), flags(flags) {}
   void finish(int len) override {
-    *r = len;
     if (len < 0) {
       *rval = len;
       return;
     }
+    *r = len;
     *rval = 0;
 
     // whole object?  can we verify the checksum?
@@ -6326,7 +6350,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       ++ctx->num_read;
       {
 	tracepoint(osd, do_osd_op_pre_getxattrs, soid.oid.name.c_str(), soid.snap.val);
-	map<string, bufferlist> out;
+	map<string, bufferlist,less<>> out;
 	result = getattrs_maybe_cache(
 	  ctx->obc,
 	  &out);
@@ -6789,8 +6813,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	if (result < 0)
 	  break;
 
-	ceph_assert(op.extent.length);
-	if (obs.exists && !oi.is_whiteout()) {
+	if (op.extent.length && obs.exists && !oi.is_whiteout()) {
 	  t->zero(soid, op.extent.offset, op.extent.length);
 	  interval_set<uint64_t> ch;
 	  ch.insert(op.extent.offset, op.extent.length);
@@ -7122,7 +7145,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  oi.user_version = target_version;
 	  ctx->user_at_version = target_version;
 	  /* rm_attrs */
-	  map<string,bufferlist> rmattrs;
+	  map<string,bufferlist,less<>> rmattrs;
 	  result = getattrs_maybe_cache(ctx->obc, &rmattrs);
 	  if (result < 0) {
 	    dout(10) << __func__ << " error: " << cpp_strerror(result) << dendl;
@@ -8922,7 +8945,7 @@ void PrimaryLogPG::finish_ctx(OpContext *ctx, int log_op_type, int result)
     }
 
     // object_info_t
-    map <string, bufferlist> attrs;
+    map <string, bufferlist, less<>> attrs;
     bufferlist bv(sizeof(ctx->new_obs.oi));
     encode(ctx->new_obs.oi, bv,
 	     get_osdmap()->get_features(CEPH_ENTITY_TYPE_OSD, nullptr));
@@ -9174,7 +9197,7 @@ int PrimaryLogPG::do_copy_get(OpContext *ctx, bufferlist::const_iterator& bp,
   reply_obj.truncate_size = oi.truncate_size;
 
   // attrs
-  map<string,bufferlist>& out_attrs = reply_obj.attrs;
+  map<string,bufferlist,less<>>& out_attrs = reply_obj.attrs;
   if (!cursor.attr_complete) {
     result = getattrs_maybe_cache(
       ctx->obc,
@@ -10472,7 +10495,7 @@ int PrimaryLogPG::start_dedup(OpRequestRef op, ObjectContextRef obc)
     }
     C_SetDedupChunks *fin = new C_SetDedupChunks(this, soid, get_last_peering_reset(), p.first);
     ceph_tid_t tid = refcount_manifest(soid, target, refcount_t::CREATE_OR_GET_REF, 
-			    fin, move(chunks[p.first]));
+			    fin, std::move(chunks[p.first]));
     mop->chunks[target] = make_pair(p.first, p.second.length());
     mop->num_chunks++;
     mop->tids[p.first] = tid;
@@ -10539,7 +10562,7 @@ int PrimaryLogPG::do_cdc(const object_info_t& oi,
     bufferlist chunk;
     chunk.substr_of(bl, p.first, p.second);
     hobject_t target = get_fpoid_from_chunk(oi.soid, chunk);
-    chunks[p.first] = move(chunk);
+    chunks[p.first] = std::move(chunk);
     chunk_map[p.first] = chunk_info_t(0, p.second, target);
     total_length += p.second;
   }
@@ -11257,8 +11280,10 @@ void PrimaryLogPG::op_applied(const eversion_t &applied_version)
   ceph_assert(applied_version <= info.last_update);
   recovery_state.local_write_applied(applied_version);
 
-  if (is_primary() && m_scrubber->should_requeue_blocked_ops(recovery_state.get_last_update_applied())) {
-    osd->queue_scrub_applied_update(this, is_scrub_blocking_ops());
+  if (is_primary() && m_scrubber) {
+    // if there's a scrub operation waiting for the selected chunk to be fully updated -
+    // allow it to continue
+    m_scrubber->on_applied_when_primary(recovery_state.get_last_update_applied());
   }
 }
 
@@ -11761,7 +11786,7 @@ ObjectContextRef PrimaryLogPG::create_object_context(const object_info_t& oi,
 ObjectContextRef PrimaryLogPG::get_object_context(
   const hobject_t& soid,
   bool can_create,
-  const map<string, bufferlist> *attrs)
+  const map<string, bufferlist, less<>> *attrs)
 {
   auto it_objects = recovery_state.get_pg_log().get_log().objects.find(soid);
   ceph_assert(
@@ -12181,7 +12206,7 @@ void PrimaryLogPG::kick_object_context_blocked(ObjectContextRef obc)
 SnapSetContext *PrimaryLogPG::get_snapset_context(
   const hobject_t& oid,
   bool can_create,
-  const map<string, bufferlist> *attrs,
+  const map<string, bufferlist, less<>> *attrs,
   bool oid_existed)
 {
   std::lock_guard l(snapset_contexts_lock);
@@ -14564,9 +14589,10 @@ void PrimaryLogPG::hit_set_persist()
         0, bl.length());
     ctx->clean_regions.mark_data_region_dirty(0, bl.length());
   }
-  map <string, bufferlist> attrs;
-  attrs[OI_ATTR] = std::move(boi);
-  attrs[SS_ATTR] = std::move(bss);
+  map<string, bufferlist, std::less<>> attrs = {
+    {OI_ATTR, std::move(boi)},
+    {SS_ATTR, std::move(bss)}
+  };
   setattrs_maybe_cache(ctx->obc, ctx->op_t.get(), attrs);
   ctx->log.push_back(
     pg_log_entry_t(
@@ -15669,7 +15695,7 @@ void PrimaryLogPG::setattr_maybe_cache(
 void PrimaryLogPG::setattrs_maybe_cache(
   ObjectContextRef obc,
   PGTransaction *t,
-  map<string, bufferlist> &attrs)
+  map<string, bufferlist, less<>> &attrs)
 {
   t->setattrs(obc->obs.oi.soid, attrs);
 }
@@ -15702,7 +15728,7 @@ int PrimaryLogPG::getattr_maybe_cache(
 
 int PrimaryLogPG::getattrs_maybe_cache(
   ObjectContextRef obc,
-  map<string, bufferlist> *out)
+  map<string, bufferlist, less<>> *out)
 {
   int r = 0;
   ceph_assert(out);
@@ -15711,12 +15737,11 @@ int PrimaryLogPG::getattrs_maybe_cache(
   } else {
     r = pgbackend->objects_get_attrs(obc->obs.oi.soid, out);
   }
-  map<string, bufferlist> tmp;
-  for (map<string, bufferlist>::iterator i = out->begin();
-       i != out->end();
-       ++i) {
-    if (i->first.size() > 1 && i->first[0] == '_')
-      tmp[i->first.substr(1, i->first.size())] = std::move(i->second);
+  map<string, bufferlist, less<>> tmp;
+  for (auto& [key, val]: *out) {
+    if (key.size() > 1 && key[0] == '_') {
+      tmp[key.substr(1, key.size())] = std::move(val);
+    }
   }
   tmp.swap(*out);
   return r;

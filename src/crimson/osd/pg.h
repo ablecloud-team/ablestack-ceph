@@ -164,9 +164,9 @@ public:
   }
 
   void send_cluster_message(
-    int osd, MessageRef m,
+    int osd, MessageURef m,
     epoch_t epoch, bool share_map_update=false) final {
-    (void)shard_services.send_to_osd(osd, m, epoch);
+    (void)shard_services.send_to_osd(osd, std::move(m), epoch);
   }
 
   void send_pg_created(pg_t pgid) final {
@@ -265,10 +265,10 @@ public:
 	}));
   }
 
-  void update_heartbeat_peers(set<int> peers) final {
+  void update_heartbeat_peers(std::set<int> peers) final {
     // Not needed yet
   }
-  void set_probe_targets(const set<pg_shard_t> &probe_set) final {
+  void set_probe_targets(const std::set<pg_shard_t> &probe_set) final {
     // Not needed yet
   }
   void clear_probe_targets() final {
@@ -465,7 +465,6 @@ public:
     int acting_primary,
     const pg_history_t& history,
     const PastIntervals& pim,
-    bool backfill,
     ceph::os::Transaction &t);
 
   seastar::future<> read_state(crimson::os::FuturizedStore* store);
@@ -556,24 +555,20 @@ private:
     const hobject_t &oid,
     RWState::State type);
 
-  void do_peering_event(
-    const boost::statechart::event_base &evt,
-    PeeringCtx &rctx);
   void fill_op_params_bump_pg_version(
     osd_op_params_t& osd_op_p,
     const bool user_modify);
-  interruptible_future<Ref<MOSDOpReply>> handle_failed_op(
-    const std::error_code& e,
-    ObjectContextRef obc,
-    const OpsExecuter& ox,
-    const MOSDOp& m) const;
   using do_osd_ops_ertr = crimson::errorator<
    crimson::ct_error::eagain>;
   using do_osd_ops_iertr =
     ::crimson::interruptible::interruptible_errorator<
       ::crimson::osd::IOInterruptCondition,
       ::crimson::errorator<crimson::ct_error::eagain>>;
-  do_osd_ops_iertr::future<Ref<MOSDOpReply>> do_osd_ops(
+  template <typename Ret = void>
+  using pg_rep_op_fut_t =
+    std::tuple<interruptible_future<>,
+               do_osd_ops_iertr::future<Ret>>;
+  do_osd_ops_iertr::future<pg_rep_op_fut_t<MURef<MOSDOpReply>>> do_osd_ops(
     Ref<MOSDOp> m,
     ObjectContextRef obc,
     const OpInfo &op_info);
@@ -582,22 +577,23 @@ private:
   using do_osd_ops_failure_func_t =
     std::function<do_osd_ops_iertr::future<>(const std::error_code&)>;
   struct do_osd_ops_params_t;
-  do_osd_ops_iertr::future<> do_osd_ops(
+  do_osd_ops_iertr::future<pg_rep_op_fut_t<>> do_osd_ops(
     ObjectContextRef obc,
-    std::vector<OSDOp> ops,
+    std::vector<OSDOp>& ops,
     const OpInfo &op_info,
     const do_osd_ops_params_t& params,
     do_osd_ops_success_func_t success_func,
     do_osd_ops_failure_func_t failure_func);
   template <class Ret, class SuccessFunc, class FailureFunc>
-  do_osd_ops_iertr::future<Ret> do_osd_ops_execute(
-    OpsExecuter&& ox,
-    std::vector<OSDOp> ops,
+  do_osd_ops_iertr::future<pg_rep_op_fut_t<Ret>> do_osd_ops_execute(
+    seastar::lw_shared_ptr<OpsExecuter> ox,
+    std::vector<OSDOp>& ops,
     const OpInfo &op_info,
     SuccessFunc&& success_func,
     FailureFunc&& failure_func);
-  interruptible_future<Ref<MOSDOpReply>> do_pg_ops(Ref<MOSDOp> m);
-  interruptible_future<> submit_transaction(
+  interruptible_future<MURef<MOSDOpReply>> do_pg_ops(Ref<MOSDOp> m);
+  std::tuple<interruptible_future<>, interruptible_future<>>
+  submit_transaction(
     const OpInfo& op_info,
     const std::vector<OSDOp>& ops,
     ObjectContextRef&& obc,
@@ -659,7 +655,7 @@ public:
   epoch_t get_last_peering_reset() const final {
     return peering_state.get_last_peering_reset();
   }
-  const set<pg_shard_t> &get_acting_recovery_backfill() const {
+  const std::set<pg_shard_t> &get_acting_recovery_backfill() const {
     return peering_state.get_acting_recovery_backfill();
   }
   bool is_backfill_target(pg_shard_t osd) const {
@@ -671,11 +667,11 @@ public:
   uint64_t min_peer_features() const {
     return peering_state.get_min_peer_features();
   }
-  const map<hobject_t, set<pg_shard_t>>&
+  const std::map<hobject_t, std::set<pg_shard_t>>&
   get_missing_loc_shards() const {
     return peering_state.get_missing_loc().get_missing_locs();
   }
-  const map<pg_shard_t, pg_missing_t> &get_shard_missing() const {
+  const std::map<pg_shard_t, pg_missing_t> &get_shard_missing() const {
     return peering_state.get_peer_missing();
   }
   epoch_t get_interval_start_epoch() const {
@@ -755,7 +751,7 @@ private:
 	oid, get_actingset(), v);
   }
   bool is_degraded_or_backfilling_object(const hobject_t& soid) const;
-  const set<pg_shard_t> &get_actingset() const {
+  const std::set<pg_shard_t> &get_actingset() const {
     return peering_state.get_actingset();
   }
 

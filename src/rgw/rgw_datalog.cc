@@ -204,7 +204,7 @@ public:
     return r;
   }
   std::string_view max_marker() const override {
-    return "99999999"sv;
+    return "99999999";
   }
   int is_empty(const DoutPrefixProvider *dpp) override {
     for (auto shard = 0u; shard < oids.size(); ++shard) {
@@ -321,7 +321,7 @@ public:
     fifo.meta(dpp, m, null_yield);
     auto p = m.head_part_num;
     if (p < 0) {
-      info->marker = ""s;
+      info->marker = "";
       info->last_update = ceph::real_clock::zero();
       return 0;
     }
@@ -703,10 +703,11 @@ int RGWDataChangesLog::add_entry(const DoutPrefixProvider *dpp, const RGWBucketI
 
 int DataLogBackends::list(const DoutPrefixProvider *dpp, int shard, int max_entries,
 			  std::vector<rgw_data_change_log_entry>& entries,
-			  std::optional<std::string_view> marker,
-			  std::string* out_marker, bool* truncated)
+			  std::string_view marker,
+			  std::string* out_marker,
+			  bool* truncated)
 {
-  const auto [start_id, start_cursor] = cursorgeno(marker);
+  const auto [start_id, start_cursor] = cursorgen(marker);
   auto gen_id = start_id;
   std::string out_cursor;
   while (max_entries > 0) {
@@ -743,7 +744,7 @@ int DataLogBackends::list(const DoutPrefixProvider *dpp, int shard, int max_entr
 
 int RGWDataChangesLog::list_entries(const DoutPrefixProvider *dpp, int shard, int max_entries,
 				    std::vector<rgw_data_change_log_entry>& entries,
-				    std::optional<std::string_view> marker,
+				    std::string_view marker,
 				    std::string* out_marker, bool* truncated)
 {
   assert(shard < num_shards);
@@ -757,7 +758,7 @@ int RGWDataChangesLog::list_entries(const DoutPrefixProvider *dpp, int max_entri
   bool truncated;
   entries.clear();
   for (; marker.shard < num_shards && int(entries.size()) < max_entries;
-       marker.shard++, marker.marker.reset()) {
+       marker.shard++, marker.marker.clear()) {
     int ret = list_entries(dpp, marker.shard, max_entries - entries.size(),
 			   entries, marker.marker, NULL, &truncated);
     if (ret == -ENOENT) {
@@ -804,6 +805,8 @@ int DataLogBackends::trim_entries(const DoutPrefixProvider *dpp, int shard_id, s
       r = -ENODATA;
     if (r == -ENODATA && be->gen_id < target_gen)
       r = 0;
+    if (be->gen_id == target_gen)
+      break;
     l.lock();
   };
   return r;

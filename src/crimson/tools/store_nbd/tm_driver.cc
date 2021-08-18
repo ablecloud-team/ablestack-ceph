@@ -21,31 +21,27 @@ seastar::future<> TMDriver::write(
   logger().debug("Writing offset {}", offset);
   assert(offset % segment_manager->get_block_size() == 0);
   assert((ptr.length() % (size_t)segment_manager->get_block_size()) == 0);
-  return repeat_eagain([this, offset, ptr=std::move(ptr)] {
-    return seastar::do_with(
-      tm->create_transaction(),
-      ptr,
-      [this, offset](auto &t, auto &ptr) mutable {
-	return tm->dec_ref(
-	  *t,
-	  offset
-	).safe_then([](auto){}).handle_error(
-	  crimson::ct_error::enoent::handle([](auto) { return seastar::now(); }),
-	  crimson::ct_error::pass_further_all{}
-	).safe_then([=, &t, &ptr] {
-	  logger().debug("dec_ref complete");
-	  return tm->alloc_extent<TestBlock>(
-	    *t,
-	    offset,
-	    ptr.length());
-	}).safe_then([=, &t, &ptr](auto ext) mutable {
-	  assert(ext->get_laddr() == (size_t)offset);
-	  assert(ext->get_bptr().length() == ptr.length());
-	  ext->get_bptr().swap(ptr);
-	  logger().debug("submitting transaction");
-	  return tm->submit_transaction(std::move(t));
-	});
+  return seastar::do_with(ptr, [this, offset](auto& ptr) {
+    return repeat_eagain([this, offset, &ptr] {
+      return tm->with_transaction_intr(
+          Transaction::src_t::MUTATE,
+          [this, offset, &ptr](auto& t) {
+        return tm->dec_ref(t, offset
+        ).si_then([](auto){}).handle_error_interruptible(
+          crimson::ct_error::enoent::handle([](auto) { return seastar::now(); }),
+          crimson::ct_error::pass_further_all{}
+        ).si_then([this, offset, &t, &ptr] {
+          logger().debug("dec_ref complete");
+          return tm->alloc_extent<TestBlock>(t, offset, ptr.length());
+        }).si_then([this, offset, &t, &ptr](auto ext) {
+          assert(ext->get_laddr() == (size_t)offset);
+          assert(ext->get_bptr().length() == ptr.length());
+          ext->get_bptr().swap(ptr);
+          logger().debug("submitting transaction");
+          return tm->submit_transaction(t);
+        });
       });
+    });
   }).handle_error(
     crimson::ct_error::assert_all{"store-nbd write"}
   );
@@ -62,10 +58,10 @@ TMDriver::read_extents_ret TMDriver::read_extents(
     [this, &t, offset, length](auto &pins, auto &ret) {
       return tm->get_pins(
 	t, offset, length
-      ).safe_then([this, &t, &pins, &ret](auto _pins) {
+      ).si_then([this, &t, &pins, &ret](auto _pins) {
 	_pins.swap(pins);
 	logger().debug("read_extents: mappings {}", pins);
-	return crimson::do_for_each(
+	return trans_intr::do_for_each(
 	  pins.begin(),
 	  pins.end(),
 	  [this, &t, &ret](auto &&pin) {
@@ -76,14 +72,14 @@ TMDriver::read_extents_ret TMDriver::read_extents(
 	    return tm->pin_to_extent<TestBlock>(
 	      t,
 	      std::move(pin)
-	    ).safe_then([this, &ret](auto ref) mutable {
+	    ).si_then([this, &ret](auto ref) mutable {
 	      ret.push_back(std::make_pair(ref->get_laddr(), ref));
 	      logger().debug(
 		"read_extents: got extent {}",
 		*ref);
 	      return seastar::now();
 	    });
-	  }).safe_then([&ret] {
+	  }).si_then([&ret] {
 	    return std::move(ret);
 	  });
       });
@@ -100,27 +96,27 @@ seastar::future<bufferlist> TMDriver::read(
   auto blptrret = std::make_unique<bufferlist>();
   auto &blret = *blptrret;
   return repeat_eagain([=, &blret] {
-    return seastar::do_with(
-      tm->create_transaction(),
-      [=, &blret](auto &t) {
-	return read_extents(*t, offset, size
-	).safe_then([=, &blret](auto ext_list) mutable {
-	  size_t cur = offset;
-	  for (auto &i: ext_list) {
-	    if (cur != i.first) {
-	      assert(cur < i.first);
-	      blret.append_zero(i.first - cur);
-	      cur = i.first;
-	    }
-	    blret.append(i.second->get_bptr());
-	    cur += i.second->get_bptr().length();
-	  }
-	  if (blret.length() != size) {
-	    assert(blret.length() < size);
-	    blret.append_zero(size - blret.length());
-	  }
-	});
+    return tm->with_transaction_intr(
+        Transaction::src_t::READ,
+        [=, &blret](auto& t) {
+      return read_extents(t, offset, size
+      ).si_then([=, &blret](auto ext_list) {
+        size_t cur = offset;
+        for (auto &i: ext_list) {
+          if (cur != i.first) {
+            assert(cur < i.first);
+            blret.append_zero(i.first - cur);
+            cur = i.first;
+          }
+          blret.append(i.second->get_bptr());
+          cur += i.second->get_bptr().length();
+        }
+        if (blret.length() != size) {
+          assert(blret.length() < size);
+          blret.append_zero(size - blret.length());
+        }
       });
+    });
   }).handle_error(
     crimson::ct_error::assert_all{"store-nbd read"}
   ).then([blptrret=std::move(blptrret)]() mutable {
@@ -133,7 +129,7 @@ void TMDriver::init()
 {
   auto segment_cleaner = std::make_unique<SegmentCleaner>(
     SegmentCleaner::config_t::get_default(),
-    perf_service->get_counters(), false /* detailed */);
+    false /* detailed */);
   segment_cleaner->mount(*segment_manager);
   auto journal = std::make_unique<Journal>(*segment_manager);
   auto cache = std::make_unique<Cache>(*segment_manager);
@@ -146,8 +142,7 @@ void TMDriver::init()
     std::move(segment_cleaner),
     std::move(journal),
     std::move(cache),
-    std::move(lba_manager),
-    perf_service->get_counters());
+    std::move(lba_manager));
 }
 
 void TMDriver::clear()
@@ -163,7 +158,6 @@ size_t TMDriver::get_size() const
 seastar::future<> TMDriver::mkfs()
 {
   assert(config.path);
-  perf_service->add_to_collection();
   segment_manager = std::make_unique<
     segment_manager::block::BlockSegmentManager
     >(*config.path);
@@ -186,7 +180,6 @@ seastar::future<> TMDriver::mkfs()
     logger().debug("sm close");
     return segment_manager->close();
   }).safe_then([this] {
-    perf_service->remove_from_collection();
     clear();
     logger().debug("mkfs complete");
     return TransactionManager::mkfs_ertr::now();
@@ -217,12 +210,9 @@ seastar::future<> TMDriver::mount()
 
 seastar::future<> TMDriver::close()
 {
-  return segment_manager->close(
-  ).safe_then([this] {
-    return tm->close();
-  }).safe_then([this] {
+  return tm->close().safe_then([this] {
     clear();
-    return seastar::now();
+    return segment_manager->close();
   }).handle_error(
     crimson::ct_error::assert_all{
       "Invalid errror during TMDriver::close"

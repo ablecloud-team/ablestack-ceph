@@ -10,8 +10,8 @@
 
 #include "crimson/common/log.h"
 #include "crimson/os/seastore/onode_manager/staged-fltree/node.h"
-#include "crimson/os/seastore/onode_manager/staged-fltree/node_extent_manager.h"
 #include "crimson/os/seastore/onode_manager/staged-fltree/node_extent_manager/dummy.h"
+#include "crimson/os/seastore/onode_manager/staged-fltree/node_extent_manager/seastore.h"
 #include "crimson/os/seastore/onode_manager/staged-fltree/node_layout.h"
 #include "crimson/os/seastore/onode_manager/staged-fltree/tree.h"
 #include "crimson/os/seastore/onode_manager/staged-fltree/tree_utils.h"
@@ -22,9 +22,35 @@
 
 using namespace crimson::os::seastore::onode;
 
+#define INTR(fun, t)            \
+  with_trans_intr(              \
+    t,                          \
+    [&] (auto &tr) {            \
+      return fun(tr);           \
+    }                           \
+  )
+
+#define INTR_R(fun, t, args...)         \
+  with_trans_intr(                      \
+    t,                                  \
+    [&] (auto &tr) {                    \
+      return fun(tr, args);             \
+    }                                   \
+  )
+
+#define INTR_WITH_PARAM(fun, c, b, v)   \
+  with_trans_intr(                      \
+    c.t,                                \
+    [=] (auto &t) {                     \
+      return fun(c, L_ADDR_MIN, b, v);  \
+    }                                   \
+  )
+
 namespace {
   constexpr bool IS_DUMMY_SYNC = false;
   using DummyManager = DummyNodeExtentManager<IS_DUMMY_SYNC>;
+
+  using UnboundedBtree = Btree<UnboundedValue>;
 
   [[maybe_unused]] seastar::logger& logger() {
     return crimson::get_logger(ceph_subsys_test);
@@ -137,28 +163,28 @@ TEST_F(a_basic_test_t, 1_basic_sizes)
 
 TEST_F(a_basic_test_t, 2_node_sizes)
 {
-  run_async([this] {
+  run_async([] {
     auto nm = NodeExtentManager::create_dummy(IS_DUMMY_SYNC);
     auto t = make_test_transaction();
-    ValueBuilderImpl<TestValue> vb;
+    ValueBuilderImpl<UnboundedValue> vb;
     context_t c{*nm, vb, *t};
     std::array<std::pair<NodeImplURef, NodeExtentMutable>, 16> nodes = {
-      InternalNode0::allocate(c, false, 1u).unsafe_get0().make_pair(),
-      InternalNode1::allocate(c, false, 1u).unsafe_get0().make_pair(),
-      InternalNode2::allocate(c, false, 1u).unsafe_get0().make_pair(),
-      InternalNode3::allocate(c, false, 1u).unsafe_get0().make_pair(),
-      InternalNode0::allocate(c, true, 1u).unsafe_get0().make_pair(),
-      InternalNode1::allocate(c, true, 1u).unsafe_get0().make_pair(),
-      InternalNode2::allocate(c, true, 1u).unsafe_get0().make_pair(),
-      InternalNode3::allocate(c, true, 1u).unsafe_get0().make_pair(),
-      LeafNode0::allocate(c, false, 0u).unsafe_get0().make_pair(),
-      LeafNode1::allocate(c, false, 0u).unsafe_get0().make_pair(),
-      LeafNode2::allocate(c, false, 0u).unsafe_get0().make_pair(),
-      LeafNode3::allocate(c, false, 0u).unsafe_get0().make_pair(),
-      LeafNode0::allocate(c, true, 0u).unsafe_get0().make_pair(),
-      LeafNode1::allocate(c, true, 0u).unsafe_get0().make_pair(),
-      LeafNode2::allocate(c, true, 0u).unsafe_get0().make_pair(),
-      LeafNode3::allocate(c, true, 0u).unsafe_get0().make_pair()
+      INTR_WITH_PARAM(InternalNode0::allocate, c, false, 1u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(InternalNode1::allocate, c, false, 1u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(InternalNode2::allocate, c, false, 1u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(InternalNode3::allocate, c, false, 1u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(InternalNode0::allocate, c, true, 1u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(InternalNode1::allocate, c, true, 1u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(InternalNode2::allocate, c, true, 1u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(InternalNode3::allocate, c, true, 1u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(LeafNode0::allocate, c, false, 0u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(LeafNode1::allocate, c, false, 0u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(LeafNode2::allocate, c, false, 0u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(LeafNode3::allocate, c, false, 0u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(LeafNode0::allocate, c, true, 0u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(LeafNode1::allocate, c, true, 0u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(LeafNode2::allocate, c, true, 0u).unsafe_get0().make_pair(),
+      INTR_WITH_PARAM(LeafNode3::allocate, c, true, 0u).unsafe_get0().make_pair()
     };
     std::ostringstream oss;
     oss << "\nallocated nodes:";
@@ -171,15 +197,13 @@ TEST_F(a_basic_test_t, 2_node_sizes)
   });
 }
 
-using TestBtree = Btree<TestValue>;
-
 struct b_dummy_tree_test_t : public seastar_test_suite_t {
   NodeExtentManagerURef moved_nm;
   TransactionRef ref_t;
   Transaction& t;
-  ValueBuilderImpl<TestValue> vb;
+  ValueBuilderImpl<UnboundedValue> vb;
   context_t c;
-  TestBtree tree;
+  UnboundedBtree tree;
 
   b_dummy_tree_test_t()
     : moved_nm{NodeExtentManager::create_dummy(IS_DUMMY_SYNC)},
@@ -189,7 +213,7 @@ struct b_dummy_tree_test_t : public seastar_test_suite_t {
       tree{std::move(moved_nm)} {}
 
   seastar::future<> set_up_fut() override final {
-    return tree.mkfs(t).handle_error(
+    return INTR(tree.mkfs, t).handle_error(
       crimson::ct_error::all_same_way([] {
         ASSERT_FALSE("Unable to mkfs");
       })
@@ -204,20 +228,21 @@ TEST_F(b_dummy_tree_test_t, 3_random_insert_erase_leaf_node)
                   "\nrandomized leaf node insert:\n");
     auto key_s = ghobject_t();
     auto key_e = ghobject_t::get_max();
-    ASSERT_TRUE(tree.find(t, key_s).unsafe_get0().is_end());
-    ASSERT_TRUE(tree.begin(t).unsafe_get0().is_end());
-    ASSERT_TRUE(tree.last(t).unsafe_get0().is_end());
+    ASSERT_TRUE(INTR_R(tree.find, t, key_s).unsafe_get0().is_end());
+    ASSERT_TRUE(INTR(tree.begin, t).unsafe_get0().is_end());
+    ASSERT_TRUE(INTR(tree.last, t).unsafe_get0().is_end());
 
     std::map<ghobject_t,
-             std::tuple<test_item_t, TestBtree::Cursor>> insert_history;
+             std::tuple<test_item_t, UnboundedBtree::Cursor>> insert_history;
 
     auto f_validate_insert_new = [this, &insert_history] (
         const ghobject_t& key, const test_item_t& value) {
-      auto [cursor, success] = tree.insert(
-          t, key, {value.get_payload_size()}).unsafe_get0();
+      auto conf = UnboundedBtree::tree_value_config_t{value.get_payload_size()};
+      auto [cursor, success] = INTR_R(tree.insert,
+          t, key, conf).unsafe_get0();
       initialize_cursor_from_item(t, key, value, cursor, success);
       insert_history.emplace(key, std::make_tuple(value, cursor));
-      auto cursor_ = tree.find(t, key).unsafe_get0();
+      auto cursor_ = INTR_R(tree.find, t, key).unsafe_get0();
       ceph_assert(cursor_ != tree.end());
       ceph_assert(cursor_.value() == cursor.value());
       validate_cursor_from_item(key, value, cursor_);
@@ -225,12 +250,12 @@ TEST_F(b_dummy_tree_test_t, 3_random_insert_erase_leaf_node)
     };
 
     auto f_validate_erase = [this, &insert_history] (const ghobject_t& key) {
-      auto cursor_erase = tree.find(t, key).unsafe_get0();
-      auto cursor_next = cursor_erase.get_next(t).unsafe_get0();
-      auto cursor_ret = tree.erase(t, cursor_erase).unsafe_get0();
+      auto cursor_erase = INTR_R(tree.find, t, key).unsafe_get0();
+      auto cursor_next = INTR(cursor_erase.get_next, t).unsafe_get0();
+      auto cursor_ret = INTR_R(tree.erase, t, cursor_erase).unsafe_get0();
       ceph_assert(cursor_erase.is_end());
       ceph_assert(cursor_ret == cursor_next);
-      auto cursor_lb = tree.lower_bound(t, key).unsafe_get0();
+      auto cursor_lb = INTR_R(tree.lower_bound, t, key).unsafe_get0();
       ceph_assert(cursor_lb == cursor_next);
       auto it = insert_history.find(key);
       ceph_assert(std::get<1>(it->second).is_end());
@@ -253,18 +278,19 @@ TEST_F(b_dummy_tree_test_t, 3_random_insert_erase_leaf_node)
 
     // validate lookup
     {
-      auto cursor1_s = tree.lower_bound(t, key_s).unsafe_get0();
+      auto cursor1_s = INTR_R(tree.lower_bound, t, key_s).unsafe_get0();
       ASSERT_EQ(cursor1_s.get_ghobj(), key1);
       ASSERT_EQ(cursor1_s.value(), test_value1);
-      auto cursor1_e = tree.lower_bound(t, key_e).unsafe_get0();
+      auto cursor1_e = INTR_R(tree.lower_bound, t, key_e).unsafe_get0();
       ASSERT_TRUE(cursor1_e.is_end());
     }
 
     // insert the same key1 with a different value
     {
       auto value1_dup = values.pick();
-      auto [cursor1_dup, ret1_dup] = tree.insert(
-          t, key1, {value1_dup.get_payload_size()}).unsafe_get0();
+      auto conf = UnboundedBtree::tree_value_config_t{value1_dup.get_payload_size()};
+      auto [cursor1_dup, ret1_dup] = INTR_R(tree.insert,
+          t, key1, conf).unsafe_get0();
       ASSERT_FALSE(ret1_dup);
       validate_cursor_from_item(key1, value1, cursor1_dup);
     }
@@ -345,28 +371,30 @@ TEST_F(b_dummy_tree_test_t, 3_random_insert_erase_leaf_node)
     std::for_each(kvs.begin(), kvs.end(), [&f_insert_erase_insert] (auto& kv) {
       f_insert_erase_insert(kv.first, kv.second);
     });
-    ASSERT_EQ(tree.height(t).unsafe_get0(), 1);
+    ASSERT_EQ(INTR(tree.height, t).unsafe_get0(), 1);
     ASSERT_FALSE(tree.test_is_clean());
 
     for (auto& [k, val] : insert_history) {
       auto& [v, c] = val;
       // validate values in tree keep intact
-      auto cursor = tree.find(t, k).unsafe_get0();
+      auto cursor = with_trans_intr(t, [this, &k=k](auto& tr) {
+        return tree.find(tr, k);
+      }).unsafe_get0();
       EXPECT_NE(cursor, tree.end());
       validate_cursor_from_item(k, v, cursor);
       // validate values in cursors keep intact
       validate_cursor_from_item(k, v, c);
     }
     {
-      auto cursor = tree.lower_bound(t, key_s).unsafe_get0();
+      auto cursor = INTR_R(tree.lower_bound, t, key_s).unsafe_get0();
       validate_cursor_from_item(smallest_key, smallest_value, cursor);
     }
     {
-      auto cursor = tree.begin(t).unsafe_get0();
+      auto cursor = INTR(tree.begin, t).unsafe_get0();
       validate_cursor_from_item(smallest_key, smallest_value, cursor);
     }
     {
-      auto cursor = tree.last(t).unsafe_get0();
+      auto cursor = INTR(tree.last, t).unsafe_get0();
       validate_cursor_from_item(largest_key, largest_value, cursor);
     }
 
@@ -381,11 +409,11 @@ TEST_F(b_dummy_tree_test_t, 3_random_insert_erase_leaf_node)
       std::sort(kvs.begin(), kvs.end(), [](auto& l, auto& r) {
         return l.first < r.first;
       });
-      auto cursor = tree.begin(t).unsafe_get0();
+      auto cursor = INTR(tree.begin, t).unsafe_get0();
       for (auto& [k, v] : kvs) {
         ASSERT_FALSE(cursor.is_end());
         validate_cursor_from_item(k, v, cursor);
-        cursor = cursor.get_next(t).unsafe_get0();
+        cursor = INTR(cursor.get_next, t).unsafe_get0();
       }
       ASSERT_TRUE(cursor.is_end());
     }
@@ -397,12 +425,14 @@ TEST_F(b_dummy_tree_test_t, 3_random_insert_erase_leaf_node)
     // randomized erase until empty
     std::random_shuffle(kvs.begin(), kvs.end());
     for (auto& [k, v] : kvs) {
-      auto e_size = tree.erase(t, k).unsafe_get0();
+      auto e_size = with_trans_intr(t, [this, &k=k](auto& tr) {
+        return tree.erase(tr, k);
+      }).unsafe_get0();
       ASSERT_EQ(e_size, 1);
     }
-    auto cursor = tree.begin(t).unsafe_get0();
+    auto cursor = INTR(tree.begin, t).unsafe_get0();
     ASSERT_TRUE(cursor.is_end());
-    ASSERT_EQ(tree.height(t).unsafe_get0(), 1);
+    ASSERT_EQ(INTR(tree.height, t).unsafe_get0(), 1);
   });
 }
 
@@ -449,7 +479,7 @@ class TestTree {
       std::pair<unsigned, unsigned> range_0,
       size_t value_size) {
     return seastar::async([this, range_2, range_1, range_0, value_size] {
-      tree.mkfs(t).unsafe_get0();
+      INTR(tree.mkfs, t).unsafe_get0();
       //logger().info("\n---------------------------------------------"
       //              "\nbefore leaf node split:\n");
       auto keys = build_key_set(range_2, range_1, range_0);
@@ -457,7 +487,7 @@ class TestTree {
         auto value = values.create(value_size);
         insert_tree(key, value).get0();
       }
-      ASSERT_EQ(tree.height(t).unsafe_get0(), 1);
+      ASSERT_EQ(INTR(tree.height, t).unsafe_get0(), 1);
       ASSERT_FALSE(tree.test_is_clean());
       //std::ostringstream oss;
       //tree.dump(t, oss);
@@ -468,7 +498,7 @@ class TestTree {
   seastar::future<> build_tree(
       const std::vector<ghobject_t>& keys, const std::vector<test_item_t>& values) {
     return seastar::async([this, keys, values] {
-      tree.mkfs(t).unsafe_get0();
+      INTR(tree.mkfs, t).unsafe_get0();
       //logger().info("\n---------------------------------------------"
       //              "\nbefore leaf node split:\n");
       ASSERT_EQ(keys.size(), values.size());
@@ -479,7 +509,7 @@ class TestTree {
         ++key_iter;
         ++value_iter;
       }
-      ASSERT_EQ(tree.height(t).unsafe_get0(), 1);
+      ASSERT_EQ(INTR(tree.height, t).unsafe_get0(), 1);
       ASSERT_FALSE(tree.test_is_clean());
       //std::ostringstream oss;
       //tree.dump(t, oss);
@@ -496,15 +526,16 @@ class TestTree {
       // clone
       auto ref_dummy = NodeExtentManager::create_dummy(IS_DUMMY_SYNC);
       auto p_dummy = static_cast<DummyManager*>(ref_dummy.get());
-      TestBtree tree_clone(std::move(ref_dummy));
+      UnboundedBtree tree_clone(std::move(ref_dummy));
       auto ref_t_clone = make_test_transaction();
       Transaction& t_clone = *ref_t_clone;
-      tree_clone.test_clone_from(t_clone, t, tree).unsafe_get0();
+      INTR_R(tree_clone.test_clone_from, t_clone, t, tree).unsafe_get0();
 
       // insert and split
       logger().info("\n\nINSERT-SPLIT {}:", key_hobj_t(key));
-      auto [cursor, success] = tree_clone.insert(
-          t_clone, key, {value.get_payload_size()}).unsafe_get0();
+      auto conf = UnboundedBtree::tree_value_config_t{value.get_payload_size()};
+      auto [cursor, success] = INTR_R(tree_clone.insert,
+          t_clone, key, conf).unsafe_get0();
       initialize_cursor_from_item(t, key, value, cursor, success);
 
       {
@@ -512,15 +543,17 @@ class TestTree {
         tree_clone.dump(t_clone, oss);
         logger().info("dump new root:\n{}", oss.str());
       }
-      EXPECT_EQ(tree_clone.height(t_clone).unsafe_get0(), 2);
+      EXPECT_EQ(INTR(tree_clone.height, t_clone).unsafe_get0(), 2);
 
       for (auto& [k, val] : insert_history) {
         auto& [v, c] = val;
-        auto result = tree_clone.find(t_clone, k).unsafe_get0();
+        auto result = with_trans_intr(t_clone, [&tree_clone, &k=k] (auto& tr) {
+          return tree_clone.find(tr, k);
+        }).unsafe_get0();
         EXPECT_NE(result, tree_clone.end());
         validate_cursor_from_item(k, v, result);
       }
-      auto result = tree_clone.find(t_clone, key).unsafe_get0();
+      auto result = INTR_R(tree_clone.find, t_clone, key).unsafe_get0();
       EXPECT_NE(result, tree_clone.end());
       validate_cursor_from_item(key, value, result);
       EXPECT_TRUE(last_split.match(expected));
@@ -528,11 +561,13 @@ class TestTree {
 
       // erase and merge
       logger().info("\n\nERASE-MERGE {}:", key_hobj_t(key));
-      auto nxt_cursor = cursor.erase<true>(t_clone).unsafe_get0();
+      auto nxt_cursor = with_trans_intr(t_clone, [&cursor=cursor](auto& tr) {
+        return cursor.erase<true>(tr);
+      }).unsafe_get0();
 
       {
         // track root again to dump
-        auto begin = tree_clone.begin(t_clone).unsafe_get0();
+        auto begin = INTR(tree_clone.begin, t_clone).unsafe_get0();
         std::ignore = begin;
         std::ostringstream oss;
         tree_clone.dump(t_clone, oss);
@@ -550,12 +585,13 @@ class TestTree {
 
       for (auto& [k, val] : insert_history) {
         auto& [v, c] = val;
-        auto result = tree_clone.find(t_clone, k).unsafe_get0();
+        auto result = with_trans_intr(t_clone, [&tree_clone, &k=k](auto& tr) {
+          return tree_clone.find(tr, k);
+        }).unsafe_get0();
         EXPECT_NE(result, tree_clone.end());
         validate_cursor_from_item(k, v, result);
       }
-
-      EXPECT_EQ(tree_clone.height(t_clone).unsafe_get0(), 1);
+      EXPECT_EQ(INTR(tree_clone.height, t_clone).unsafe_get0(), 1);
       EXPECT_EQ(p_dummy->size(), 1);
     });
   }
@@ -567,8 +603,9 @@ class TestTree {
  private:
   seastar::future<> insert_tree(const ghobject_t& key, const test_item_t& value) {
     return seastar::async([this, &key, &value] {
-      auto [cursor, success] = tree.insert(
-          t, key, {value.get_payload_size()}).unsafe_get0();
+      auto conf = UnboundedBtree::tree_value_config_t{value.get_payload_size()};
+      auto [cursor, success] = INTR_R(tree.insert,
+          t, key, conf).unsafe_get0();
       initialize_cursor_from_item(t, key, value, cursor, success);
       insert_history.emplace(key, std::make_tuple(value, cursor));
     });
@@ -577,19 +614,19 @@ class TestTree {
   NodeExtentManagerURef moved_nm;
   TransactionRef ref_t;
   Transaction& t;
-  ValueBuilderImpl<TestValue> vb;
+  ValueBuilderImpl<UnboundedValue> vb;
   context_t c;
-  TestBtree tree;
+  UnboundedBtree tree;
   Values<test_item_t> values;
   std::map<ghobject_t,
-           std::tuple<test_item_t, TestBtree::Cursor>> insert_history;
+           std::tuple<test_item_t, UnboundedBtree::Cursor>> insert_history;
 };
 
 struct c_dummy_test_t : public seastar_test_suite_t {};
 
 TEST_F(c_dummy_test_t, 4_split_merge_leaf_node)
 {
-  run_async([this] {
+  run_async([] {
     {
       TestTree test;
       test.build_tree({2, 5}, {2, 5}, {2, 5}, 120).get0();
@@ -828,22 +865,25 @@ class DummyChildPool {
     laddr_t laddr() const override { return _laddr; }
     bool is_level_tail() const override { return _is_level_tail; }
     std::optional<key_view_t> get_pivot_index() const override { return {key_view}; }
-    bool is_extent_valid() const override { return _is_extent_valid; }
+    bool is_extent_retired() const override { return _is_extent_retired; }
     const std::string& get_name() const override { return name; }
     search_position_t make_tail() override {
       _is_level_tail = true;
       build_name();
       return search_position_t::end();
     }
-    ertr::future<> retire_extent(context_t) override {
-      _is_extent_valid = false;
-      return ertr::now();
+    eagain_ifuture<> retire_extent(context_t) override {
+      assert(!_is_extent_retired);
+      _is_extent_retired = true;
+      return eagain_iertr::now();
     }
 
    protected:
     node_type_t node_type() const override { return node_type_t::LEAF; }
     field_type_t field_type() const override { return field_type_t::N0; }
     const char* read() const override {
+      ceph_abort("impossible path"); }
+    extent_len_t get_node_size() const override {
       ceph_abort("impossible path"); }
     nextent_state_t get_extent_state() const override {
       ceph_abort("impossible path"); }
@@ -854,11 +894,11 @@ class DummyChildPool {
       ceph_abort("impossible path"); }
     bool is_keys_empty() const override {
       ceph_abort("impossible path"); }
-    bool is_keys_one() const override {
+    bool has_single_value() const override {
       ceph_abort("impossible path"); }
     node_offset_t free_size() const override {
       ceph_abort("impossible path"); }
-    node_offset_t total_size() const override {
+    extent_len_t total_size() const override {
       ceph_abort("impossible path"); }
     bool is_size_underflow() const override {
       ceph_abort("impossible path"); }
@@ -866,9 +906,9 @@ class DummyChildPool {
       ceph_abort("impossible path"); }
     std::tuple<match_stage_t, std::size_t> evaluate_merge(NodeImpl&) override {
       ceph_abort("impossible path"); }
-    search_position_t merge(NodeExtentMutable&, NodeImpl&, match_stage_t, node_offset_t) override {
+    search_position_t merge(NodeExtentMutable&, NodeImpl&, match_stage_t, extent_len_t) override {
       ceph_abort("impossible path"); }
-    ertr::future<NodeExtentMutable> rebuild_extent(context_t) override {
+    eagain_ifuture<NodeExtentMutable> rebuild_extent(context_t, laddr_t) override {
       ceph_abort("impossible path"); }
     node_stats_t get_stats() const override {
       ceph_abort("impossible path"); }
@@ -898,7 +938,7 @@ class DummyChildPool {
     bool _is_level_tail;
     laddr_t _laddr;
     std::string name;
-    bool _is_extent_valid = true;
+    bool _is_extent_retired = false;
 
     key_view_t key_view;
     void* p_mem_key_view;
@@ -910,7 +950,7 @@ class DummyChildPool {
 
     key_view_t get_pivot_key() const { return *impl->get_pivot_index(); }
 
-    node_future<> populate_split(
+    eagain_ifuture<> populate_split(
         context_t c, std::set<Ref<DummyChild>>& splitable_nodes) {
       ceph_assert(can_split());
       ceph_assert(splitable_nodes.find(this) != splitable_nodes.end());
@@ -938,10 +978,10 @@ class DummyChildPool {
       }
       Ref<Node> this_ref = this;
       return apply_split_to_parent(
-          c, std::move(this_ref), std::move(right_child), false);
+            c, std::move(this_ref), std::move(right_child), false);
     }
 
-    node_future<> insert_and_split(
+    eagain_ifuture<> insert_and_split(
         context_t c, const ghobject_t& insert_key,
         std::set<Ref<DummyChild>>& splitable_nodes) {
       const auto& keys = impl->get_keys();
@@ -961,9 +1001,9 @@ class DummyChildPool {
       return fut;
     }
 
-    node_future<> merge(context_t c, Ref<DummyChild>&& this_ref) {
+    eagain_ifuture<> merge(context_t c, Ref<DummyChild>&& this_ref) {
       return parent_info().ptr->get_child_peers(c, parent_info().position
-      ).safe_then([c, this_ref = std::move(this_ref), this] (auto lr_nodes) mutable {
+      ).si_then([c, this_ref = std::move(this_ref), this] (auto lr_nodes) mutable {
         auto& [lnode, rnode] = lr_nodes;
         if (rnode) {
           lnode.reset();
@@ -982,7 +1022,7 @@ class DummyChildPool {
       });
     }
 
-    node_future<> fix_key(context_t c, const ghobject_t& new_key) {
+    eagain_ifuture<> fix_key(context_t c, const ghobject_t& new_key) {
       const auto& keys = impl->get_keys();
       ceph_assert(keys.size() == 1);
       assert(impl->is_level_tail() == false);
@@ -1012,21 +1052,24 @@ class DummyChildPool {
       return create(keys, is_level_tail, seed++, pool);
     }
 
-    static node_future<Ref<DummyChild>> create_initial(
+    static eagain_ifuture<Ref<DummyChild>> create_initial(
         context_t c, const std::set<ghobject_t>& keys,
         DummyChildPool& pool, RootNodeTracker& root_tracker) {
       auto initial = create_new(keys, true, pool);
       return c.nm.get_super(c.t, root_tracker
-      ).safe_then([c, &pool, initial](auto super) {
+      ).handle_error_interruptible(
+        eagain_iertr::pass_further{},
+        crimson::ct_error::assert_all{"Invalid error during create_initial()"}
+      ).si_then([c, initial](auto super) {
         initial->make_root_new(c, std::move(super));
-        return initial->upgrade_root(c).safe_then([initial] {
+        return initial->upgrade_root(c, L_ADDR_MIN).si_then([initial] {
           return initial;
         });
       });
     }
 
    protected:
-    node_future<> test_clone_non_root(
+    eagain_ifuture<> test_clone_non_root(
         context_t, Ref<InternalNode> new_parent) const override {
       ceph_assert(!is_root());
       auto p_pool_clone = pool.pool_clone_in_progress;
@@ -1034,18 +1077,18 @@ class DummyChildPool {
       auto clone = create(
           impl->get_keys(), impl->is_level_tail(), impl->laddr(), *p_pool_clone);
       clone->as_child(parent_info().position, new_parent);
-      return node_ertr::now();
+      return eagain_iertr::now();
     }
-    node_future<Ref<tree_cursor_t>> lookup_smallest(context_t) override {
+    eagain_ifuture<Ref<tree_cursor_t>> lookup_smallest(context_t) override {
       ceph_abort("impossible path"); }
-    node_future<Ref<tree_cursor_t>> lookup_largest(context_t) override {
+    eagain_ifuture<Ref<tree_cursor_t>> lookup_largest(context_t) override {
       ceph_abort("impossible path"); }
-    node_future<> test_clone_root(context_t, RootNodeTracker&) const override {
+    eagain_ifuture<> test_clone_root(context_t, RootNodeTracker&) const override {
       ceph_abort("impossible path"); }
-    node_future<search_result_t> lower_bound_tracked(
+    eagain_ifuture<search_result_t> lower_bound_tracked(
         context_t, const key_hobj_t&, MatchHistory&) override {
       ceph_abort("impossible path"); }
-    node_future<> do_get_tree_stats(context_t, tree_stats_t&) override {
+    eagain_ifuture<> do_get_tree_stats(context_t, tree_stats_t&) override {
       ceph_abort("impossible path"); }
     bool is_tracking() const override { return false; }
     void track_merge(Ref<Node>, match_stage_t, search_position_t&) override {
@@ -1059,7 +1102,7 @@ class DummyChildPool {
 
     bool can_split() const { return impl->get_keys().size() > 1; }
 
-    static node_future<> do_merge(
+    static eagain_ifuture<> do_merge(
         context_t c, Ref<DummyChild>&& left, Ref<DummyChild>&& right, bool stole_key) {
       assert(right->use_count() == 1);
       assert(left->impl->get_keys().size() == 1);
@@ -1072,8 +1115,9 @@ class DummyChildPool {
         p_keys = &left->impl->get_keys();
       }
       left->impl->reset(*p_keys, left_is_tail);
+      auto left_addr = left->impl->laddr();
       return left->parent_info().ptr->apply_children_merge<true>(
-          c, std::move(left), left->impl->laddr(), std::move(right), !stole_key);
+          c, std::move(left), left_addr, std::move(right), !stole_key);
     }
 
     DummyChildImpl* impl;
@@ -1082,44 +1126,43 @@ class DummyChildPool {
   };
 
  public:
-  using node_ertr = Node::node_ertr;
-  template <class ValueT=void>
-  using node_future = Node::node_future<ValueT>;
-
   DummyChildPool() = default;
   ~DummyChildPool() { reset(); }
 
-  node_future<> build_tree(const std::set<ghobject_t>& keys) {
+  auto build_tree(const std::set<ghobject_t>& keys) {
     reset();
-
     // create tree
     auto ref_dummy = NodeExtentManager::create_dummy(IS_DUMMY_SYNC);
     p_dummy = static_cast<DummyManager*>(ref_dummy.get());
     p_btree.emplace(std::move(ref_dummy));
-    return DummyChild::create_initial(get_context(), keys, *this, *p_btree->root_tracker
-    ).safe_then([this](auto initial_child) {
-      // split
-      splitable_nodes.insert(initial_child);
-      return crimson::do_until([this] {
-        if (splitable_nodes.empty()) {
-          return node_ertr::make_ready_future<bool>(true);
-        }
-        auto index = rd() % splitable_nodes.size();
-        auto iter = splitable_nodes.begin();
-        std::advance(iter, index);
-        Ref<DummyChild> child = *iter;
-        return child->populate_split(get_context(), splitable_nodes
-        ).safe_then([] {
-          return node_ertr::make_ready_future<bool>(false);
+    return with_trans_intr(get_context().t, [this, &keys] (auto &tr) {
+      return DummyChild::create_initial(get_context(), keys, *this, *p_btree->root_tracker
+      ).si_then([this](auto initial_child) {
+        // split
+        splitable_nodes.insert(initial_child);
+        return trans_intr::repeat([this] ()
+          -> eagain_ifuture<seastar::stop_iteration> {
+          if (splitable_nodes.empty()) {
+            return seastar::make_ready_future<seastar::stop_iteration>(
+              seastar::stop_iteration::yes);
+          }
+          auto index = rd() % splitable_nodes.size();
+          auto iter = splitable_nodes.begin();
+          std::advance(iter, index);
+          Ref<DummyChild> child = *iter;
+          return child->populate_split(get_context(), splitable_nodes
+          ).si_then([] {
+            return seastar::stop_iteration::no;
+          });
         });
-      });
-    }).safe_then([this] {
+      }).si_then([this] {
       //std::ostringstream oss;
       //p_btree->dump(t(), oss);
       //logger().info("\n{}\n", oss.str());
-      return p_btree->height(t());
-    }).safe_then([](auto height) {
-      ceph_assert(height == 2);
+        return p_btree->height(t());
+      }).si_then([](auto height) {
+        ceph_assert(height == 2);
+      });
     });
   }
 
@@ -1132,14 +1175,17 @@ class DummyChildPool {
       // insert and split
       logger().info("\n\nINSERT-SPLIT {} at pos({}):", key_hobj_t(key), pos);
       auto node_to_split = pool_clone.get_node_by_pos(pos);
-      node_to_split->insert_and_split(
-        pool_clone.get_context(), key, pool_clone.splitable_nodes).unsafe_get0();
+      with_trans_intr(pool_clone.get_context().t, [&] (auto &t) {
+        return node_to_split->insert_and_split(
+          pool_clone.get_context(), key, pool_clone.splitable_nodes);
+      }).unsafe_get0();
       {
         std::ostringstream oss;
         pool_clone.p_btree->dump(pool_clone.t(), oss);
         logger().info("dump new root:\n{}", oss.str());
       }
-      EXPECT_EQ(pool_clone.p_btree->height(pool_clone.t()).unsafe_get0(), 3);
+      auto &pt = pool_clone.t();
+      EXPECT_EQ(INTR(pool_clone.p_btree->height, pt).unsafe_get0(), 3);
       EXPECT_TRUE(last_split.match(expected));
       EXPECT_EQ(pool_clone.p_dummy->size(), 3);
 
@@ -1147,9 +1193,12 @@ class DummyChildPool {
       auto pivot_key = node_to_split->get_pivot_key();
       logger().info("\n\nERASE-MERGE {}:", node_to_split->get_name());
       assert(pivot_key.compare_to(key_hobj_t(key)) == MatchKindCMP::EQ);
-      node_to_split->merge(
-          pool_clone.get_context(), std::move(node_to_split)).unsafe_get0();
-      EXPECT_EQ(pool_clone.p_btree->height(pool_clone.t()).unsafe_get0(), 2);
+      with_trans_intr(pool_clone.get_context().t, [&] (auto &t) {
+        return node_to_split->merge(
+          pool_clone.get_context(), std::move(node_to_split));
+      }).unsafe_get0();
+      auto &pt2 = pool_clone.t();
+      EXPECT_EQ(INTR(pool_clone.p_btree->height ,pt2).unsafe_get0(), 2);
       EXPECT_EQ(pool_clone.p_dummy->size(), 1);
     });
   }
@@ -1165,23 +1214,30 @@ class DummyChildPool {
       auto old_key = node_to_fix->get_pivot_key().to_ghobj();
       logger().info("\n\nFIX pos({}) from {} to {}, expect_split={}:",
                     pos, node_to_fix->get_name(), key_hobj_t(new_key), expect_split);
-      node_to_fix->fix_key(pool_clone.get_context(), new_key).unsafe_get0();
+      with_trans_intr(pool_clone.get_context().t, [&] (auto &t) {
+        return node_to_fix->fix_key(pool_clone.get_context(), new_key);
+      }).unsafe_get0();
       if (expect_split) {
         std::ostringstream oss;
         pool_clone.p_btree->dump(pool_clone.t(), oss);
         logger().info("dump new root:\n{}", oss.str());
-        EXPECT_EQ(pool_clone.p_btree->height(pool_clone.t()).unsafe_get0(), 3);
+        auto &pt = pool_clone.t();
+        EXPECT_EQ(INTR(pool_clone.p_btree->height, pt).unsafe_get0(), 3);
         EXPECT_EQ(pool_clone.p_dummy->size(), 3);
       } else {
-        EXPECT_EQ(pool_clone.p_btree->height(pool_clone.t()).unsafe_get0(), 2);
+        auto &pt = pool_clone.t();
+        EXPECT_EQ(INTR(pool_clone.p_btree->height, pt).unsafe_get0(), 2);
         EXPECT_EQ(pool_clone.p_dummy->size(), 1);
       }
 
       // fix back
       logger().info("\n\nFIX pos({}) from {} back to {}:",
-                    pos, node_to_fix->get_name(), old_key);
-      node_to_fix->fix_key(pool_clone.get_context(), old_key).unsafe_get0();
-      EXPECT_EQ(pool_clone.p_btree->height(pool_clone.t()).unsafe_get0(), 2);
+                    pos, node_to_fix->get_name(), key_hobj_t(old_key));
+      with_trans_intr(pool_clone.get_context().t, [&] (auto &t) {
+          return node_to_fix->fix_key(pool_clone.get_context(), old_key);
+      }).unsafe_get0();
+      auto &pt = pool_clone.t();
+      EXPECT_EQ(INTR(pool_clone.p_btree->height, pt).unsafe_get0(), 2);
       EXPECT_EQ(pool_clone.p_dummy->size(), 1);
     });
   }
@@ -1192,8 +1248,10 @@ class DummyChildPool {
     auto ref_dummy = NodeExtentManager::create_dummy(IS_DUMMY_SYNC);
     pool_clone.p_dummy = static_cast<DummyManager*>(ref_dummy.get());
     pool_clone.p_btree.emplace(std::move(ref_dummy));
-    pool_clone.p_btree->test_clone_from(
-      pool_clone.t(), t(), *p_btree).unsafe_get0();
+    auto &pt = pool_clone.t();
+    [[maybe_unused]] auto &tr = t();
+    INTR_R(pool_clone.p_btree->test_clone_from,
+      pt, tr, *p_btree).unsafe_get0();
     pool_clone_in_progress = nullptr;
   }
 
@@ -1238,9 +1296,9 @@ class DummyChildPool {
   Transaction& t() const { return *ref_t; }
 
   std::set<Ref<DummyChild>> tracked_children;
-  std::optional<TestBtree> p_btree;
+  std::optional<UnboundedBtree> p_btree;
   DummyManager* p_dummy = nullptr;
-  ValueBuilderImpl<TestValue> vb;
+  ValueBuilderImpl<UnboundedValue> vb;
   TransactionRef ref_t = make_test_transaction();
 
   std::random_device rd;
@@ -1253,7 +1311,7 @@ class DummyChildPool {
 
 TEST_F(c_dummy_test_t, 5_split_merge_internal_node)
 {
-  run_async([this] {
+  run_async([] {
     DummyChildPool pool;
     {
       logger().info("\n---------------------------------------------"
@@ -1270,7 +1328,7 @@ TEST_F(c_dummy_test_t, 5_split_merge_internal_node)
       keys.insert(make_ghobj(2, 2, 2, "ns2", "oid2" + padding_s, 2, 2));
       keys.insert(make_ghobj(2, 2, 2, "ns2", "oid2" + padding_s, 3, 3));
       keys.insert(make_ghobj(2, 2, 2, "ns2", "oid2" + padding_s, 4, 4));
-      auto padding_e = std::string(248, '_');
+      auto padding_e = std::string(247, '_');
       keys.insert(make_ghobj(5, 5, 5, "ns4", "oid4" + padding_e, 2, 2));
       keys.insert(make_ghobj(5, 5, 5, "ns4", "oid4" + padding_e, 3, 3));
       keys.insert(make_ghobj(5, 5, 5, "ns4", "oid4" + padding_e, 4, 4));
@@ -1385,7 +1443,7 @@ TEST_F(c_dummy_test_t, 5_split_merge_internal_node)
     {
       logger().info("\n---------------------------------------------"
                     "\nbefore internal node insert (3):\n");
-      auto padding = std::string(420, '_');
+      auto padding = std::string(419, '_');
       auto keys = build_key_set({2, 5}, {2, 5}, {2, 5}, padding, true);
       keys.erase(make_ghobj(4, 4, 4, "ns4", "oid4" + padding, 2, 2));
       keys.erase(make_ghobj(4, 4, 4, "ns4", "oid4" + padding, 3, 3));
@@ -1410,7 +1468,7 @@ TEST_F(c_dummy_test_t, 5_split_merge_internal_node)
       keys.erase(make_ghobj(2, 2, 2, "ns2", "oid2" + padding, 2, 2));
       keys.erase(make_ghobj(2, 2, 2, "ns2", "oid2" + padding, 3, 3));
       keys.erase(make_ghobj(2, 2, 2, "ns2", "oid2" + padding, 4, 4));
-      auto padding_s = std::string(387, '_');
+      auto padding_s = std::string(386, '_');
       keys.insert(make_ghobj(2, 2, 2, "ns2", "oid2" + padding_s, 2, 2));
       keys.insert(make_ghobj(2, 2, 2, "ns2", "oid2" + padding_s, 3, 3));
       keys.insert(make_ghobj(2, 2, 2, "ns2", "oid2" + padding_s, 4, 4));
@@ -1458,7 +1516,7 @@ TEST_F(c_dummy_test_t, 5_split_merge_internal_node)
                     "\nbefore internal node insert (6):\n");
       auto padding = std::string(328, '_');
       auto keys = build_key_set({2, 5}, {2, 5}, {2, 5}, padding);
-      keys.insert(make_ghobj(5, 5, 5, "ns3", "oid3" + std::string(271, '_'), 3, 3));
+      keys.insert(make_ghobj(5, 5, 5, "ns3", "oid3" + std::string(270, '_'), 3, 3));
       keys.insert(make_ghobj(9, 9, 9, "ns~last", "oid~last", 9, 9));
       pool.build_tree(keys).unsafe_get0();
 
@@ -1519,31 +1577,32 @@ TEST_F(d_seastore_tm_test_t, 6_random_tree_insert_erase)
     constexpr bool TEST_SEASTORE = true;
     constexpr bool TRACK_CURSORS = true;
     auto kvs = KVPool<test_item_t>::create_raw_range(
-        {8, 11, 64, 256, 301, 320},
+        {8, 11,  64, 256, 301, 320},
+        {8, 11,  64, 256, 301, 320},
         {8, 16, 128, 512, 576, 640},
-        {0, 32}, {0, 10}, {0, 4});
+        {0, 16}, {0, 10}, {0, 4});
     auto moved_nm = (TEST_SEASTORE ? NodeExtentManager::create_seastore(*tm)
                                    : NodeExtentManager::create_dummy(IS_DUMMY_SYNC));
     auto p_nm = moved_nm.get();
-    auto tree = std::make_unique<TreeBuilder<TRACK_CURSORS, test_item_t>>(
+    auto tree = std::make_unique<TreeBuilder<TRACK_CURSORS, BoundedValue>>(
         kvs, std::move(moved_nm));
     {
-      auto t = tm->create_transaction();
-      tree->bootstrap(*t).unsafe_get();
-      tm->submit_transaction(std::move(t)).unsafe_get();
+      auto t = create_mutate_transaction();
+      INTR(tree->bootstrap, *t).unsafe_get();
+      submit_transaction(std::move(t));
       segment_cleaner->run_until_halt().get0();
     }
 
     // test insert
     {
-      auto t = tm->create_transaction();
-      tree->insert(*t).unsafe_get();
-      tm->submit_transaction(std::move(t)).unsafe_get();
+      auto t = create_mutate_transaction();
+      INTR(tree->insert, *t).unsafe_get();
+      submit_transaction(std::move(t));
       segment_cleaner->run_until_halt().get0();
     }
     {
-      auto t = tm->create_transaction();
-      tree->get_stats(*t).unsafe_get();
+      auto t = create_read_transaction();
+      INTR(tree->get_stats, *t).unsafe_get();
     }
     if constexpr (TEST_SEASTORE) {
       logger().info("seastore replay insert begin");
@@ -1552,21 +1611,22 @@ TEST_F(d_seastore_tm_test_t, 6_random_tree_insert_erase)
       logger().info("seastore replay insert end");
     }
     {
-      // Note: tm->create_weak_transaction() can also work, but too slow.
-      auto t = tm->create_transaction();
-      tree->validate(*t).unsafe_get();
+      // Note: create_weak_transaction() can also work, but too slow.
+      auto t = create_read_transaction();
+      INTR(tree->validate, *t).unsafe_get();
     }
 
     // test erase 3/4
     {
-      auto t = tm->create_transaction();
-      tree->erase(*t, kvs.size() / 4 * 3).unsafe_get();
-      tm->submit_transaction(std::move(t)).unsafe_get();
+      auto t = create_mutate_transaction();
+      auto size = kvs.size() / 4 * 3;
+      INTR_R(tree->erase, *t, size).unsafe_get();
+      submit_transaction(std::move(t));
       segment_cleaner->run_until_halt().get0();
     }
     {
-      auto t = tm->create_transaction();
-      tree->get_stats(*t).unsafe_get();
+      auto t = create_read_transaction();
+      INTR(tree->get_stats, *t).unsafe_get();
     }
     if constexpr (TEST_SEASTORE) {
       logger().info("seastore replay erase-1 begin");
@@ -1575,20 +1635,21 @@ TEST_F(d_seastore_tm_test_t, 6_random_tree_insert_erase)
       logger().info("seastore replay erase-1 end");
     }
     {
-      auto t = tm->create_transaction();
-      tree->validate(*t).unsafe_get();
+      auto t = create_read_transaction();
+      INTR(tree->validate, *t).unsafe_get();
     }
 
     // test erase remaining
     {
-      auto t = tm->create_transaction();
-      tree->erase(*t, kvs.size()).unsafe_get();
-      tm->submit_transaction(std::move(t)).unsafe_get();
+      auto t = create_mutate_transaction();
+      auto size = kvs.size();
+      INTR_R(tree->erase, *t, size).unsafe_get();
+      submit_transaction(std::move(t));
       segment_cleaner->run_until_halt().get0();
     }
     {
-      auto t = tm->create_transaction();
-      tree->get_stats(*t).unsafe_get();
+      auto t = create_read_transaction();
+      INTR(tree->get_stats, *t).unsafe_get();
     }
     if constexpr (TEST_SEASTORE) {
       logger().info("seastore replay erase-2 begin");
@@ -1597,15 +1658,135 @@ TEST_F(d_seastore_tm_test_t, 6_random_tree_insert_erase)
       logger().info("seastore replay erase-2 end");
     }
     {
-      auto t = tm->create_transaction();
-      tree->validate(*t).unsafe_get();
-      EXPECT_EQ(tree->height(*t).unsafe_get0(), 1);
+      auto t = create_read_transaction();
+      INTR(tree->validate, *t).unsafe_get();
+      EXPECT_EQ(INTR(tree->height, *t).unsafe_get0(), 1);
     }
 
     if constexpr (!TEST_SEASTORE) {
       auto p_dummy = static_cast<DummyManager*>(p_nm);
       EXPECT_EQ(p_dummy->size(), 1);
     }
+    tree.reset();
+  });
+}
+
+TEST_F(d_seastore_tm_test_t, 7_tree_insert_erase_eagain)
+{
+  run_async([this] {
+    constexpr double EAGAIN_PROBABILITY = 0.1;
+    constexpr bool TRACK_CURSORS = false;
+    auto kvs = KVPool<test_item_t>::create_raw_range(
+        {8, 11,  64, 128,  255,  256},
+        {8, 13,  64, 512, 2035, 2048},
+        {8, 16, 128, 576,  992, 1200},
+        {0, 8}, {0, 10}, {0, 4});
+    auto moved_nm = NodeExtentManager::create_seastore(
+        *tm, L_ADDR_MIN, EAGAIN_PROBABILITY);
+    auto p_nm = static_cast<SeastoreNodeExtentManager<true>*>(moved_nm.get());
+    auto tree = std::make_unique<TreeBuilder<TRACK_CURSORS, ExtendedValue>>(
+        kvs, std::move(moved_nm));
+    unsigned num_ops = 0;
+    unsigned num_ops_eagain = 0;
+
+    // bootstrap
+    ++num_ops;
+    repeat_eagain([this, &tree, &num_ops_eagain] {
+      ++num_ops_eagain;
+      return seastar::do_with(
+	create_mutate_transaction(),
+	[this, &tree](auto &t) {
+	  return INTR(tree->bootstrap, *t
+	  ).safe_then([this, &t] {
+	    return submit_transaction_fut(*t);
+	  });
+	});
+    }).unsafe_get0();
+    segment_cleaner->run_until_halt().get0();
+
+    // insert
+    logger().warn("start inserting {} kvs ...", kvs.size());
+    {
+      auto iter = kvs.random_begin();
+      while (iter != kvs.random_end()) {
+        ++num_ops;
+        repeat_eagain([this, &tree, &num_ops_eagain, &iter] {
+          ++num_ops_eagain;
+	  return seastar::do_with(
+	    create_mutate_transaction(),
+	    [this, &tree, &iter](auto &t) {
+	      return INTR_R(tree->insert_one, *t, iter
+	      ).safe_then([this, &t](auto cursor) {
+		cursor.invalidate();
+		return submit_transaction_fut(*t);
+	      });
+	    });
+        }).unsafe_get0();
+        segment_cleaner->run_until_halt().get0();
+        ++iter;
+      }
+    }
+
+    {
+      p_nm->set_generate_eagain(false);
+      auto t = create_read_transaction();
+      INTR(tree->get_stats, *t).unsafe_get0();
+      p_nm->set_generate_eagain(true);
+    }
+
+    // lookup
+    logger().warn("start lookup {} kvs ...", kvs.size());
+    {
+      auto iter = kvs.begin();
+      while (iter != kvs.end()) {
+        ++num_ops;
+        repeat_eagain([this, &tree, &num_ops_eagain, &iter] {
+          ++num_ops_eagain;
+          auto t = create_read_transaction();
+          return INTR_R(tree->validate_one, *t, iter
+          ).safe_then([t=std::move(t)]{});
+        }).unsafe_get0();
+        ++iter;
+      }
+    }
+
+    // erase
+    logger().warn("start erase {} kvs ...", kvs.size());
+    {
+      kvs.shuffle();
+      auto iter = kvs.random_begin();
+      while (iter != kvs.random_end()) {
+        ++num_ops;
+        repeat_eagain([this, &tree, &num_ops_eagain, &iter] {
+          ++num_ops_eagain;
+	  return seastar::do_with(
+	    create_mutate_transaction(),
+	    [this, &tree, &iter](auto &t) {
+	      return INTR_R(tree->erase_one, *t, iter
+	      ).safe_then([this, &t] () mutable {
+		return submit_transaction_fut(*t);
+	      });
+	    });
+        }).unsafe_get0();
+        segment_cleaner->run_until_halt().get0();
+        ++iter;
+      }
+      kvs.erase_from_random(kvs.random_begin(), kvs.random_end());
+    }
+
+    {
+      p_nm->set_generate_eagain(false);
+      auto t = create_read_transaction();
+      INTR(tree->get_stats, *t).unsafe_get0();
+      INTR(tree->validate, *t).unsafe_get0();
+      EXPECT_EQ(INTR(tree->height,*t).unsafe_get0(), 1);
+    }
+
+    // we can adjust EAGAIN_PROBABILITY to get a proper eagain_rate
+    double eagain_rate = num_ops_eagain;
+    eagain_rate /= num_ops;
+    logger().info("eagain rate: {}", eagain_rate);
+
     tree.reset();
   });
 }

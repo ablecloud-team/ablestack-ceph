@@ -1,7 +1,7 @@
 include(AddCephTest)
 
 set(UNITTEST_LIBS GMock::Main GMock::GMock GTest::GTest ${CMAKE_THREAD_LIBS_INIT} 
-    ${GSSAPI_LIBRARIES} ${OPENLDAP_LIBRARIES} ${CMAKE_DL_LIBS})
+    ${GSSAPI_LIBRARIES} ${CMAKE_DL_LIBS})
 
 if(WIN32)
   # Needed by Boost.
@@ -275,9 +275,6 @@ if(${WITH_RADOSGW})
 add_executable(ceph_test_librgw_file
   librgw_file.cc
   )
-if(WITH_RADOSGW_FCGI_FRONTEND)
-target_include_directories(ceph_test_librgw_file SYSTEM PRIVATE ${FCGI_INCLUDE_DIR})
-endif(WITH_RADOSGW_FCGI_FRONTEND)
 target_link_libraries(ceph_test_librgw_file
   rgw
   librados
@@ -318,9 +315,6 @@ add_executable(ceph_test_librgw_file_nfsns
   librgw_file_nfsns.cc
   )
 target_include_directories(ceph_test_librgw_file_nfsns SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
-if(WITH_RADOSGW_FCGI_FRONTEND)
-target_include_directories(ceph_test_librgw_file_nfsns SYSTEM PRIVATE ${FCGI_INCLUDE_DIR})
-endif(WITH_RADOSGW_FCGI_FRONTEND)
 target_link_libraries(ceph_test_librgw_file_nfsns
   rgw
   librados
@@ -392,9 +386,11 @@ add_executable(test_rgw_ldap
 target_link_libraries(test_rgw_ldap
   librados
   ceph-common
-  ${OPENLDAP_LIBRARIES}
-  ${UNITTEST_LIBS}
-  )
+  ${UNITTEST_LIBS})
+if(WITH_OPENLDAP)
+  target_link_libraries(test_rgw_ldap
+    OpenLDAP::OpenLDAP)
+endif()
 endif(${WITH_RADOSGW})
 
 # ceph_multi_stress_watch
@@ -612,6 +608,10 @@ add_ceph_test(run-cli-tests ${CMAKE_CURRENT_SOURCE_DIR}/run-cli-tests)
 
 add_ceph_test(smoke.sh ${CMAKE_CURRENT_SOURCE_DIR}/smoke.sh)
 
+if(DEFINED PROMTOOL_EXECUTABLE)
+  set(promtool_executable_checked TRUE)
+endif()
+
 find_program(PROMTOOL_EXECUTABLE promtool)
 if(PROMTOOL_EXECUTABLE)
   execute_process(
@@ -621,15 +621,12 @@ if(PROMTOOL_EXECUTABLE)
   if(NOT rc)
     add_ceph_test(run-promtool-unittests
       ${PROMTOOL_EXECUTABLE} test rules ${CMAKE_SOURCE_DIR}/monitoring/prometheus/alerts/test_alerts.yml)
-  else()
+  elseif(NOT promtool_executable_checked)
     message(WARNING "'${PROMTOOL_EXECUTABLE} test rules' does not work, "
       "please use a newer prometheus")
   endif()
-else()
-  if(LINUX)
-    add_ceph_test(run-promtool-unittests
-      {CMAKE_CURRENT_SOURCE_DIR}/run-promtool-unittests.sh)
-  endif()
+elseif(NOT promtool_executable_checked)
+  message(WARNING "run-promtool-unittests is skipped due to missing promtool")
 endif()
 
 set_property(
@@ -985,4 +982,6 @@ add_ceph_unittest(unittest_any)
 add_executable(unittest_weighted_shuffle test_weighted_shuffle.cc)
 add_ceph_unittest(unittest_weighted_shuffle)
 
+add_executable(unittest_intarith test_intarith.cc)
+add_ceph_unittest(unittest_intarith)
 #make check ends here

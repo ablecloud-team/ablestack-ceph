@@ -329,7 +329,11 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         return cast(str, self.get_module_option("orchestrator"))
 
     @_cli_write_command('orch host add')
-    def _add_host(self, hostname: str, addr: Optional[str] = None, labels: Optional[List[str]] = None, maintenance: Optional[bool] = False) -> HandleCommandResult:
+    def _add_host(self,
+                  hostname: str,
+                  addr: Optional[str] = None,
+                  labels: Optional[List[str]] = None,
+                  maintenance: Optional[bool] = False) -> HandleCommandResult:
         """Add a host"""
         _status = 'maintenance' if maintenance else ''
 
@@ -345,6 +349,13 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
     def _remove_host(self, hostname: str) -> HandleCommandResult:
         """Remove a host"""
         completion = self.remove_host(hostname)
+        raise_if_exception(completion)
+        return HandleCommandResult(stdout=completion.result_str())
+
+    @_cli_write_command('orch host drain')
+    def _drain_host(self, hostname: str) -> HandleCommandResult:
+        """drain all daemons from a host"""
+        completion = self.drain_host(hostname)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
@@ -607,6 +618,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
     @_cli_read_command('orch ps')
     def _list_daemons(self,
                       hostname: Optional[str] = None,
+                      _end_positional_: int = 0,
                       service_name: Optional[str] = None,
                       daemon_type: Optional[str] = None,
                       daemon_id: Optional[str] = None,
@@ -810,24 +822,24 @@ Usage:
 
     @_cli_write_command('orch osd rm')
     def _osd_rm_start(self,
-                      svc_id: List[str],
+                      osd_id: List[str],
                       replace: bool = False,
                       force: bool = False) -> HandleCommandResult:
-        """Remove OSD services"""
-        completion = self.remove_osds(svc_id, replace=replace, force=force)
+        """Remove OSD daemons"""
+        completion = self.remove_osds(osd_id, replace=replace, force=force)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
     @_cli_write_command('orch osd rm stop')
-    def _osd_rm_stop(self, svc_id: List[str]) -> HandleCommandResult:
+    def _osd_rm_stop(self, osd_id: List[str]) -> HandleCommandResult:
         """Cancel ongoing OSD removal operation"""
-        completion = self.stop_remove_osds(svc_id)
+        completion = self.stop_remove_osds(osd_id)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
     @_cli_write_command('orch osd rm status')
     def _osd_rm_status(self, format: Format = Format.plain) -> HandleCommandResult:
-        """status of OSD removal operation"""
+        """Status of OSD removal operation"""
         completion = self.remove_osds_status()
         raise_if_exception(completion)
         report = completion.result
@@ -896,9 +908,10 @@ Usage:
     @_cli_write_command('orch daemon add rgw')
     def _rgw_add(self,
                  svc_id: str,
+                 placement: Optional[str] = None,
+                 _end_positional_: int = 0,
                  port: Optional[int] = None,
                  ssl: bool = False,
-                 placement: Optional[str] = None,
                  inbuf: Optional[str] = None) -> HandleCommandResult:
         """Start RGW daemon(s)"""
         if inbuf:
@@ -915,8 +928,6 @@ Usage:
     @_cli_write_command('orch daemon add nfs')
     def _nfs_add(self,
                  svc_id: str,
-                 pool: str,
-                 namespace: Optional[str] = None,
                  placement: Optional[str] = None,
                  inbuf: Optional[str] = None) -> HandleCommandResult:
         """Start NFS daemon(s)"""
@@ -925,8 +936,6 @@ Usage:
 
         spec = NFSServiceSpec(
             service_id=svc_id,
-            pool=pool,
-            namespace=namespace,
             placement=PlacementSpec.from_string(placement),
         )
         return self._daemon_add_misc(spec)
@@ -970,7 +979,9 @@ Usage:
         return HandleCommandResult(stdout=completion.result_str())
 
     @_cli_write_command('orch daemon redeploy')
-    def _daemon_action_redeploy(self, name: str, image: Optional[str] = None) -> HandleCommandResult:
+    def _daemon_action_redeploy(self,
+                                name: str,
+                                image: Optional[str] = None) -> HandleCommandResult:
         """Redeploy a daemon (with a specifc image)"""
         if '.' not in name:
             raise OrchestratorError('%s is not a valid daemon name' % name)
@@ -1084,11 +1095,12 @@ Usage:
     @_cli_write_command('orch apply rgw')
     def _apply_rgw(self,
                    svc_id: str,
+                   placement: Optional[str] = None,
+                   _end_positional_: int = 0,
                    realm: Optional[str] = None,
                    zone: Optional[str] = None,
                    port: Optional[int] = None,
                    ssl: bool = False,
-                   placement: Optional[str] = None,
                    dry_run: bool = False,
                    format: Format = Format.plain,
                    unmanaged: bool = False,
@@ -1121,10 +1133,9 @@ Usage:
     @_cli_write_command('orch apply nfs')
     def _apply_nfs(self,
                    svc_id: str,
-                   pool: str,
-                   namespace: Optional[str] = None,
                    placement: Optional[str] = None,
                    format: Format = Format.plain,
+                   port: Optional[int] = None,
                    dry_run: bool = False,
                    unmanaged: bool = False,
                    no_overwrite: bool = False,
@@ -1135,8 +1146,7 @@ Usage:
 
         spec = NFSServiceSpec(
             service_id=svc_id,
-            pool=pool,
-            namespace=namespace,
+            port=port,
             placement=PlacementSpec.from_string(placement),
             unmanaged=unmanaged,
             preview_only=dry_run
@@ -1336,6 +1346,7 @@ Usage:
     @_cli_write_command('orch upgrade start')
     def _upgrade_start(self,
                        image: Optional[str] = None,
+                       _end_positional_: int = 0,
                        ceph_version: Optional[str] = None) -> HandleCommandResult:
         """Initiate upgrade"""
         self._upgrade_check_image_name(image, ceph_version)

@@ -64,7 +64,7 @@ try:
 except:
     pass
 
-def init_log():
+def init_log(log_level=logging.INFO):
     global log
     if log is not None:
         del log
@@ -79,7 +79,7 @@ def init_log():
         datefmt='%Y-%m-%dT%H:%M:%S')
     handler.setFormatter(formatter)
     log.addHandler(handler)
-    log.setLevel(logging.INFO)
+    log.setLevel(log_level)
 
 log = None
 init_log()
@@ -532,13 +532,11 @@ class LocalDaemon(object):
             if line.find("ceph-{0} -i {1}".format(self.daemon_type, self.daemon_id)) != -1:
                 log.debug("Found ps line for daemon: {0}".format(line))
                 return int(line.split()[0])
-        if opt_log_ps_output:
-            log.debug("No match for {0} {1}: {2}".format(
-                self.daemon_type, self.daemon_id, ps_txt))
-        else:
-            log.debug("No match for {0} {1}".format(self.daemon_type,
-                     self.daemon_id))
-            return None
+        if not opt_log_ps_output:
+            ps_txt = '(omitted)'
+        log.debug("No match for {0} {1}: {2}".format(
+            self.daemon_type, self.daemon_id, ps_txt))
+        return None
 
     def wait(self, timeout):
         waited = 0
@@ -554,6 +552,8 @@ class LocalDaemon(object):
             return
 
         pid = self._get_pid()
+        if pid is None:
+            return
         log.debug("Killing PID {0} for {1}.{2}".format(pid, self.daemon_type, self.daemon_id))
         os.kill(pid, signal.SIGTERM)
 
@@ -659,12 +659,16 @@ class LocalCephFSMount():
         path = "{0}/client.{1}.*.asok".format(d, self.client_id)
         return path
 
-    def _run_python(self, pyscript, py_version='python'):
+    def _run_python(self, pyscript, py_version='python', sudo=False):
         """
         Override this to remove the daemon-helper prefix that is used otherwise
         to make the process killable.
         """
-        return self.client_remote.run(args=[py_version, '-c', pyscript],
+        args = []
+        if sudo:
+            args.append('sudo')
+        args += [py_version, '-c', pyscript]
+        return self.client_remote.run(args=args,
                                       wait=False, stdout=StringIO())
 
     def setup_netns(self):
@@ -1011,6 +1015,12 @@ class LocalCluster(object):
     def only(self, requested):
         return self.__class__(rolename=requested)
 
+    def run(self, *args, **kwargs):
+        r = []
+        for remote in self.remotes.keys():
+            r.append(remote.run(*args, **kwargs))
+        return r
+
 
 class LocalContext(object):
     def __init__(self):
@@ -1107,23 +1117,20 @@ class LogRotate():
 def teardown_cluster():
     log.info('\ntearing down the cluster...')
     remote.run(args=[os.path.join(SRC_PREFIX, "stop.sh")], timeout=60)
+    log.info('\nceph cluster torn down')
     remote.run(args=['rm', '-rf', './dev', './out'])
 
 
 def clear_old_log():
-    from os import stat
-
     try:
-        stat(logpath)
-    # would need an update when making this py3 compatible. Use FileNotFound
-    # instead.
-    except OSError:
+        os.stat(logpath)
+    except FileNotFoundError:
         return
     else:
         os.remove(logpath)
         with open(logpath, 'w') as logfile:
             logfile.write('')
-        init_log()
+        init_log(log.level)
         log.debug('logging in a fresh file now...')
 
 
@@ -1393,9 +1400,11 @@ def exec_test():
         if opt_verbose:
             args.append("-d")
 
+        log.info('\nrunning vstart.sh now...')
         # usually, i get vstart.sh running completely in less than 100
         # seconds.
         remote.run(args=args, env=vstart_env, timeout=(3 * 60))
+        log.info('\nvstart.sh finished running')
 
         # Wait for OSD to come up so that subsequent injectargs etc will
         # definitely succeed

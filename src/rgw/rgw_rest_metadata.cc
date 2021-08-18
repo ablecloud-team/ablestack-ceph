@@ -30,6 +30,8 @@
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
+using namespace std;
+
 static inline void frame_metadata_key(req_state *s, string& out) {
   bool exists;
   string key = s->info.args.get("key", &exists);
@@ -142,7 +144,7 @@ void RGWOp_Metadata_List::execute(optional_yield y) {
   do {
     list<string> keys;
     left = (max_entries_specified ? max_entries - count : max);
-    op_ret = store->meta_list_keys_next(handle, left, keys, &truncated);
+    op_ret = store->meta_list_keys_next(this, handle, left, keys, &truncated);
     if (op_ret < 0) {
       ldpp_dout(this, 5) << "ERROR: lists_keys_next(): " << cpp_strerror(op_ret)
 	      << dendl;

@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-from __future__ import absolute_import
 
 import json
 import logging
@@ -98,6 +97,7 @@ class RgwDaemon(RESTController):
                 # extract per-daemon service data and health
                 daemon = {
                     'id': metadata['id'],
+                    'service_map_id': service['id'],
                     'version': metadata['ceph_version'],
                     'server_hostname': hostname,
                     'zonegroup_name': metadata['zonegroup_name'],
@@ -201,8 +201,8 @@ class RgwBucket(RgwRESTController):
                      retention_period_days, retention_period_years):
         rgw_client = RgwClient.instance(owner, daemon_name)
         return rgw_client.set_bucket_locking(bucket_name, mode,
-                                             int(retention_period_days),
-                                             int(retention_period_years))
+                                             retention_period_days,
+                                             retention_period_years)
 
     @staticmethod
     def strip_tenant_from_bucket_name(bucket_name):

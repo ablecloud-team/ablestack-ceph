@@ -2,13 +2,10 @@
 """
 ceph dashboard mgr plugin (based on CherryPy)
 """
-from __future__ import absolute_import
-
 import collections
 import errno
 import logging
 import os
-import socket
 import ssl
 import sys
 import tempfile
@@ -32,6 +29,7 @@ from .controllers import generate_routes, json_error_page
 from .grafana import push_local_dashboards
 from .services.auth import AuthManager, AuthManagerTool, JwtManager
 from .services.exception import dashboard_exception_handler
+from .services.rgw_client import configure_rgw_credentials
 from .services.sso import SSO_COMMANDS, handle_sso_command
 from .settings import handle_option_command, options_command_list, options_schema_list
 from .tools import NotificationQueue, RequestLoggingTool, TaskManager, \
@@ -51,7 +49,7 @@ if cherrypy is not None:
     patch_cherrypy(cherrypy.__version__)
 
 # pylint: disable=wrong-import-position
-from .plugins import PLUGIN_MANAGER, debug, feature_toggles  # noqa # pylint: disable=unused-import
+from .plugins import PLUGIN_MANAGER, debug, feature_toggles, motd  # isort:skip # noqa E501 # pylint: disable=unused-import
 
 PLUGIN_MANAGER.hook.init()
 
@@ -109,6 +107,8 @@ class CherryPyConfig(object):
         else:
             server_port = self.get_localized_module_option('ssl_server_port', 8443)  # type: ignore
 
+        if server_addr == '::':
+            server_addr = self.get_mgr_ip()  # type: ignore
         if server_addr is None:
             raise ServerConfigException(
                 'no server_addr configured; '
@@ -193,7 +193,7 @@ class CherryPyConfig(object):
 
         uri = "{0}://{1}:{2}{3}/".format(
             'https' if use_ssl else 'http',
-            socket.getfqdn(server_addr if server_addr != '::' else ''),
+            server_addr,
             server_port,
             self.url_prefix
         )
@@ -304,7 +304,15 @@ class Module(MgrModule, CherryPyConfig):
     @classmethod
     def get_frontend_path(cls):
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(current_dir, 'frontend/dist')
+        path = os.path.join(current_dir, 'frontend/dist')
+        if os.path.exists(path):
+            return path
+        else:
+            path = os.path.join(current_dir,
+                                '../../../../build',
+                                'src/pybind/mgr/dashboard',
+                                'frontend/dist')
+            return os.path.abspath(path)
 
     def serve(self):
 
@@ -398,6 +406,15 @@ class Module(MgrModule, CherryPyConfig):
         if result.retval != 0:
             return result
         return 0, 'Self-signed certificate created', ''
+
+    @CLIWriteCommand("dashboard set-rgw-credentials")
+    def set_rgw_credentials(self):
+        try:
+            configure_rgw_credentials()
+        except Exception as error:
+            return -errno.EINVAL, '', str(error)
+
+        return 0, 'RGW credentials configured', ''
 
     def handle_command(self, inbuf, cmd):
         # pylint: disable=too-many-return-statements

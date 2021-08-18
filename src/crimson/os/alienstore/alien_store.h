@@ -14,6 +14,10 @@
 #include "crimson/os/futurized_collection.h"
 #include "crimson/os/futurized_store.h"
 
+namespace seastar::alien {
+class instance;
+}
+
 namespace ceph::os {
 class Transaction;
 }
@@ -39,7 +43,10 @@ public:
     AlienStore* store;
     CollectionRef ch;
   };
-  AlienStore(const std::string& path, const ConfigValues& values);
+  AlienStore(const std::string& type,
+             const std::string& path,
+             const ConfigValues& values,
+             seastar::alien::instance& alien);
   ~AlienStore() final;
 
   seastar::future<> start() final;
@@ -90,6 +97,10 @@ public:
   seastar::future<> do_transaction(CollectionRef c,
                                    ceph::os::Transaction&& txn) final;
 
+  // error injection
+  seastar::future<> inject_data_error(const ghobject_t& o) final;
+  seastar::future<> inject_mdata_error(const ghobject_t& o) final;
+
   seastar::future<> write_meta(const std::string& key,
                   const std::string& value) final;
   seastar::future<std::tuple<int, std::string>> read_meta(
@@ -118,7 +129,9 @@ private:
   static constexpr int N_CORES_FOR_SEASTAR = 3;
   constexpr static unsigned MAX_KEYS_PER_OMAP_GET_CALL = 32;
   mutable std::unique_ptr<crimson::os::ThreadPool> tp;
+  const std::string type;
   const std::string path;
+  seastar::alien::instance& alien;
   uint64_t used_bytes = 0;
   std::unique_ptr<ObjectStore> store;
   std::unique_ptr<CephContext> cct;

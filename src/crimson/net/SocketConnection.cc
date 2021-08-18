@@ -21,6 +21,7 @@
 #include "Interceptor.h"
 #endif
 
+using std::ostream;
 using namespace crimson::net;
 using crimson::common::local_conf;
 
@@ -70,12 +71,6 @@ bool SocketConnection::peer_wins() const
 }
 
 seastar::future<> SocketConnection::send(MessageURef msg)
-{
-  assert(seastar::this_shard_id() == shard_id());
-  return protocol->send(MessageRef{msg.release(), false});
-}
-
-seastar::future<> SocketConnection::send(MessageRef msg)
 {
   assert(seastar::this_shard_id() == shard_id());
   return protocol->send(std::move(msg));

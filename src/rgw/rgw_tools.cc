@@ -33,6 +33,8 @@
 
 #define READ_CHUNK_LEN (512 * 1024)
 
+using namespace std;
+
 static std::map<std::string, std::string>* ext_mime_map;
 
 int rgw_init_ioctx(const DoutPrefixProvider *dpp,
@@ -344,14 +346,14 @@ void parse_mime_map(const char *buf)
   }
 }
 
-static int ext_mime_map_init(CephContext *cct, const char *ext_map)
+static int ext_mime_map_init(const DoutPrefixProvider *dpp, CephContext *cct, const char *ext_map)
 {
   int fd = open(ext_map, O_RDONLY);
   char *buf = NULL;
   int ret;
   if (fd < 0) {
     ret = -errno;
-    ldout(cct, 0) << __func__ << " failed to open file=" << ext_map
+    ldpp_dout(dpp, 0) << __func__ << " failed to open file=" << ext_map
                   << " : " << cpp_strerror(-ret) << dendl;
     return ret;
   }
@@ -360,7 +362,7 @@ static int ext_mime_map_init(CephContext *cct, const char *ext_map)
   ret = fstat(fd, &st);
   if (ret < 0) {
     ret = -errno;
-    ldout(cct, 0) << __func__ << " failed to stat file=" << ext_map
+    ldpp_dout(dpp, 0) << __func__ << " failed to stat file=" << ext_map
                   << " : " << cpp_strerror(-ret) << dendl;
     goto done;
   }
@@ -368,17 +370,17 @@ static int ext_mime_map_init(CephContext *cct, const char *ext_map)
   buf = (char *)malloc(st.st_size + 1);
   if (!buf) {
     ret = -ENOMEM;
-    ldout(cct, 0) << __func__ << " failed to allocate buf" << dendl;
+    ldpp_dout(dpp, 0) << __func__ << " failed to allocate buf" << dendl;
     goto done;
   }
 
   ret = safe_read(fd, buf, st.st_size + 1);
   if (ret != st.st_size) {
     // huh? file size has changed?
-    ldout(cct, 0) << __func__ << " raced! will retry.." << dendl;
+    ldpp_dout(dpp, 0) << __func__ << " raced! will retry.." << dendl;
     free(buf);
     close(fd);
-    return ext_mime_map_init(cct, ext_map);
+    return ext_mime_map_init(dpp, cct, ext_map);
   }
   buf[st.st_size] = '\0';
 
@@ -488,16 +490,16 @@ int RGWDataAccess::Object::put(bufferlist& data,
 
   string req_id = store->zone_unique_id(store->get_new_req_id());
 
-  using namespace rgw::putobj;
-  AtomicObjectProcessor processor(&aio, store, b.get(), nullptr,
-                                  owner.get_id(), obj_ctx, std::move(obj), olh_epoch,
-                                  req_id, dpp, y);
+  std::unique_ptr<rgw::sal::Writer> processor;
+  processor = store->get_atomic_writer(dpp, y, std::move(obj),
+				       owner.get_id(), obj_ctx,
+				       nullptr, olh_epoch, req_id);
 
-  int ret = processor.prepare(y);
+  int ret = processor->prepare(y);
   if (ret < 0)
     return ret;
 
-  DataProcessor *filter = &processor;
+  rgw::sal::DataProcessor *filter = processor.get();
 
   CompressorRef plugin;
   boost::optional<RGWPutObj_Compress> compressor;
@@ -506,7 +508,7 @@ int RGWDataAccess::Object::put(bufferlist& data,
   if (compression_type != "none") {
     plugin = Compressor::create(store->ctx(), compression_type);
     if (!plugin) {
-      ldout(store->ctx(), 1) << "Cannot load plugin for compression type "
+      ldpp_dout(dpp, 1) << "Cannot load plugin for compression type "
         << compression_type << dendl;
     } else {
       compressor.emplace(store->ctx(), plugin, filter);
@@ -570,7 +572,7 @@ int RGWDataAccess::Object::put(bufferlist& data,
     puser_data = &(*user_data);
   }
 
-  return processor.complete(obj_size, etag,
+  return processor->complete(obj_size, etag,
 			    &mtime, mtime,
 			    attrs, delete_at,
                             nullptr, nullptr,
@@ -583,10 +585,10 @@ void RGWDataAccess::Object::set_policy(const RGWAccessControlPolicy& policy)
   policy.encode(aclbl.emplace());
 }
 
-int rgw_tools_init(CephContext *cct)
+int rgw_tools_init(const DoutPrefixProvider *dpp, CephContext *cct)
 {
   ext_mime_map = new std::map<std::string, std::string>;
-  ext_mime_map_init(cct, cct->_conf->rgw_mime_types_file.c_str());
+  ext_mime_map_init(dpp, cct, cct->_conf->rgw_mime_types_file.c_str());
   // ignore errors; missing mime.types is not fatal
   return 0;
 }

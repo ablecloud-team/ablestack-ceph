@@ -2,11 +2,11 @@
 # pylint: disable=C0302
 # pylint: disable=too-many-branches
 # pylint: disable=too-many-lines
-from __future__ import absolute_import
 
 import json
 import re
 from copy import deepcopy
+from typing import Any, Dict, List, no_type_check
 
 import cherrypy
 import rados
@@ -26,11 +26,6 @@ from ..tools import TaskManager, str_to_bool
 from . import ApiController, BaseController, ControllerDoc, Endpoint, \
     EndpointDoc, ReadPermission, RESTController, Task, UiApiController, \
     UpdatePermission
-
-try:
-    from typing import Any, Dict, List, no_type_check
-except ImportError:
-    no_type_check = object()  # Just for type checking
 
 ISCSI_SCHEMA = {
     'user': (str, 'username'),

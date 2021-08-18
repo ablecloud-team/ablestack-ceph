@@ -107,7 +107,9 @@ static constexpr std::uint64_t s3DeletePublicAccessBlock = 64;
 static constexpr std::uint64_t s3GetBucketPublicAccessBlock = 65;
 static constexpr std::uint64_t s3PutBucketPublicAccessBlock = 66;
 static constexpr std::uint64_t s3DeleteBucketPublicAccessBlock = 67;
-static constexpr std::uint64_t s3All = 68;
+static constexpr std::uint64_t s3GetBucketEncryption = 68;
+static constexpr std::uint64_t s3PutBucketEncryption = 69;
+static constexpr std::uint64_t s3All = 70;
 
 static constexpr std::uint64_t iamPutUserPolicy = s3All + 1;
 static constexpr std::uint64_t iamGetUserPolicy = s3All + 2;
@@ -197,6 +199,7 @@ inline int op_to_perm(std::uint64_t op) {
   case s3GetAccelerateConfiguration:
   case s3GetBucketAcl:
   case s3GetBucketCORS:
+  case s3GetBucketEncryption:
   case s3GetBucketLocation:
   case s3GetBucketLogging:
   case s3GetBucketNotification:
@@ -220,6 +223,7 @@ inline int op_to_perm(std::uint64_t op) {
   case s3PutAccelerateConfiguration:
   case s3PutBucketAcl:
   case s3PutBucketCORS:
+  case s3PutBucketEncryption:
   case s3PutBucketLogging:
   case s3PutBucketNotification:
   case s3PutBucketPolicy:
@@ -241,6 +245,12 @@ inline int op_to_perm(std::uint64_t op) {
   return RGW_PERM_INVALID;
 }
 }
+
+enum class PolicyPrincipal {
+  Role,
+  Session,
+  Other
+};
 
 using Environment = boost::container::flat_map<std::string, std::string>;
 
@@ -439,15 +449,15 @@ struct Statement {
 
   Effect eval(const Environment& e,
 	      boost::optional<const rgw::auth::Identity&> ida,
-	      std::uint64_t action, const ARN& resource) const;
+	      std::uint64_t action, const ARN& resource, boost::optional<PolicyPrincipal&> princ_type=boost::none) const;
 
   Effect eval_principal(const Environment& e,
-		       boost::optional<const rgw::auth::Identity&> ida) const;
+		       boost::optional<const rgw::auth::Identity&> ida, boost::optional<PolicyPrincipal&> princ_type=boost::none) const;
 
   Effect eval_conditions(const Environment& e) const;
 };
 
-std::ostream& operator <<(ostream& m, const Statement& s);
+std::ostream& operator <<(std::ostream& m, const Statement& s);
 
 struct PolicyParseException : public std::exception {
   rapidjson::ParseResult pr;
@@ -471,15 +481,15 @@ struct Policy {
 
   Effect eval(const Environment& e,
 	      boost::optional<const rgw::auth::Identity&> ida,
-	      std::uint64_t action, const ARN& resource) const;
+	      std::uint64_t action, const ARN& resource, boost::optional<PolicyPrincipal&> princ_type=boost::none) const;
 
   Effect eval_principal(const Environment& e,
-	      boost::optional<const rgw::auth::Identity&> ida) const;
+	      boost::optional<const rgw::auth::Identity&> ida, boost::optional<PolicyPrincipal&> princ_type=boost::none) const;
 
   Effect eval_conditions(const Environment& e) const;
 
   template <typename F>
-  bool has_conditional(const string& conditional, F p) const {
+  bool has_conditional(const std::string& conditional, F p) const {
     for (const auto&s: statements){
       if (std::any_of(s.conditions.begin(), s.conditions.end(),
 		      [&](const Condition& c) { return c.has_key_p(conditional, p);}))
@@ -488,16 +498,16 @@ struct Policy {
     return false;
   }
 
-  bool has_conditional(const string& c) const {
+  bool has_conditional(const std::string& c) const {
     return has_conditional(c, Condition::ci_equal_to());
   }
 
-  bool has_partial_conditional(const string& c) const {
+  bool has_partial_conditional(const std::string& c) const {
     return has_conditional(c, Condition::ci_starts_with());
   }
 };
 
-std::ostream& operator <<(ostream& m, const Policy& p);
+std::ostream& operator <<(std::ostream& m, const Policy& p);
 bool is_public(const Policy& p);
 
 }

@@ -114,6 +114,7 @@ public:
     uint64_t dirty_seq;
     bool locked;
     bool deleted;
+    bool is_dirty;
     boost::intrusive::list_member_hook<> dirty_item;
 
     std::atomic_int num_readers, num_writers;
@@ -129,6 +130,7 @@ public:
 	dirty_seq(0),
 	locked(false),
 	deleted(false),
+	is_dirty(false),
 	num_readers(0),
 	num_writers(0),
 	num_reading(0),
@@ -204,12 +206,17 @@ public:
     }
 
     // note: BlueRocksEnv uses this append exclusively, so it's safe
-    // to use buffer_appender exclusively here (e.g., it's notion of
+    // to use buffer_appender exclusively here (e.g., its notion of
     // offset will remain accurate).
     void append(const char *buf, size_t len) {
       uint64_t l0 = get_buffer_length();
       ceph_assert(l0 + len <= std::numeric_limits<unsigned>::max());
       buffer_appender.append(buf, len);
+    }
+
+    void append(const std::byte *buf, size_t len) {
+      // allow callers to use byte type instead of char* as we simply pass byte array
+      append((const char*)buf, len);
     }
 
     // note: used internally only, for ino 1 or 0.
@@ -384,6 +391,8 @@ private:
   int _allocate_without_fallback(uint8_t id, uint64_t len,
 				 PExtentVector* extents);
 
+  /* signal replay log to include h->file in nearest log flush */
+  int _signal_dirty_to_log(FileWriter *h);
   int _flush_range(FileWriter *h, uint64_t offset, uint64_t length);
   int _flush(FileWriter *h, bool force, std::unique_lock<ceph::mutex>& l);
   int _flush(FileWriter *h, bool force, bool *flushed = nullptr);
@@ -443,9 +452,10 @@ private:
 
   int _open_super();
   int _write_super(int dev);
-  int _check_new_allocations(const bluefs_fnode_t& fnode,
-    size_t dev_count,
-    boost::dynamic_bitset<uint64_t>* used_blocks);
+  int _check_allocations(const bluefs_fnode_t& fnode,
+    boost::dynamic_bitset<uint64_t>* used_blocks,
+    bool is_alloc, //true when allocating, false when deallocating
+    const char* op_name);
   int _verify_alloc_granularity(
     __u8 id, uint64_t offset, uint64_t length,
     const char *op);
@@ -640,6 +650,8 @@ public:
   const PerfCounters* get_perf_counters() const {
     return logger;
   }
+  uint64_t debug_get_dirty_seq(FileWriter *h);
+  bool debug_get_is_dev_dirty(FileWriter *h, uint8_t dev);
 
 private:
   // Wrappers for BlockDevice::read(...) and BlockDevice::read_random(...)

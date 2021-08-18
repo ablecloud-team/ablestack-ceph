@@ -11,6 +11,7 @@
 #include "include/buffer.h"
 #include "include/cmp.h"
 #include "include/uuid.h"
+#include "include/interval_set.h"
 
 namespace crimson::os::seastore {
 
@@ -330,20 +331,20 @@ enum class extent_types_t : uint8_t {
   ROOT = 0,
   LADDR_INTERNAL = 1,
   LADDR_LEAF = 2,
-  OMAP_INNER = 4,
-  OMAP_LEAF = 5,
-  ONODE_BLOCK_STAGED = 6,
-  COLL_BLOCK = 7,
-  OBJECT_DATA_BLOCK = 8,
-  RETIRED_PLACEHOLDER = 9,
-
+  OMAP_INNER = 3,
+  OMAP_LEAF = 4,
+  ONODE_BLOCK_STAGED = 5,
+  COLL_BLOCK = 6,
+  OBJECT_DATA_BLOCK = 7,
+  RETIRED_PLACEHOLDER = 8,
+  RBM_ALLOC_INFO = 9,
   // Test Block Types
-  TEST_BLOCK = 0xF0,
-  TEST_BLOCK_PHYSICAL = 0xF1,
-
-  // None
-  NONE = 0xFF
+  TEST_BLOCK = 10,
+  TEST_BLOCK_PHYSICAL = 11,
+  // None and the number of valid extent_types_t
+  NONE = 12,
 };
+constexpr auto EXTENT_TYPES_MAX = static_cast<uint8_t>(extent_types_t::NONE);
 
 inline bool is_logical_type(extent_types_t type) {
   switch (type) {
@@ -483,12 +484,14 @@ struct __attribute__((packed)) object_data_le_t {
 struct omap_root_t {
   laddr_t addr = L_ADDR_NULL;
   depth_t depth = 0;
+  laddr_t hint = L_ADDR_MIN;
   bool mutated = false;
 
   omap_root_t() = default;
-  omap_root_t(laddr_t addr, depth_t depth)
+  omap_root_t(laddr_t addr, depth_t depth, laddr_t addr_min)
     : addr(addr),
-      depth(depth) {}
+      depth(depth),
+      hint(addr_min) {}
 
   omap_root_t(const omap_root_t &o) = default;
   omap_root_t(omap_root_t &&o) = default;
@@ -503,10 +506,11 @@ struct omap_root_t {
     return mutated;
   }
   
-  void update(laddr_t _addr, depth_t _depth) {
+  void update(laddr_t _addr, depth_t _depth, laddr_t _hint) {
     mutated = true;
     addr = _addr;
     depth = _depth;
+    hint = _hint;
   }
   
   laddr_t get_location() const {
@@ -515,6 +519,10 @@ struct omap_root_t {
 
   depth_t get_depth() const {
     return depth;
+  }
+
+  laddr_t get_hint() const {
+    return hint;
   }
 };
 
@@ -538,8 +546,8 @@ public:
     depth = init_depth_le(nroot.get_depth());
   }
   
-  omap_root_t get() const {
-    return omap_root_t(addr, depth);
+  omap_root_t get(laddr_t hint) const {
+    return omap_root_t(addr, depth, hint);
   }
 };
 
@@ -691,6 +699,22 @@ struct __attribute__((packed)) root_t {
     ::memset(meta, 0, MAX_META_LENGTH);
     ::memcpy(meta, bptr.c_str(), bl.length());
   }
+};
+
+using blk_id_t = uint64_t;
+constexpr blk_id_t NULL_BLK_ID =
+  std::numeric_limits<blk_id_t>::max();
+
+// use absolute address
+using blk_paddr_t = uint64_t;
+struct rbm_alloc_delta_t {
+  enum class op_types_t : uint8_t {
+    SET = 1,
+    CLEAR = 2
+  };
+  extent_types_t type;
+  interval_set<blk_id_t> alloc_blk_ids;
+  op_types_t op;
 };
 
 }

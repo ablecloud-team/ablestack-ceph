@@ -69,6 +69,8 @@
 
 #define dout_subsys ceph_subsys_rgw
 
+using namespace std;
+
 bool global_stop = false;
 
 static void handle_sigterm(int signum)
@@ -518,7 +520,7 @@ namespace rgw {
 
     common_init_finish(g_ceph_context);
 
-    rgw_tools_init(g_ceph_context);
+    rgw_tools_init(this, g_ceph_context);
 
     rgw_init_resolver();
     rgw::curl::setup_curl(boost::none);
@@ -615,7 +617,7 @@ namespace rgw {
 
     fe->run();
 
-    r = store->register_to_service_map("rgw-nfs", service_map_meta);
+    r = store->register_to_service_map(this, "rgw-nfs", service_map_meta);
     if (r < 0) {
       derr << "ERROR: failed to register to service map: " << cpp_strerror(-r) << dendl;
       /* ignore error */

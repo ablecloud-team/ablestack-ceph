@@ -15,6 +15,10 @@
 #include "include/uuid.h"
 #include "osd/osd_types.h"
 
+namespace seastar::alien {
+class instance;
+}
+
 namespace ceph::os {
 class Transaction;
 }
@@ -53,7 +57,8 @@ public:
 
   static std::unique_ptr<FuturizedStore> create(const std::string& type,
                                                 const std::string& data,
-                                                const ConfigValues& values);
+                                                const ConfigValues& values,
+                                                seastar::alien::instance& alien);
   FuturizedStore() = default;
   virtual ~FuturizedStore() = default;
 
@@ -104,7 +109,7 @@ public:
     CollectionRef c,
     const ghobject_t& oid) = 0;
 
-  using omap_values_t = std::map<std::string, bufferlist, std::less<>>;
+  using omap_values_t = std::map<std::string, ceph::bufferlist, std::less<>>;
   using omap_keys_t = std::set<std::string>;
   virtual read_errorator::future<omap_values_t> omap_get_values(
     CollectionRef c,
@@ -131,6 +136,14 @@ public:
 
   virtual seastar::future<> do_transaction(CollectionRef ch,
 					   ceph::os::Transaction&& txn) = 0;
+  // error injection
+  virtual seastar::future<> inject_data_error(const ghobject_t& o) {
+    return seastar::now();
+  }
+  virtual seastar::future<> inject_mdata_error(const ghobject_t& o) {
+    return seastar::now();
+  }
+
   virtual seastar::future<OmapIteratorRef> get_omap_iterator(
     CollectionRef ch,
     const ghobject_t& oid) = 0;

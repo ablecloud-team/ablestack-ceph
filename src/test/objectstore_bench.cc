@@ -18,6 +18,8 @@
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_filestore
 
+using namespace std;
+
 static void usage()
 {
   cout << "usage: ceph_objectstore_bench [flags]\n"
@@ -47,7 +49,7 @@ struct byte_units {
 
 bool byte_units::parse(const std::string &val, std::string *err)
 {
-  v = strict_iecstrtoll(val.c_str(), err);
+  v = strict_iecstrtoll(val, err);
   return err->empty();
 }
 
@@ -207,11 +209,11 @@ int main(int argc, const char *argv[])
   dout(0) << "repeats " << cfg.repeats << dendl;
   dout(0) << "threads " << cfg.threads << dendl;
 
-  auto os = std::unique_ptr<ObjectStore>(
+  auto os =
       ObjectStore::create(g_ceph_context,
                           g_conf()->osd_objectstore,
                           g_conf()->osd_data,
-                          g_conf()->osd_journal));
+                          g_conf()->osd_journal);
 
   //Checking data folder: create if needed or error if it's not empty
   DIR *dir = ::opendir(g_conf()->osd_data.c_str());

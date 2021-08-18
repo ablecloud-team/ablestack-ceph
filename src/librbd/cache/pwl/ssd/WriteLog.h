@@ -67,7 +67,7 @@ protected:
                        pwl::DeferredContexts &later) override;
   void process_work() override;
   void append_scheduled_ops(void) override;
-  void schedule_append_ops(pwl::GenericLogOperations &ops) override;
+  void schedule_append_ops(pwl::GenericLogOperations &ops, C_BlockIORequestT *req) override;
   void remove_pool_file() override;
   void release_ram(std::shared_ptr<GenericLogEntry> log_entry) override;
 
@@ -101,7 +101,6 @@ private:
 
   std::atomic<int> m_async_update_superblock = {0};
   BlockDevice *bdev = nullptr;
-  uint64_t pool_size;
   pwl::WriteLogPoolRoot pool_root;
   Builder<This> *m_builderobj;
 
@@ -109,11 +108,11 @@ private:
   void load_existing_entries(pwl::DeferredContexts &later);
   void collect_read_extents(
       uint64_t read_buffer_offset, LogMapEntry<GenericWriteLogEntry> map_entry,
-      std::vector<WriteLogCacheEntry*> &log_entries_to_read,
+      std::vector<std::shared_ptr<GenericWriteLogEntry>> &log_entries_to_read,
       std::vector<bufferlist*> &bls_to_read, uint64_t entry_hit_length,
       Extent hit_extent, pwl::C_ReadRequest *read_ctx) override;
   void complete_read(
-      std::vector<WriteLogCacheEntry*> &log_entries_to_read,
+      std::vector<std::shared_ptr<GenericWriteLogEntry>> &log_entries_to_read,
       std::vector<bufferlist*> &bls_to_read, Context *ctx) override;
   void enlist_op_appender();
   bool retire_entries(const unsigned long int frees_per_tx);
@@ -123,10 +122,9 @@ private:
   Context* construct_flush_entry_ctx(
       std::shared_ptr<GenericLogEntry> log_entry);
   void append_ops(GenericLogOperations &ops, Context *ctx,
-                  uint64_t* new_first_free_entry,
-                  uint64_t &bytes_allocated);
+                  uint64_t* new_first_free_entry);
   void write_log_entries(GenericLogEntriesVector log_entries,
-                         AioTransContext *aio);
+                         AioTransContext *aio, uint64_t *pos);
   void schedule_update_root(std::shared_ptr<WriteLogPoolRoot> root,
                             Context *ctx);
   void enlist_op_update_root();
@@ -134,10 +132,10 @@ private:
   int update_pool_root_sync(std::shared_ptr<pwl::WriteLogPoolRoot> root);
   void update_pool_root(std::shared_ptr<WriteLogPoolRoot> root,
                                           AioTransContext *aio);
-  void aio_read_data_block(WriteLogCacheEntry *log_entry, bufferlist *bl,
-                           Context *ctx);
-  void aio_read_data_block(std::vector<WriteLogCacheEntry*> &log_entries,
-                           std::vector<bufferlist *> &bls, Context *ctx);
+  void aio_read_data_block(std::shared_ptr<GenericWriteLogEntry> log_entry,
+                           bufferlist *bl, Context *ctx);
+  void aio_read_data_blocks(std::vector<std::shared_ptr<GenericWriteLogEntry>> &log_entries,
+                            std::vector<bufferlist *> &bls, Context *ctx);
   static void aio_cache_cb(void *priv, void *priv2) {
     AioTransContext *c = static_cast<AioTransContext*>(priv2);
     c->aio_finish();

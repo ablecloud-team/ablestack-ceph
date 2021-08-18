@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class IscsiService(CephService):
     TYPE = 'iscsi'
 
-    def config(self, spec: IscsiServiceSpec, daemon_id: str) -> None:  # type: ignore
+    def config(self, spec: IscsiServiceSpec) -> None:  # type: ignore
         assert self.TYPE == spec.service_type
         assert spec.pool
         self.mgr._check_pool_exists(spec.pool, spec.service_name())
@@ -96,7 +96,7 @@ class IscsiService(CephService):
                 if not spec:
                     logger.warning('No ServiceSpec found for %s', dd)
                     continue
-                ip = utils.resolve_ip(dd.hostname)
+                ip = utils.resolve_ip(self.mgr.inventory.get_addr(dd.hostname))
                 # IPv6 URL encoding requires square brackets enclosing the ip
                 if type(ip_address(ip)) is IPv6Address:
                     ip = f'[{ip}]'
@@ -150,12 +150,13 @@ class IscsiService(CephService):
         """
         logger.debug(f'Post remove daemon {self.TYPE}.{daemon.daemon_id}')
 
-        # remove config for dashboard iscsi gateways
-        ret, out, err = self.mgr.check_mon_command({
-            'prefix': 'dashboard iscsi-gateway-rm',
-            'name': daemon.hostname,
-        })
-        logger.info(f'{daemon.hostname} removed from iscsi gateways dashboard config')
+        if 'dashboard' in self.mgr.get('mgr_map')['modules']:
+            # remove config for dashboard iscsi gateways
+            ret, out, err = self.mgr.check_mon_command({
+                'prefix': 'dashboard iscsi-gateway-rm',
+                'name': daemon.hostname,
+            })
+            logger.info(f'{daemon.hostname} removed from iscsi gateways dashboard config')
 
         # needed to know if we have ssl stuff for iscsi in ceph config
         iscsi_config_dict = {}

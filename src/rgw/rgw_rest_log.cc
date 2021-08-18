@@ -37,6 +37,8 @@
 #define LOG_CLASS_LIST_MAX_ENTRIES (1000)
 #define dout_subsys ceph_subsys_rgw
 
+using namespace std;
+
 void RGWOp_MDLog_List::execute(optional_yield y) {
   string   period = s->info.args.get("period");
   string   shard = s->info.args.get("id");
@@ -701,7 +703,7 @@ void RGWOp_DATALog_Notify::execute(optional_yield y) {
     }
   }
 
-  store->wakeup_data_sync_shards(source_zone, updated_shards);
+  store->wakeup_data_sync_shards(this, source_zone, updated_shards);
 
   op_ret = 0;
 }

@@ -149,6 +149,14 @@
 #define S_IXUGO	(S_IXUSR|S_IXGRP|S_IXOTH)
 #endif
 
+using std::dec;
+using std::hex;
+using std::list;
+using std::oct;
+using std::pair;
+using std::string;
+using std::vector;
+
 using namespace TOPNSPC::common;
 
 namespace bs = boost::system;
@@ -1123,7 +1131,7 @@ void Client::update_dentry_lease(Dentry *dn, LeaseStat *dlease, utime_t from, Me
 /*
  * update MDS location cache for a single inode
  */
-void Client::update_dir_dist(Inode *in, DirStat *dst)
+void Client::update_dir_dist(Inode *in, DirStat *dst, mds_rank_t from)
 {
   // auth
   ldout(cct, 20) << "got dirfrag map for " << in->ino << " frag " << dst->frag << " to mds " << dst->auth << dendl;
@@ -1137,12 +1145,14 @@ void Client::update_dir_dist(Inode *in, DirStat *dst)
     _fragmap_remove_non_leaves(in);
   }
 
-  // replicated
-  in->dir_replicated = !dst->dist.empty();
-  if (!dst->dist.empty())
-    in->frag_repmap[dst->frag].assign(dst->dist.begin(), dst->dist.end()) ;
-  else
-    in->frag_repmap.erase(dst->frag);
+  // replicated, only update from auth mds reply
+  if (from == dst->auth) {
+    in->dir_replicated = !dst->dist.empty();
+    if (!dst->dist.empty())
+      in->frag_repmap[dst->frag].assign(dst->dist.begin(), dst->dist.end()) ;
+    else
+      in->frag_repmap.erase(dst->frag);
+  }
 }
 
 void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
@@ -1432,7 +1442,8 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
   if (reply->head.is_dentry) {
     diri = add_update_inode(&dirst, request->sent_stamp, session,
 			    request->perms);
-    update_dir_dist(diri, &dst);  // dir stat info is attached to ..
+    mds_rank_t from_mds = mds_rank_t(reply->get_source().num());
+    update_dir_dist(diri, &dst, from_mds);  // dir stat info is attached to ..
 
     if (in) {
       Dir *dir = diri->open_dir();
@@ -4788,37 +4799,6 @@ void Client::early_kick_flushing_caps(MetaSession *session)
   }
 }
 
-void SnapRealm::build_snap_context()
-{
-  set<snapid_t> snaps;
-  snapid_t max_seq = seq;
-  
-  // start with prior_parents?
-  for (unsigned i=0; i<prior_parent_snaps.size(); i++)
-    snaps.insert(prior_parent_snaps[i]);
-
-  // current parent's snaps
-  if (pparent) {
-    const SnapContext& psnapc = pparent->get_snap_context();
-    for (unsigned i=0; i<psnapc.snaps.size(); i++)
-      if (psnapc.snaps[i] >= parent_since)
-	snaps.insert(psnapc.snaps[i]);
-    if (psnapc.seq > max_seq)
-      max_seq = psnapc.seq;
-  }
-
-  // my snaps
-  for (unsigned i=0; i<my_snaps.size(); i++)
-    snaps.insert(my_snaps[i]);
-
-  // ok!
-  cached_snap_context.seq = max_seq;
-  cached_snap_context.snaps.resize(0);
-  cached_snap_context.snaps.reserve(snaps.size());
-  for (set<snapid_t>::reverse_iterator p = snaps.rbegin(); p != snaps.rend(); ++p)
-    cached_snap_context.snaps.push_back(*p);
-}
-
 void Client::invalidate_snaprealm_and_children(SnapRealm *realm)
 {
   list<SnapRealm*> q;
@@ -5644,7 +5624,7 @@ out:
   return r;
 }
 
-ostream& operator<<(ostream &out, const UserPerm& perm) {
+std::ostream& operator<<(std::ostream &out, const UserPerm& perm) {
   out << "UserPerm(uid: " << perm.uid() << ", gid: " << perm.gid() << ")";
   return out;
 }
@@ -6313,9 +6293,29 @@ void Client::_close_sessions()
   }
 }
 
+void Client::flush_mdlog_sync(Inode *in)
+{
+  if (in->unsafe_ops.empty()) {
+    return;
+  }
+
+  std::set<mds_rank_t> anchor;
+  for (auto &&p : in->unsafe_ops) {
+    anchor.emplace(p->mds);
+  }
+  if (in->auth_cap) {
+    anchor.emplace(in->auth_cap->session->mds_num);
+  }
+
+  for (auto &rank : anchor) {
+    auto session = &mds_sessions.at(rank);
+    flush_mdlog(session);
+  }
+}
+
 void Client::flush_mdlog_sync()
 {
-  if (mds_requests.empty()) 
+  if (mds_requests.empty())
     return;
   for (auto &p : mds_sessions) {
     flush_mdlog(&p.second);
@@ -10567,7 +10567,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
   } else ldout(cct, 10) << "no metadata needs to commit" << dendl;
 
   if (!syncdataonly && !in->unsafe_ops.empty()) {
-    flush_mdlog_sync();
+    flush_mdlog_sync(in);
 
     MetaRequest *req = in->unsafe_ops.back();
     ldout(cct, 15) << "waiting on unsafe requests, last tid " << req->get_tid() <<  dendl;
@@ -10805,7 +10805,7 @@ int Client::statfs(const char *path, struct statvfs *stbuf,
   if (data_pools.size() == 1) {
     objecter->get_fs_stats(stats, data_pools[0], &cond);
   } else {
-    objecter->get_fs_stats(stats, boost::optional<int64_t>(), &cond);
+    objecter->get_fs_stats(stats, std::optional<int64_t>(), &cond);
   }
 
   lock.unlock();
@@ -11047,7 +11047,7 @@ void Client::_encode_filelocks(Inode *in, bufferlist& bl)
   encode(nr_fcntl_locks, bl);
   if (nr_fcntl_locks) {
     auto &lock_state = in->fcntl_locks;
-    for(multimap<uint64_t, ceph_filelock>::iterator p = lock_state->held_locks.begin();
+    for(auto p = lock_state->held_locks.begin();
 	p != lock_state->held_locks.end();
 	++p)
       encode(p->second, bl);
@@ -11057,7 +11057,7 @@ void Client::_encode_filelocks(Inode *in, bufferlist& bl)
   encode(nr_flock_locks, bl);
   if (nr_flock_locks) {
     auto &lock_state = in->flock_locks;
-    for(multimap<uint64_t, ceph_filelock>::iterator p = lock_state->held_locks.begin();
+    for(auto p = lock_state->held_locks.begin();
 	p != lock_state->held_locks.end();
 	++p)
       encode(p->second, bl);
@@ -11235,11 +11235,11 @@ int Client::ll_statfs(Inode *in, struct statvfs *stbuf, const UserPerm& perms)
   return statfs(0, stbuf, perms);
 }
 
-void Client::ll_register_callbacks(struct ceph_client_callback_args *args)
+void Client::_ll_register_callbacks(struct ceph_client_callback_args *args)
 {
   if (!args)
     return;
-  std::scoped_lock l(client_lock);
+
   ldout(cct, 10) << __func__ << " cb " << args->handle
 		 << " invalidate_ino_cb " << args->ino_cb
 		 << " invalidate_dentry_cb " << args->dentry_cb
@@ -11269,6 +11269,23 @@ void Client::ll_register_callbacks(struct ceph_client_callback_args *args)
   }
   if (args->umask_cb)
     umask_cb = args->umask_cb;
+}
+
+// This is deprecated, use ll_register_callbacks2() instead.
+void Client::ll_register_callbacks(struct ceph_client_callback_args *args)
+{
+  ceph_assert(!is_mounting() && !is_mounted() && !is_unmounting());
+
+  _ll_register_callbacks(args);
+}
+
+int Client::ll_register_callbacks2(struct ceph_client_callback_args *args)
+{
+  if (is_mounting() || is_mounted() || is_unmounting())
+    return -CEPHFS_EBUSY;
+
+  _ll_register_callbacks(args);
+  return 0;
 }
 
 int Client::test_dentry_handling(bool can_invalidate)
@@ -12749,6 +12766,14 @@ size_t Client::_vxattrcb_snap_btime(Inode *in, char *val, size_t size)
       (long unsigned)in->snap_btime.nsec());
 }
 
+size_t Client::_vxattrcb_caps(Inode *in, char *val, size_t size)
+{
+  int issued;
+
+  in->caps_issued(&issued);
+  return snprintf(val, size, "%s/0x%x", ccap_string(issued).c_str(), issued);
+}
+
 bool Client::_vxattrcb_mirror_info_exists(Inode *in)
 {
   // checking one of the xattrs would suffice
@@ -12772,7 +12797,7 @@ size_t Client::_vxattrcb_cluster_fsid(Inode *in, char *val, size_t size)
 size_t Client::_vxattrcb_client_id(Inode *in, char *val, size_t size)
 {
   auto name = messenger->get_myname();
-  return snprintf(val, size, "%s%ld", name.type_str(), name.num());
+  return snprintf(val, size, "%s%" PRId64, name.type_str(), name.num());
 }
 
 #define CEPH_XATTR_NAME(_type, _name) "ceph." #_type "." #_name
@@ -12855,6 +12880,13 @@ const Client::VXattr Client::_dir_vxattrs[] = {
     exists_cb: &Client::_vxattrcb_mirror_info_exists,
     flags: 0,
   },
+  {
+    name: "ceph.caps",
+    getxattr_cb: &Client::_vxattrcb_caps,
+    readonly: true,
+    exists_cb: NULL,
+    flags: 0,
+  },
   { name: "" }     /* Required table terminator */
 };
 
@@ -12876,6 +12908,13 @@ const Client::VXattr Client::_file_vxattrs[] = {
     getxattr_cb: &Client::_vxattrcb_snap_btime,
     readonly: true,
     exists_cb: &Client::_vxattrcb_snap_btime_exists,
+    flags: 0,
+  },
+  {
+    name: "ceph.caps",
+    getxattr_cb: &Client::_vxattrcb_caps,
+    readonly: true,
+    exists_cb: NULL,
     flags: 0,
   },
   { name: "" }     /* Required table terminator */
@@ -14403,8 +14442,6 @@ int Client::ll_sync_inode(Inode *in, bool syncdataonly)
   return _fsync(in, syncdataonly);
 }
 
-#ifdef FALLOC_FL_PUNCH_HOLE
-
 int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
@@ -14526,15 +14563,6 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
   put_cap_ref(in, CEPH_CAP_FILE_WR);
   return r;
 }
-#else
-
-int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
-{
-  return -CEPHFS_EOPNOTSUPP;
-}
-
-#endif
-
 
 int Client::ll_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 {
@@ -14973,7 +15001,7 @@ void Client::ms_handle_remote_reset(Connection *con)
       mds_rank_t mds = MDS_RANK_NONE;
       MetaSession *s = NULL;
       for (auto &p : mds_sessions) {
-	if (mdsmap->get_addrs(p.first) == con->get_peer_addrs()) {
+	if (mdsmap->have_inst(p.first) && mdsmap->get_addrs(p.first) == con->get_peer_addrs()) {
 	  mds = p.first;
 	  s = &p.second;
 	}

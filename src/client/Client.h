@@ -107,10 +107,11 @@ class MDSCommandOp : public CommandOp
 
 /* getdir result */
 struct DirEntry {
-  explicit DirEntry(const string &s) : d_name(s), stmask(0) {}
-  DirEntry(const string &n, struct stat& s, int stm) : d_name(n), st(s), stmask(stm) {}
+  explicit DirEntry(const std::string &s) : d_name(s), stmask(0) {}
+  DirEntry(const std::string &n, struct stat& s, int stm)
+    : d_name(n), st(s), stmask(stm) {}
 
-  string d_name;
+  std::string d_name;
   struct stat st;
   int stmask;
 };
@@ -215,7 +216,7 @@ struct dir_result_t {
 			 //   ((frag value) << 28) | (the nth entry in frag);
 
   unsigned next_offset;  // offset of next chunk (last_name's + 1)
-  string last_name;      // last entry in previous chunk
+  std::string last_name;      // last entry in previous chunk
 
   uint64_t release_count;
   uint64_t ordered_count;
@@ -225,7 +226,7 @@ struct dir_result_t {
 
   frag_t buffer_frag;
 
-  vector<dentry> buffer;
+  std::vector<dentry> buffer;
   struct dirent de;
 };
 
@@ -350,7 +351,7 @@ public:
   int readdir_r(dir_result_t *dirp, struct dirent *de);
   int readdirplus_r(dir_result_t *dirp, struct dirent *de, struct ceph_statx *stx, unsigned want, unsigned flags, Inode **out);
 
-  int getdir(const char *relpath, list<string>& names,
+  int getdir(const char *relpath, std::list<std::string>& names,
 	     const UserPerm& perms);  // get the whole dir at once.
 
   /**
@@ -512,8 +513,8 @@ public:
   int describe_layout(const char *path, file_layout_t* layout,
 		      const UserPerm& perms);
   int fdescribe_layout(int fd, file_layout_t* layout);
-  int get_file_stripe_address(int fd, loff_t offset, vector<entity_addr_t>& address);
-  int get_file_extent_osds(int fd, loff_t off, loff_t *len, vector<int>& osds);
+  int get_file_stripe_address(int fd, loff_t offset, std::vector<entity_addr_t>& address);
+  int get_file_extent_osds(int fd, loff_t off, loff_t *len, std::vector<int>& osds);
   int get_osd_addr(int osd, entity_addr_t& addr);
 
   // expose mdsmap
@@ -523,10 +524,10 @@ public:
   int get_local_osd();
   int get_pool_replication(int64_t pool);
   int64_t get_pool_id(const char *pool_name);
-  string get_pool_name(int64_t pool);
-  int get_osd_crush_location(int id, vector<pair<string, string> >& path);
+  std::string get_pool_name(int64_t pool);
+  int get_osd_crush_location(int id, std::vector<std::pair<std::string, std::string> >& path);
 
-  int enumerate_layout(int fd, vector<ObjectExtent>& result,
+  int enumerate_layout(int fd, std::vector<ObjectExtent>& result,
 		       loff_t length, loff_t offset);
 
   int mksnap(const char *path, const char *name, const UserPerm& perm,
@@ -653,7 +654,9 @@ public:
   int ll_osdaddr(int osd, uint32_t *addr);
   int ll_osdaddr(int osd, char* buf, size_t size);
 
-  void ll_register_callbacks(struct ceph_client_callback_args *args);
+  void _ll_register_callbacks(struct ceph_client_callback_args *args);
+  void ll_register_callbacks(struct ceph_client_callback_args *args); // deprecated
+  int ll_register_callbacks2(struct ceph_client_callback_args *args);
   int test_dentry_handling(bool can_invalidate);
 
   const char** get_tracked_conf_keys() const override;
@@ -712,7 +715,7 @@ public:
   int get_caps_used(Inode *in);
 
   void maybe_update_snaprealm(SnapRealm *realm, snapid_t snap_created, snapid_t snap_highwater,
-			      vector<snapid_t>& snaps);
+			      std::vector<snapid_t>& snaps);
 
   void handle_quota(const MConstRef<MClientQuota>& m);
   void handle_snap(const MConstRef<MClientSnap>& m);
@@ -740,7 +743,7 @@ public:
   void finish_cap_snap(Inode *in, CapSnap &capsnap, int used);
 
   void _schedule_invalidate_dentry_callback(Dentry *dn, bool del);
-  void _async_dentry_invalidate(vinodeno_t dirino, vinodeno_t ino, string& name);
+  void _async_dentry_invalidate(vinodeno_t dirino, vinodeno_t ino, std::string& name);
   void _try_to_trim_inode(Inode *in, bool sched_inval);
 
   void _schedule_invalidate_callback(Inode *in, int64_t off, int64_t len);
@@ -776,7 +779,7 @@ public:
   void unlock_fh_pos(Fh *f);
 
   // metadata cache
-  void update_dir_dist(Inode *in, DirStat *st);
+  void update_dir_dist(Inode *in, DirStat *st, mds_rank_t from);
 
   void clear_dir_complete_and_ordered(Inode *diri, bool complete);
   void insert_readdir_results(MetaRequest *request, MetaSession *session, Inode *diri);
@@ -788,7 +791,7 @@ public:
 
   Inode *add_update_inode(InodeStat *st, utime_t ttl, MetaSession *session,
 			  const UserPerm& request_perms);
-  Dentry *insert_dentry_inode(Dir *dir, const string& dname, LeaseStat *dlease,
+  Dentry *insert_dentry_inode(Dir *dir, const std::string& dname, LeaseStat *dlease,
 			      Inode *in, utime_t from, MetaSession *session,
 			      Dentry *old_dentry = NULL);
   void update_dentry_lease(Dentry *dn, LeaseStat *dlease, utime_t from, MetaSession *session);
@@ -797,6 +800,7 @@ public:
   vinodeno_t map_faked_ino(ino_t ino);
 
   //notify the mds to flush the mdlog
+  void flush_mdlog_sync(Inode *in);
   void flush_mdlog_sync();
   void flush_mdlog(MetaSession *session);
 
@@ -986,8 +990,8 @@ protected:
   // helpers
   void wake_up_session_caps(MetaSession *s, bool reconnect);
 
-  void wait_on_context_list(list<Context*>& ls);
-  void signal_context_list(list<Context*>& ls);
+  void wait_on_context_list(std::list<Context*>& ls);
+  void signal_context_list(std::list<Context*>& ls);
 
   // -- metadata cache stuff
 
@@ -1011,7 +1015,7 @@ protected:
    * leave dn set to default NULL unless you're trying to add
    * a new inode to a pre-created Dentry
    */
-  Dentry* link(Dir *dir, const string& name, Inode *in, Dentry *dn);
+  Dentry* link(Dir *dir, const std::string& name, Inode *in, Dentry *dn);
   void unlink(Dentry *dn, bool keepdir, bool keepdentry);
 
   int fill_stat(Inode *in, struct stat *st, frag_info_t *dirstat=0, nest_info_t *rstat=0);
@@ -1226,11 +1230,11 @@ private:
    * statistics and layout metadata.
    */
   struct VXattr {
-	  const string name;
-	  size_t (Client::*getxattr_cb)(Inode *in, char *val, size_t size);
-	  bool readonly;
-	  bool (Client::*exists_cb)(Inode *in);
-	  unsigned int flags;
+    const std::string name;
+    size_t (Client::*getxattr_cb)(Inode *in, char *val, size_t size);
+    bool readonly;
+    bool (Client::*exists_cb)(Inode *in);
+    unsigned int flags;
   };
 
   enum {
@@ -1289,10 +1293,10 @@ private:
 
   // internal interface
   //   call these with client_lock held!
-  int _do_lookup(Inode *dir, const string& name, int mask, InodeRef *target,
+  int _do_lookup(Inode *dir, const std::string& name, int mask, InodeRef *target,
 		 const UserPerm& perms);
 
-  int _lookup(Inode *dir, const string& dname, int mask, InodeRef *target,
+  int _lookup(Inode *dir, const std::string& dname, int mask, InodeRef *target,
 	      const UserPerm& perm, std::string* alternate_name=nullptr);
 
   int _link(Inode *in, Inode *dir, const char *name, const UserPerm& perm, std::string alternate_name,
@@ -1334,7 +1338,7 @@ private:
 		int flags, const UserPerm& perms);
   int _setxattr(InodeRef &in, const char *name, const void *value, size_t len,
 		int flags, const UserPerm& perms);
-  int _setxattr_check_data_pool(string& name, string& value, const OSDMap *osdmap);
+  int _setxattr_check_data_pool(std::string& name, std::string& value, const OSDMap *osdmap);
   void _setxattr_maybe_wait_for_osdmap(const char *name, const void *value, size_t len);
   int _removexattr(Inode *in, const char *nm, const UserPerm& perms);
   int _removexattr(InodeRef &in, const char *nm, const UserPerm& perms);
@@ -1409,6 +1413,8 @@ private:
 
   bool _vxattrcb_snap_btime_exists(Inode *in);
   size_t _vxattrcb_snap_btime(Inode *in, char *val, size_t size);
+
+  size_t _vxattrcb_caps(Inode *in, char *val, size_t size);
 
   bool _vxattrcb_mirror_info_exists(Inode *in);
   size_t _vxattrcb_mirror_info(Inode *in, char *val, size_t size);
@@ -1525,7 +1531,7 @@ private:
   utime_t last_auto_reconnect;
 
   // trace generation
-  ofstream traceout;
+  std::ofstream traceout;
 
   ceph::condition_variable mount_cond, sync_cond;
 

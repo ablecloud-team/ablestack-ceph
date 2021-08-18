@@ -115,6 +115,10 @@ struct logback_generation {
   }
 };
 WRITE_CLASS_ENCODER(logback_generation)
+inline std::ostream& operator <<(std::ostream& m, const logback_generation& g) {
+  return m << "[" << g.gen_id << "," << g.type << ","
+	   << (g.pruned ? "PRUNED" : "NOT PRUNED") << "]";
+}
 
 class logback_generations : public librados::WatchCtx2 {
 public:
@@ -237,6 +241,9 @@ inline std::string gencursor(uint64_t gen_id, std::string_view cursor) {
 
 inline std::pair<uint64_t, std::string_view>
 cursorgen(std::string_view cursor_) {
+  if (cursor_.empty()) {
+    return { 0, "" };
+  }
   std::string_view cursor = cursor_;
   if (cursor[0] != 'G') {
     return { 0, cursor };
@@ -248,15 +255,6 @@ cursorgen(std::string_view cursor_) {
   }
   cursor.remove_prefix(1);
   return { *gen_id, cursor };
-}
-
-inline std::pair<uint64_t, std::string_view>
-cursorgeno(std::optional<std::string_view> cursor) {
-  if (cursor && !cursor->empty()) {
-    return cursorgen(*cursor);
-  } else {
-    return { 0, ""s };
-  }
 }
 
 class LazyFIFO {

@@ -19,9 +19,9 @@
 
 class Allocator {
 public:
-  explicit Allocator(const std::string& name,
-                     int64_t _capacity,
-                     int64_t _block_size);
+  Allocator(std::string_view name,
+	    int64_t _capacity,
+	    int64_t _block_size);
   virtual ~Allocator();
 
   /*
@@ -66,11 +66,11 @@ public:
   virtual double get_fragmentation_score();
   virtual void shutdown() = 0;
 
-  static Allocator *create(CephContext* cct, std::string type, int64_t size,
-			   int64_t block_size, const std::string& name = "");
+  static Allocator *create(CephContext* cct, std::string_view type, int64_t size,
+			   int64_t block_size, const std::string_view name = "");
 
 
-  const string& get_name() const;
+  const std::string& get_name() const;
   int64_t get_capacity() const
   {
     return device_size;

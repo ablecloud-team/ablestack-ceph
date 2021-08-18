@@ -13,7 +13,6 @@
 #include "crimson/os/seastore/cached_extent.h"
 #include "crimson/os/seastore/journal.h"
 #include "crimson/os/seastore/seastore_types.h"
-#include "crimson/os/seastore/seastore_perf_counters.h"
 #include "crimson/os/seastore/segment_manager.h"
 #include "crimson/os/seastore/transaction.h"
 
@@ -247,24 +246,45 @@ public:
   public:
     virtual ~ExtentCallbackInterface() = default;
 
-    virtual TransactionRef create_transaction() = 0;
+    virtual TransactionRef create_transaction(Transaction::src_t) = 0;
+
+    /// Creates empty transaction with interruptible context
+    template <typename Func>
+    auto with_transaction_intr(Transaction::src_t src, Func &&f) {
+      return seastar::do_with(
+        create_transaction(src),
+        [f=std::forward<Func>(f)](auto &ref_t) mutable {
+          return with_trans_intr(
+            *ref_t,
+            [f=std::forward<Func>(f)](auto& t) mutable {
+              return f(t);
+            }
+          );
+        }
+      );
+    }
 
     /**
      * get_next_dirty_extent
      *
      * returns all extents with dirty_from < bound
      */
-    using get_next_dirty_extents_ertr = crimson::errorator<>;
-    using get_next_dirty_extents_ret = get_next_dirty_extents_ertr::future<
+    using get_next_dirty_extents_iertr = crimson::errorator<>;
+    using get_next_dirty_extents_ret = get_next_dirty_extents_iertr::future<
       std::vector<CachedExtentRef>>;
     virtual get_next_dirty_extents_ret get_next_dirty_extents(
       journal_seq_t bound,///< [in] return extents with dirty_from < bound
       size_t max_bytes    ///< [in] return up to max_bytes of extents
     ) = 0;
 
+
     using extent_mapping_ertr = crimson::errorator<
       crimson::ct_error::input_output_error,
       crimson::ct_error::eagain>;
+    using extent_mapping_iertr = trans_iertr<
+      crimson::errorator<
+	crimson::ct_error::input_output_error>
+      >;
 
     /**
      * rewrite_extent
@@ -274,8 +294,8 @@ public:
      * handle finding the current instance if it is still alive and
      * otherwise ignore it.
      */
-    using rewrite_extent_ertr = extent_mapping_ertr;
-    using rewrite_extent_ret = rewrite_extent_ertr::future<>;
+    using rewrite_extent_iertr = extent_mapping_iertr;
+    using rewrite_extent_ret = rewrite_extent_iertr::future<>;
     virtual rewrite_extent_ret rewrite_extent(
       Transaction &t,
       CachedExtentRef extent) = 0;
@@ -289,8 +309,8 @@ public:
      * See TransactionManager::get_extent_if_live and
      * LBAManager::get_physical_extent_if_live.
      */
-    using get_extent_if_live_ertr = extent_mapping_ertr;
-    using get_extent_if_live_ret = get_extent_if_live_ertr::future<
+    using get_extent_if_live_iertr = extent_mapping_iertr;
+    using get_extent_if_live_ret = get_extent_if_live_iertr::future<
       CachedExtentRef>;
     virtual get_extent_if_live_ret get_extent_if_live(
       Transaction &t,
@@ -326,14 +346,14 @@ public:
      *
      * Submits transaction without any space throttling.
      */
-    using submit_transaction_direct_ertr = crimson::errorator<
-      crimson::ct_error::eagain,
-      crimson::ct_error::input_output_error
+    using submit_transaction_direct_iertr = trans_iertr<
+      crimson::errorator<
+        crimson::ct_error::input_output_error>
       >;
     using submit_transaction_direct_ret =
-      submit_transaction_direct_ertr::future<>;
+      submit_transaction_direct_iertr::future<>;
     virtual submit_transaction_direct_ret submit_transaction_direct(
-      TransactionRef t) = 0;
+      Transaction &t) = 0;
   };
 
 private:
@@ -349,7 +369,12 @@ private:
   size_t empty_segments;
   int64_t used_bytes = 0;
   bool init_complete = false;
-  PerfCounters &sc_perf;
+
+  struct {
+    uint64_t segments_released = 0;
+  } stats;
+  seastar::metrics::metric_group metrics;
+  void register_metrics();
 
   /// target journal_tail for next fresh segment
   journal_seq_t journal_tail_target;
@@ -366,11 +391,7 @@ private:
   std::optional<seastar::promise<>> blocked_io_wake;
 
 public:
-  SegmentCleaner(config_t config, PerfCounters &perf, bool detailed = false)
-    : detailed(detailed),
-      config(config),
-      sc_perf(perf),
-      gc_process(*this) {}
+  SegmentCleaner(config_t config, bool detailed = false);
 
   void mount(SegmentManager &sm) {
     init_complete = false;
@@ -437,7 +458,7 @@ public:
   }
 
   void init_mark_segment_closed(segment_id_t segment, segment_seq_t seq) final {
-    crimson::get_logger(ceph_subsys_filestore).debug(
+    crimson::get_logger(ceph_subsys_seastore).debug(
       "SegmentCleaner::init_mark_segment_closed: segment {}, seq {}",
       segment,
       seq);
@@ -450,7 +471,7 @@ public:
   }
 
   void mark_segment_released(segment_id_t segment) {
-    sc_perf.inc(ss_sm_segments_released);
+    stats.segments_released++;
     return mark_empty(segment);
   }
 
@@ -501,7 +522,7 @@ public:
       }
     }
     if (ret != NULL_SEG_ID) {
-      crimson::get_logger(ceph_subsys_filestore).debug(
+      crimson::get_logger(ceph_subsys_seastore).debug(
 	"SegmentCleaner::get_next_gc_target: segment {} seq {}",
 	ret,
 	segments[ret].journal_segment_seq);
@@ -551,6 +572,7 @@ public:
   }
 
   using work_ertr = ExtentCallbackInterface::extent_mapping_ertr;
+  using work_iertr = ExtentCallbackInterface::extent_mapping_iertr;
 
 private:
 
@@ -561,8 +583,8 @@ private:
    *
    * Writes out dirty blocks dirtied earlier than limit.
    */
-  using rewrite_dirty_ertr = ExtentCallbackInterface::extent_mapping_ertr;
-  using rewrite_dirty_ret = rewrite_dirty_ertr::future<>;
+  using rewrite_dirty_iertr = work_iertr;
+  using rewrite_dirty_ret = rewrite_dirty_iertr::future<>;
   rewrite_dirty_ret rewrite_dirty(
     Transaction &t,
     journal_seq_t limit);
@@ -662,7 +684,7 @@ private:
     }
   } gc_process;
 
-  using gc_ertr = ExtentCallbackInterface::extent_mapping_ertr::extend_ertr<
+  using gc_ertr = work_ertr::extend_ertr<
     ExtentCallbackInterface::scan_extents_ertr
     >;
 
@@ -776,7 +798,7 @@ private:
   }
 
   void log_gc_state(const char *caller) const {
-    auto &logger = crimson::get_logger(ceph_subsys_filestore);
+    auto &logger = crimson::get_logger(ceph_subsys_seastore);
     if (logger.is_enabled(seastar::log_level::debug)) {
       logger.debug(
 	"SegmentCleaner::log_gc_state({}): "
@@ -877,7 +899,7 @@ private:
       assert(empty_segments > 0);
       --empty_segments;
     }
-    crimson::get_logger(ceph_subsys_filestore).debug(
+    crimson::get_logger(ceph_subsys_seastore).debug(
       "mark_closed: empty_segments: {}",
       empty_segments);
     segments[segment].state = Segment::segment_state_t::CLOSED;

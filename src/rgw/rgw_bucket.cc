@@ -57,6 +57,8 @@
 
 #define BUCKET_TAG_TIMEOUT 30
 
+using namespace std;
+
 // default number of entries to list with each bucket listing call
 // (use marker to bridge between calls)
 static constexpr size_t listing_max_entries = 1000;
@@ -314,139 +316,6 @@ int rgw_remove_object(const DoutPrefixProvider *dpp, rgw::sal::Store* store, rgw
   return object->delete_object(dpp, &rctx, null_yield);
 }
 
-int rgw_remove_bucket_bypass_gc(rgw::sal::Store* store, rgw::sal::Bucket* bucket,
-                                int concurrent_max, bool keep_index_consistent,
-                                optional_yield y,
-                                const DoutPrefixProvider *dpp)
-{
-  int ret;
-  map<RGWObjCategory, RGWStorageStats> stats;
-  map<string, bool> common_prefixes;
-  RGWObjectCtx obj_ctx(store);
-  CephContext *cct = store->ctx();
-
-  string bucket_ver, master_ver;
-
-  ret = bucket->get_bucket_info(dpp, null_yield);
-  if (ret < 0)
-    return ret;
-
-  ret = bucket->get_bucket_stats(dpp, RGW_NO_SHARD, &bucket_ver, &master_ver, stats, NULL);
-  if (ret < 0)
-    return ret;
-
-  string prefix, delimiter;
-
-  ret = abort_bucket_multiparts(dpp, store, cct, bucket, prefix, delimiter);
-  if (ret < 0) {
-    return ret;
-  }
-
-  rgw::sal::Bucket::ListParams params;
-  rgw::sal::Bucket::ListResults results;
-
-  params.list_versions = true;
-  params.allow_unordered = true;
-
-  std::unique_ptr<rgw::sal::Completions> handles = store->get_completions();
-
-  int max_aio = concurrent_max;
-  results.is_truncated = true;
-
-  while (results.is_truncated) {
-    ret = bucket->list(dpp, params, listing_max_entries, results, null_yield);
-    if (ret < 0)
-      return ret;
-
-    std::vector<rgw_bucket_dir_entry>::iterator it = results.objs.begin();
-    for (; it != results.objs.end(); ++it) {
-      RGWObjState *astate = NULL;
-      std::unique_ptr<rgw::sal::Object> obj = bucket->get_object((*it).key);
-
-      ret = obj->get_obj_state(dpp, &obj_ctx, &astate, y, false);
-      if (ret == -ENOENT) {
-        ldpp_dout(dpp, 1) << "WARNING: cannot find obj state for obj " << obj << dendl;
-        continue;
-      }
-      if (ret < 0) {
-        ldpp_dout(dpp, -1) << "ERROR: get obj state returned with error " << ret << dendl;
-        return ret;
-      }
-
-      if (astate->manifest) {
-        RGWObjManifest& manifest = *astate->manifest;
-        RGWObjManifest::obj_iterator miter = manifest.obj_begin(dpp);
-	std::unique_ptr<rgw::sal::Object> head_obj = bucket->get_object(manifest.get_obj().key);
-        rgw_raw_obj raw_head_obj;
-	head_obj->get_raw_obj(&raw_head_obj);
-
-        for (; miter != manifest.obj_end(dpp) && max_aio--; ++miter) {
-          if (!max_aio) {
-            ret = handles->drain();
-            if (ret < 0) {
-              ldpp_dout(dpp, -1) << "ERROR: could not drain handles as aio completion returned with " << ret << dendl;
-              return ret;
-            }
-            max_aio = concurrent_max;
-          }
-
-          rgw_raw_obj last_obj = miter.get_location().get_raw_obj(store);
-          if (last_obj == raw_head_obj) {
-            // have the head obj deleted at the end
-            continue;
-          }
-
-          ret = store->delete_raw_obj_aio(dpp, last_obj, handles.get());
-          if (ret < 0) {
-            ldpp_dout(dpp, -1) << "ERROR: delete obj aio failed with " << ret << dendl;
-            return ret;
-          }
-        } // for all shadow objs
-
-	ret = head_obj->delete_obj_aio(dpp, astate, handles.get(), keep_index_consistent, null_yield);
-        if (ret < 0) {
-          ldpp_dout(dpp, -1) << "ERROR: delete obj aio failed with " << ret << dendl;
-          return ret;
-        }
-      }
-
-      if (!max_aio) {
-        ret = handles->drain();
-        if (ret < 0) {
-          ldpp_dout(dpp, -1) << "ERROR: could not drain handles as aio completion returned with " << ret << dendl;
-          return ret;
-        }
-        max_aio = concurrent_max;
-      }
-      obj_ctx.invalidate(obj->get_obj());
-    } // for all RGW objects
-  }
-
-  ret = handles->drain();
-  if (ret < 0) {
-    ldpp_dout(dpp, -1) << "ERROR: could not drain handles as aio completion returned with " << ret << dendl;
-    return ret;
-  }
-
-  bucket->sync_user_stats(dpp, y);
-  if (ret < 0) {
-     ldpp_dout(dpp, 1) << "WARNING: failed sync user stats before bucket delete. ret=" <<  ret << dendl;
-  }
-
-  RGWObjVersionTracker objv_tracker;
-
-  // this function can only be run if caller wanted children to be
-  // deleted, so we can ignore the check for children as any that
-  // remain are detritus from a prior bug
-  ret = bucket->remove_bucket(dpp, true, std::string(), std::string(), false, nullptr, y);
-  if (ret < 0) {
-    ldpp_dout(dpp, -1) << "ERROR: could not remove bucket " << bucket << dendl;
-    return ret;
-  }
-
-  return ret;
-}
-
 static void set_err_msg(std::string *sink, std::string msg)
 {
   if (sink && !msg.empty())
@@ -515,7 +384,7 @@ bool rgw_find_bucket_by_id(const DoutPrefixProvider *dpp, CephContext *cct, rgw:
   }
   do {
       list<string> keys;
-      ret = store->meta_list_keys_next(handle, 1000, keys, &truncated);
+      ret = store->meta_list_keys_next(dpp, handle, 1000, keys, &truncated);
       if (ret < 0) {
         cerr << "ERROR: lists_keys_next(): " << cpp_strerror(-ret) << std::endl;
         store->meta_list_keys_complete(handle);
@@ -727,8 +596,6 @@ int RGWBucket::check_object_index(const DoutPrefixProvider *dpp,
 
   bucket->set_tag_timeout(dpp, BUCKET_TAG_TIMEOUT);
 
-  string prefix;
-  string empty_delimiter;
   rgw::sal::Bucket::ListResults results;
   results.is_truncated = true;
 
@@ -736,15 +603,13 @@ int RGWBucket::check_object_index(const DoutPrefixProvider *dpp,
   formatter->open_object_section("objects");
   while (results.is_truncated) {
     rgw::sal::Bucket::ListParams params;
-
     params.marker = results.next_marker;
-    params.prefix = prefix;
 
     int r = bucket->list(dpp, params, listing_max_entries, results, y);
 
     if (r == -ENOENT) {
       break;
-    } else if (r < 0 && r != -ENOENT) {
+    } else if (r < 0) {
       set_err_msg(err_msg, "ERROR: failed operation r=" + cpp_strerror(-r));
     }
 
@@ -1139,7 +1004,7 @@ int RGWBucketAdminOp::remove_bucket(rgw::sal::Store* store, RGWBucketAdminOpStat
     return ret;
 
   if (bypass_gc)
-    ret = rgw_remove_bucket_bypass_gc(store, bucket.get(), op_state.get_max_aio(), keep_index_consistent, y, dpp);
+    ret = bucket->remove_bucket_bypass_gc(op_state.get_max_aio(), keep_index_consistent, y, dpp);
   else
     ret = bucket->remove_bucket(dpp, op_state.will_delete_children(), string(), string(),
 				false, nullptr, y);
@@ -1428,7 +1293,7 @@ int RGWBucketAdminOp::info(rgw::sal::Store* store,
     while (ret == 0 && truncated) {
       std::list<std::string> buckets;
       constexpr int max_keys = 1000;
-      ret = store->meta_list_keys_next(handle, max_keys, buckets,
+      ret = store->meta_list_keys_next(dpp, handle, max_keys, buckets,
 						   &truncated);
       for (auto& bucket_name : buckets) {
         if (show_stats) {
@@ -1549,7 +1414,7 @@ void get_stale_instances(rgw::sal::Store* store, const std::string& bucket_name,
   // with these
   {
     RGWBucketReshardLock reshard_lock(static_cast<rgw::sal::RadosStore*>(store), cur_bucket->get_info(), true);
-    r = reshard_lock.lock();
+    r = reshard_lock.lock(dpp);
     if (r < 0) {
       // most likely bucket is under reshard, return the sureshot stale instances
       ldpp_dout(dpp, 5) << __func__
@@ -1597,7 +1462,7 @@ static int process_stale_instances(rgw::sal::Store* store, RGWBucketAdminOpState
   do {
     list<std::string> keys;
 
-    ret = store->meta_list_keys_next(handle, default_max_keys, keys, &truncated);
+    ret = store->meta_list_keys_next(dpp, handle, default_max_keys, keys, &truncated);
     if (ret < 0 && ret != -ENOENT) {
       cerr << "ERROR: lists_keys_next(): " << cpp_strerror(-ret) << std::endl;
       return ret;
@@ -1730,7 +1595,7 @@ int RGWBucketAdminOp::fix_lc_shards(rgw::sal::Store* store,
                                  });
       do {
         list<std::string> keys;
-        ret = store->meta_list_keys_next(handle, default_max_keys, keys, &truncated);
+        ret = store->meta_list_keys_next(dpp, handle, default_max_keys, keys, &truncated);
         if (ret < 0 && ret != -ENOENT) {
           std::cerr << "ERROR: lists_keys_next(): " << cpp_strerror(-ret) << std::endl;
           return ret;

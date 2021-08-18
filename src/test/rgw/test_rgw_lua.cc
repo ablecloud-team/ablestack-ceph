@@ -1,11 +1,16 @@
 #include <gtest/gtest.h>
 #include "common/ceph_context.h"
 #include "rgw/rgw_common.h"
+#include "rgw/rgw_auth.h"
 #include "rgw/rgw_process.h"
 #include "rgw/rgw_sal_rados.h"
 #include "rgw/rgw_lua_request.h"
 
+using namespace std;
 using namespace rgw;
+using boost::container::flat_set;
+using rgw::auth::Identity;
+using rgw::auth::Principal;
 
 class CctCleaner {
   CephContext* cct;
@@ -17,6 +22,47 @@ public:
 #else
     cct->put(); 
 #endif
+  }
+};
+
+class FakeIdentity : public Identity {
+public:
+  FakeIdentity() = default;
+
+  uint32_t get_perms_from_aclspec(const DoutPrefixProvider* dpp, const aclspec_t& aclspec) const override {
+    return 0;
+  };
+
+  bool is_admin_of(const rgw_user& uid) const override {
+    return false;
+  }
+
+  bool is_owner_of(const rgw_user& uid) const override {
+    return false;
+  }
+
+  virtual uint32_t get_perm_mask() const override {
+    return 0;
+  }
+
+  uint32_t get_identity_type() const override {
+    return TYPE_RGW;
+  }
+
+  string get_acct_name() const override {
+    return "";
+  }
+
+  string get_subuser() const override {
+    return "";
+  }
+
+  void to_str(std::ostream& out) const override {
+    return;
+  }
+
+  bool is_identity(const flat_set<Principal>& ids) const override {
+    return false;
   }
 };
 
@@ -449,6 +495,26 @@ TEST(TestRGWLua, Acl)
   ASSERT_EQ(rc, 0);
 }
 
+TEST(TestRGWLua, User)
+{
+  const std::string script = R"(
+    assert(Request.User)
+    assert(Request.User.Id == "myid")
+    assert(Request.User.Tenant == "mytenant")
+  )";
+
+  DEFINE_REQ_STATE;
+
+  rgw_user u;
+  u.tenant = "mytenant";
+  u.id = "myid";
+  s.user.reset(new sal::RadosUser(nullptr, u));
+
+  const auto rc = lua::request::execute(nullptr, nullptr, nullptr, &s, "put_obj", script);
+  ASSERT_EQ(rc, 0);
+}
+
+
 TEST(TestRGWLua, UseFunction)
 {
 	const std::string script = R"(
@@ -598,6 +664,9 @@ TEST(TestRGWLua, OpsLog)
   TestAccounter ac;
   s.cio = &ac; 
 	s.cct->_conf->rgw_ops_log_rados	= false;
+
+  s.auth.identity = std::unique_ptr<rgw::auth::Identity>(
+                        new FakeIdentity());
 
   auto rc = lua::request::execute(store.get(), nullptr, olog.get(), &s, "put_obj", script);
   EXPECT_EQ(rc, 0);

@@ -10,7 +10,6 @@
 #include "crimson/os/seastore/transaction_manager.h"
 #include "crimson/os/seastore/segment_manager/ephemeral.h"
 #include "crimson/os/seastore/seastore.h"
-#include "crimson/os/seastore/seastore_perf_counters.h"
 #include "crimson/os/seastore/segment_manager.h"
 #include "crimson/os/seastore/collection_manager/flat_collection_manager.h"
 #include "crimson/os/seastore/onode_manager/staged-fltree/fltree_onode_manager.h"
@@ -70,54 +69,45 @@ protected:
 };
 
 auto get_transaction_manager(
-  SegmentManager &segment_manager, PerfCounters &perf
-) {
+  SegmentManager &segment_manager) {
   auto segment_cleaner = std::make_unique<SegmentCleaner>(
     SegmentCleaner::config_t::get_default(),
-    perf, true);
+    true);
   auto journal = std::make_unique<Journal>(segment_manager);
   auto cache = std::make_unique<Cache>(segment_manager);
   auto lba_manager = lba_manager::create_lba_manager(segment_manager, *cache);
 
   journal->set_segment_provider(&*segment_cleaner);
 
-  auto ret = std::make_unique<TransactionManager>(
+  return std::make_unique<TransactionManager>(
     segment_manager,
     std::move(segment_cleaner),
     std::move(journal),
     std::move(cache),
-    std::move(lba_manager),
-    perf);
-  return ret;
+    std::move(lba_manager));
 }
 
-auto get_seastore(
-  SegmentManagerRef sm
-) {
-  PerfServiceRef perf_service = PerfServiceRef(new PerfService());
-  auto tm = get_transaction_manager(*sm, perf_service->get_counters());
+auto get_seastore(SegmentManagerRef sm) {
+  auto tm = get_transaction_manager(*sm);
   auto cm = std::make_unique<collection_manager::FlatCollectionManager>(*tm);
   return std::make_unique<SeaStore>(
     std::move(sm),
     std::move(tm),
     std::move(cm),
-    std::make_unique<crimson::os::seastore::onode::FLTreeOnodeManager>(*tm),
-    std::move(perf_service));
+    std::make_unique<crimson::os::seastore::onode::FLTreeOnodeManager>(*tm));
 }
 
 
 class TMTestState : public EphemeralTestState {
 protected:
-  std::unique_ptr<TransactionManager> tm;
+  TransactionManagerRef tm;
   LBAManager *lba_manager;
   SegmentCleaner *segment_cleaner;
-  PerfServiceRef perf_service = PerfServiceRef(new PerfService());
 
   TMTestState() : EphemeralTestState() {}
 
   virtual void _init() {
-    perf_service->add_to_collection();
-    tm = get_transaction_manager(*segment_manager, perf_service->get_counters());
+    tm = get_transaction_manager(*segment_manager);
     segment_cleaner = tm->get_segment_cleaner();
     lba_manager = tm->get_lba_manager();
   }
@@ -129,9 +119,10 @@ protected:
   }
 
   virtual seastar::future<> _teardown() {
-    perf_service->remove_from_collection();
-    return tm->close(
-    ).handle_error(
+    return tm->close().safe_then([this] {
+      _destroy();
+      return seastar::now();
+    }).handle_error(
       crimson::ct_error::assert_all{"Error in teardown"}
     );
   }
@@ -153,9 +144,38 @@ protected:
       crimson::ct_error::assert_all{"Error in teardown"}
     );
   }
+
+  auto create_mutate_transaction() {
+    return tm->create_transaction(Transaction::src_t::MUTATE);
+  }
+
+  auto create_read_transaction() {
+    return tm->create_transaction(Transaction::src_t::READ);
+  }
+
+  auto create_weak_transaction() {
+    return tm->create_weak_transaction(Transaction::src_t::READ);
+  }
+
+  auto submit_transaction_fut2(Transaction& t) {
+    return tm->submit_transaction(t);
+  }
+
+  auto submit_transaction_fut(Transaction &t) {
+    return with_trans_intr(
+      t,
+      [this](auto &t) {
+	return tm->submit_transaction(t);
+      });
+  }
+
+  void submit_transaction(TransactionRef t) {
+    submit_transaction_fut(*t).unsafe_get0();
+    segment_cleaner->run_until_halt().get0();
+  }
 };
 
-class TestSegmentManagerWrapper : public SegmentManager {
+class TestSegmentManagerWrapper final : public SegmentManager {
   SegmentManager &sm;
 public:
   TestSegmentManagerWrapper(SegmentManager &sm) : sm(sm) {}
@@ -209,7 +229,9 @@ protected:
   }
 
   virtual seastar::future<> _teardown() {
-    return seastore->umount();
+    return seastore->umount().then([this] {
+      seastore.reset();
+    });
   }
 
   virtual seastar::future<> _mount() {

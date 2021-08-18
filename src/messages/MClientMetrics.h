@@ -28,7 +28,7 @@ public:
     return "client_metrics";
   }
 
-  void print(ostream &out) const override {
+  void print(std::ostream &out) const override {
     out << "client_metrics ";
     for (auto &i : updates) {
       i.print(&out);
@@ -50,7 +50,7 @@ private:
   template<class T, typename... Args>
   friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
   template<class T, typename... Args>
-  friend MURef<T> crimson::net::make_message(Args&&... args);
+  friend MURef<T> crimson::make_message(Args&&... args);
 };
 
 #endif // CEPH_MDS_CLIENT_METRICS_H

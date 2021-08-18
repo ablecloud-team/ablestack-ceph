@@ -49,20 +49,34 @@ CLS_NAME(rgw)
 #define BI_BUCKET_LAST_INDEX          4
 
 static std::string bucket_index_prefixes[] = { "", /* special handling for the objs list index */
-                                          "0_",     /* bucket log index */
-                                          "1000_",  /* obj instance index */
-                                          "1001_",  /* olh data index */
+					       "0_",     /* bucket log index */
+					       "1000_",  /* obj instance index */
+					       "1001_",  /* olh data index */
 
-                                          /* this must be the last index */
-                                          "9999_",};
+					       /* this must be the last index */
+					       "9999_",};
 
-static bool bi_is_objs_index(const string& s) {
-  return ((unsigned char)s[0] != BI_PREFIX_CHAR);
+// this string is greater than all ascii plain entries and less than
+// all special entries
+static const std::string BI_PREFIX_BEGIN = string(1, BI_PREFIX_CHAR);
+
+// this string is greater than all special entries and less than all
+// non-ascii plain entries
+static const std::string BI_PREFIX_END = string(1, BI_PREFIX_CHAR) +
+    bucket_index_prefixes[BI_BUCKET_LAST_INDEX];
+
+/* Returns whether parameter is not a key for a special entry. Empty
+ * strings are considered plain also, so, for example, an empty marker
+ * is also considered plain. TODO: check to make sure all callers are
+ * using appropriately.
+ */
+static bool bi_is_plain_entry(const std::string& s) {
+  return (s.empty() || (unsigned char)s[0] != BI_PREFIX_CHAR);
 }
 
 int bi_entry_type(const string& s)
 {
-  if (bi_is_objs_index(s)) {
+  if (bi_is_plain_entry(s)) {
     return BI_BUCKET_OBJS_INDEX;
   }
 
@@ -169,10 +183,10 @@ static int log_index_operation(cls_method_context_t hctx, cls_rgw_obj_key& obj_k
  * namespace".
  */
 static int get_obj_vals(cls_method_context_t hctx,
-			const string& start,
-			const string& filter_prefix,
+			const std::string& start,
+			const std::string& filter_prefix,
                         int num_entries,
-			map<string, bufferlist> *pkeys,
+			std::map<std::string, bufferlist> *pkeys,
 			bool *pmore)
 {
   int ret = cls_cxx_map_get_vals(hctx, start, filter_prefix,
@@ -185,7 +199,7 @@ static int get_obj_vals(cls_method_context_t hctx,
     return 0;
   }
 
-  auto last_element = pkeys->rbegin();
+  auto last_element = pkeys->crbegin();
   if ((unsigned char)last_element->first[0] < BI_PREFIX_CHAR) {
     /* if the first character of the last entry is less than the
      * prefix then all entries must preceed the "ugly namespace" and
@@ -194,11 +208,11 @@ static int get_obj_vals(cls_method_context_t hctx,
     return 0;
   }
 
-  auto first_element = pkeys->begin();
+  auto first_element = pkeys->cbegin();
   if ((unsigned char)first_element->first[0] > BI_PREFIX_CHAR) {
-    /* the first character of the last entry is in or after the "ugly
-     * namespace", so if the first character of the first entry
-     * follows the "ugly namespace" then all entries do and we're done
+    /* if the first character of the first entry is after the "ugly
+     * namespace" then all entries must follow the "ugly namespace"
+     * then all entries do and we're done
      */
     return 0;
   }
@@ -209,10 +223,10 @@ static int get_obj_vals(cls_method_context_t hctx,
    * outside the "ugly namespace"
    */
 
-  auto comp = [](const pair<string, bufferlist>& l, const string &r) {
+  auto comp = [](const pair<std::string, bufferlist>& l, const std::string &r) {
 		return l.first < r;
 	      };
-  string new_start = {static_cast<char>(BI_PREFIX_CHAR + 1)};
+  std::string new_start = {static_cast<char>(BI_PREFIX_CHAR + 1)};
 
   auto lower = pkeys->lower_bound(string{static_cast<char>(BI_PREFIX_CHAR)});
   auto upper = std::lower_bound(lower, pkeys->end(), new_start, comp);
@@ -222,11 +236,11 @@ static int get_obj_vals(cls_method_context_t hctx,
     return 0;
   }
 
-  if (pkeys->size() && new_start < pkeys->rbegin()->first) {
+  if (pkeys->size() && new_start < pkeys->crbegin()->first) {
     new_start = pkeys->rbegin()->first;
   }
 
-  map<string, bufferlist> new_keys;
+  std::map<std::string, bufferlist> new_keys;
 
   /* now get some more keys */
   ret = cls_cxx_map_get_vals(hctx, new_start, filter_prefix,
@@ -455,6 +469,8 @@ static int read_bucket_header(cls_method_context_t hctx,
 
 int rgw_bucket_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
+
   // maximum number of calls to get_obj_vals we'll try; compromise
   // between wanting to return the requested # of entries, but not
   // wanting to slow down this op with too many omap reads
@@ -480,29 +496,42 @@ int rgw_bucket_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
     return rc;
   }
 
-  string start_after_key;   // key that we can start listing at, one of a)
-                            // sent in by caller, b) last item visited, or
-                            // c) when delimiter present, a key that will
-                            // move past the subdirectory
-  encode_list_index_key(hctx, op.start_obj, &start_after_key);
+  // some calls just want the header and request 0 entries
+  if (op.num_entries <= 0) {
+    ret.is_truncated = false;
+    encode(ret, *out);
+    return 0;
+  }
 
-  string previous_key; // last key stored in result, so if we have to
-		       // call get_obj_vals multiple times, we do not
-		       // add the overlap to result
-  string previous_prefix_key; // last prefix_key stored in result, so
-			      // we can skip over entries with the
-			      // same prefix_key
+  // key that we can start listing at, one of a) sent in by caller, b)
+  // last item visited, or c) when delimiter present, a key that will
+  // move past the subdirectory
+  std::string start_after_omap_key;
+  encode_list_index_key(hctx, op.start_obj, &start_after_omap_key);
+
+  // this is set whenenver start_after_omap_key is set to keep them in
+  // sync since this will be the returned marker when a marker is
+  // returned
+  cls_rgw_obj_key start_after_entry_key;
+
+  // last key stored in result, so if we have to call get_obj_vals
+  // multiple times, we do not add the overlap to result
+  std::string prev_omap_key;
+
+  // last prefix_key stored in result, so we can skip over entries
+  // with the same prefix_key
+  std::string prev_prefix_omap_key;
 
   bool done = false;   // whether we need to keep calling get_obj_vals
   bool more = true;    // output parameter of get_obj_vals
   bool has_delimiter = !op.delimiter.empty();
 
   if (has_delimiter &&
-      start_after_key > op.filter_prefix &&
-      boost::algorithm::ends_with(start_after_key, op.delimiter)) {
+      start_after_omap_key > op.filter_prefix &&
+      boost::algorithm::ends_with(start_after_omap_key, op.delimiter)) {
     // advance past all subdirectory entries if we start after a
     // subdirectory
-    start_after_key = cls_rgw_after_delim(start_after_key);
+    start_after_omap_key = cls_rgw_after_delim(start_after_omap_key);
   }
 
   for (int attempt = 0;
@@ -511,24 +540,23 @@ int rgw_bucket_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 	 !done &&
 	 name_entry_map.size() < op.num_entries;
        ++attempt) {
-    map<string, bufferlist> keys;
-    rc = get_obj_vals(hctx, start_after_key, op.filter_prefix,
+    std::map<std::string, bufferlist> keys;
+
+    // note: get_obj_vals skips past the "ugly namespace" (i.e.,
+    // entries that start with the BI_PREFIX_CHAR), so no need to
+    // check for such entries
+    rc = get_obj_vals(hctx, start_after_omap_key, op.filter_prefix,
 		      op.num_entries - name_entry_map.size(),
 		      &keys, &more);
     if (rc < 0) {
       return rc;
     }
+    CLS_LOG(20, "%s: on attempt %d get_obj_vls returned %ld entries, more=%d\n",
+	    __func__, attempt, keys.size(), more);
 
     done = keys.empty();
 
     for (auto kiter = keys.cbegin(); kiter != keys.cend(); ++kiter) {
-      if (!bi_is_objs_index(kiter->first)) {
-	// we're done if we walked off the end of the objects area of
-	// the bucket index
-        done = true;
-        break;
-      }
-
       rgw_bucket_dir_entry entry;
       try {
 	const bufferlist& entrybl = kiter->second;
@@ -540,7 +568,8 @@ int rgw_bucket_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
         return -EINVAL;
       }
 
-      start_after_key = kiter->first;
+      start_after_omap_key = kiter->first;
+      start_after_entry_key = entry.key;
       CLS_LOG(20, "%s: working on key=%s len=%zu",
 	      __func__, kiter->first.c_str(), kiter->first.size());
 
@@ -558,7 +587,7 @@ int rgw_bucket_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 		__func__, key.name.c_str(), key.instance.c_str());
         continue;
       }
-      
+
       // filter out noncurrent versions, delete markers, and initial marker
       if (!op.list_versions &&
 	  (!entry.is_visible() || op.start_obj.name == key.name)) {
@@ -575,10 +604,10 @@ int rgw_bucket_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
           string prefix_key =
 	    key.name.substr(0, delim_pos + op.delimiter.length());
 
-	  if (prefix_key == previous_prefix_key) {
+	  if (prefix_key == prev_prefix_omap_key) {
 	    continue; // we've already added this;
 	  } else {
-	    previous_prefix_key = prefix_key;
+	    prev_prefix_omap_key = prefix_key;
 	  }
 
 	  if (name_entry_map.size() < op.num_entries) {
@@ -596,11 +625,12 @@ int rgw_bucket_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 	  // make sure that if this is the last item added to the
 	  // result from this call to get_obj_vals, the next call will
 	  // skip past rest of "subdirectory"
-	  start_after_key = cls_rgw_after_delim(prefix_key);
+	  start_after_omap_key = cls_rgw_after_delim(prefix_key);
+	  start_after_entry_key.set(start_after_omap_key);
 
-	  // advance to past this subdirectory, but then back up one,
+	  // advance past this subdirectory, but then back up one,
 	  // so the loop increment will put us in the right place
-	  kiter = keys.lower_bound(start_after_key);
+	  kiter = keys.lower_bound(start_after_omap_key);
 	  --kiter;
 
           continue;
@@ -611,9 +641,9 @@ int rgw_bucket_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
       }
 
       if (name_entry_map.size() < op.num_entries &&
-	  kiter->first != previous_key) {
+	  kiter->first != prev_omap_key) {
         name_entry_map[kiter->first] = entry;
-	previous_key = kiter->first;
+	prev_omap_key = kiter->first;
 	CLS_LOG(20, "%s: got object entry %s[%s] num entries=%d\n",
 		__func__, key.name.c_str(), key.instance.c_str(),
 		int(name_entry_map.size()));
@@ -622,9 +652,21 @@ int rgw_bucket_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
   } // for (int attempt...
 
   ret.is_truncated = more && !done;
+  if (ret.is_truncated) {
+    ret.marker = start_after_entry_key;
+  }
+  CLS_LOG(20, "%s: normal exit returning %ld entries, is_truncated=%d\n",
+	  __func__, ret.dir.m.size(), ret.is_truncated);
   encode(ret, *out);
-  return 0;
+
+  if (ret.is_truncated && name_entry_map.size() == 0) {
+    CLS_LOG(5, "%s: returning value RGWBIAdvanceAndRetryError\n", __func__);
+    return RGWBIAdvanceAndRetryError;
+  } else {
+    return 0;
+  }
 } // rgw_bucket_list
+
 
 static int check_index(cls_method_context_t hctx,
 		       rgw_bucket_dir_header *existing_header,
@@ -654,7 +696,7 @@ static int check_index(cls_method_context_t hctx,
       return rc;
 
     for (auto kiter = keys.begin(); kiter != keys.end(); ++kiter) {
-      if (!bi_is_objs_index(kiter->first)) {
+      if (!bi_is_plain_entry(kiter->first)) {
         done = true;
         break;
       }
@@ -682,6 +724,7 @@ static int check_index(cls_method_context_t hctx,
 
 int rgw_bucket_check_index(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   rgw_cls_check_index_ret ret;
 
   int rc = check_index(hctx, &ret.existing_header, &ret.calculated_header);
@@ -705,6 +748,7 @@ static int write_bucket_header(cls_method_context_t hctx, rgw_bucket_dir_header 
 
 int rgw_bucket_rebuild_index(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   rgw_bucket_dir_header existing_header;
   rgw_bucket_dir_header calc_header;
   int rc = check_index(hctx, &existing_header, &calc_header);
@@ -716,6 +760,7 @@ int rgw_bucket_rebuild_index(cls_method_context_t hctx, bufferlist *in, bufferli
 
 int rgw_bucket_update_stats(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_bucket_update_stats_op op;
   auto iter = in->cbegin();
@@ -750,6 +795,7 @@ int rgw_bucket_update_stats(cls_method_context_t hctx, bufferlist *in, bufferlis
 
 int rgw_bucket_init_index(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   bufferlist header_bl;
   int rc = cls_cxx_map_read_header(hctx, &header_bl);
   if (rc < 0) {
@@ -774,6 +820,7 @@ int rgw_bucket_init_index(cls_method_context_t hctx, bufferlist *in, bufferlist 
 
 int rgw_bucket_set_tag_timeout(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_tag_timeout_op op;
   auto iter = in->cbegin();
@@ -802,6 +849,7 @@ static int read_key_entry(cls_method_context_t hctx, cls_rgw_obj_key& key,
 
 int rgw_bucket_prepare_op(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_obj_prepare_op op;
   auto iter = in->cbegin();
@@ -944,6 +992,7 @@ static int read_key_entry(cls_method_context_t hctx, cls_rgw_obj_key& key,
 
 int rgw_bucket_complete_op(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_obj_complete_op op;
   auto iter = in->cbegin();
@@ -1193,6 +1242,7 @@ class BIVerObjEntry {
 
 public:
   BIVerObjEntry(cls_method_context_t& _hctx, const cls_rgw_obj_key& _key) : hctx(_hctx), key(_key), initialized(false) {
+    // empty
   }
 
   int init(bool check_delete_marker = true) {
@@ -1341,7 +1391,7 @@ public:
   real_time mtime() {
     return instance_entry.meta.mtime;
   }
-};
+}; // class BIVerObjEntry
 
 
 class BIOLHEntry {
@@ -1517,6 +1567,7 @@ static int convert_plain_entry_to_versioned(cls_method_context_t hctx,
  */
 static int rgw_bucket_link_olh(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   string olh_data_idx;
   string instance_idx;
 
@@ -1530,17 +1581,48 @@ static int rgw_bucket_link_olh(cls_method_context_t hctx, bufferlist *in, buffer
     return -EINVAL;
   }
 
-  BIVerObjEntry obj(hctx, op.key);
-  BIOLHEntry olh(hctx, op.key);
-
   /* read instance entry */
+  BIVerObjEntry obj(hctx, op.key);
   int ret = obj.init(op.delete_marker);
+
+  /* NOTE: When a delete is issued, a key instance is always provided,
+   * either the one for which the delete is requested or a new random
+   * one when no instance is specified. So we need to see which of
+   * these two cases we're dealing with. The variable `existed` will
+   * be true if the instance was specified and false if it was
+   * randomly generated. It might have been cleaner if the instance
+   * were empty and randomly generated here and returned in the reply,
+   * as that would better allow a typo in the instance id. This code
+   * should be audited and possibly cleaned up. */
+
   bool existed = (ret == 0);
   if (ret == -ENOENT && op.delete_marker) {
     ret = 0;
   }
   if (ret < 0) {
     return ret;
+  }
+
+  BIOLHEntry olh(hctx, op.key);
+  bool olh_read_attempt = false;
+  bool olh_found = false;
+  if (!existed && op.delete_marker) {
+    /* read olh */
+    ret = olh.init(&olh_found);
+    if (ret < 0) {
+      return ret;
+    }
+    olh_read_attempt = true;
+
+    // if we're deleting (i.e., adding a delete marker, and the OLH
+    // indicates it already refers to a delete marker, error out)
+    if (olh_found && olh.get_entry().delete_marker) {
+      CLS_LOG(10,
+	      "%s: delete marker received for \"%s\" although OLH"
+	      " already refers to a delete marker\n",
+	      __func__, escape_str(op.key.to_string()).c_str());
+      return -ENOENT;
+    }
   }
 
   if (existed && !real_clock::is_zero(op.unmod_since)) {
@@ -1595,11 +1677,14 @@ static int rgw_bucket_link_olh(cls_method_context_t hctx, bufferlist *in, buffer
   }
 
   /* read olh */
-  bool olh_found;
-  ret = olh.init(&olh_found);
-  if (ret < 0) {
-    return ret;
+  if (!olh_read_attempt) { // only read if we didn't attempt earlier
+    ret = olh.init(&olh_found);
+    if (ret < 0) {
+      return ret;
+    }
+    olh_read_attempt = true;
   }
+
   const uint64_t prev_epoch = olh.get_epoch();
 
   if (!olh.start_modify(op.olh_epoch)) {
@@ -1717,6 +1802,7 @@ static int rgw_bucket_link_olh(cls_method_context_t hctx, bufferlist *in, buffer
 
 static int rgw_bucket_unlink_instance(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   string olh_data_idx;
   string instance_idx;
 
@@ -1873,6 +1959,7 @@ static int rgw_bucket_unlink_instance(cls_method_context_t hctx, bufferlist *in,
 
 static int rgw_bucket_read_olh_log(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_read_olh_log_op op;
   auto iter = in->cbegin();
@@ -1926,6 +2013,7 @@ static int rgw_bucket_read_olh_log(cls_method_context_t hctx, bufferlist *in, bu
 
 static int rgw_bucket_trim_olh_log(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_trim_olh_log_op op;
   auto iter = in->cbegin();
@@ -1977,6 +2065,7 @@ static int rgw_bucket_trim_olh_log(cls_method_context_t hctx, bufferlist *in, bu
 
 static int rgw_bucket_clear_olh(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_bucket_clear_olh_op op;
   auto iter = in->cbegin();
@@ -2043,7 +2132,7 @@ static int rgw_bucket_clear_olh(cls_method_context_t hctx, bufferlist *in, buffe
 int rgw_dir_suggest_changes(cls_method_context_t hctx,
 			    bufferlist *in, bufferlist *out)
 {
-  CLS_LOG(1, "rgw_dir_suggest_changes()");
+  CLS_LOG(1, "entered %s()\n", __func__);
 
   bufferlist header_bl;
   rgw_bucket_dir_header header;
@@ -2171,6 +2260,7 @@ int rgw_dir_suggest_changes(cls_method_context_t hctx,
 
 static int rgw_obj_remove(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_obj_remove_op op;
   auto iter = in->cbegin();
@@ -2244,6 +2334,7 @@ static int rgw_obj_remove(cls_method_context_t hctx, bufferlist *in, bufferlist 
 
 static int rgw_obj_store_pg_ver(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_obj_store_pg_ver_op op;
   auto iter = in->cbegin();
@@ -2268,6 +2359,7 @@ static int rgw_obj_store_pg_ver(cls_method_context_t hctx, bufferlist *in, buffe
 
 static int rgw_obj_check_attrs_prefix(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_obj_check_attrs_prefix op;
   auto iter = in->cbegin();
@@ -2311,6 +2403,7 @@ static int rgw_obj_check_attrs_prefix(cls_method_context_t hctx, bufferlist *in,
 
 static int rgw_obj_check_mtime(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_obj_check_mtime op;
   auto iter = in->cbegin();
@@ -2374,6 +2467,7 @@ static int rgw_obj_check_mtime(cls_method_context_t hctx, bufferlist *in, buffer
 
 static int rgw_bi_get_op(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_bi_get_op op;
   auto iter = in->cbegin();
@@ -2422,6 +2516,7 @@ static int rgw_bi_get_op(cls_method_context_t hctx, bufferlist *in, bufferlist *
 
 static int rgw_bi_put_op(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_bi_put_op op;
   auto iter = in->cbegin();
@@ -2442,70 +2537,142 @@ static int rgw_bi_put_op(cls_method_context_t hctx, bufferlist *in, bufferlist *
   return 0;
 }
 
-static int list_plain_entries(cls_method_context_t hctx,
-			      const string& name,
-			      const string& marker,
-			      uint32_t max,
-                              list<rgw_cls_bi_entry> *entries,
-			      bool *pmore)
+
+/* The plain entries in the bucket index are divided into two regions
+ * divided by the special entries that begin with 0x80. Those below
+ * ("Low") are ascii entries. Those above ("High") bring in unicode
+ * entries. This enum allows either or both regions to be listed in
+ * list_plain_entries(). It's convenient that "Both" be in between the
+ * others so we can use "<= Both" or ">= Both" logic.
+ */
+enum class PlainEntriesRegion {
+  Low, Both, High
+};
+
+
+/* Queries the omap for plain entries in the range of start_after_key
+ * to end_key, non-inclusive. Both of those values must either be
+ * before the "ugly namespace" or after it.
+ *
+ * Negative return values indicate errors. Non-negative return values
+ * indicate number of entries retrieved. */
+static int list_plain_entries_help(cls_method_context_t hctx,
+				   const std::string& name_filter,
+				   const std::string& start_after_key, // exclusive
+				   const std::string& end_key, // exclusive
+				   uint32_t max,
+				   std::list<rgw_cls_bi_entry>* entries,
+				   bool& end_key_reached,
+				   bool& more)
 {
-  string filter = name;
-  string start_after_key = marker;
-
-  string end_key; // stop listing at bi_log_prefix
-  bi_log_prefix(end_key);
-
   int count = 0;
-  map<string, bufferlist> keys;
-  int ret = cls_cxx_map_get_vals(hctx, start_after_key, filter, max,
-				 &keys, pmore);
+  std::map<std::string, bufferlist> raw_entries;
+  int ret = cls_cxx_map_get_vals(hctx, start_after_key, name_filter, max,
+				 &raw_entries, &more);
   if (ret < 0) {
     return ret;
   }
 
-  for (auto iter = keys.begin(); iter != keys.end(); ++iter) {
-    if (iter->first >= end_key) {
-      /* past the end of plain namespace */
-      if (pmore) {
-	*pmore = false;
-      }
+  end_key_reached = false;
+  for (auto iter : raw_entries) {
+    if (!end_key.empty() && iter.first >= end_key) {
+      end_key_reached = true;
+      more = false;
+      return count;
+    }
+
+    rgw_bucket_dir_entry e;
+    auto biter = iter.second.cbegin();
+    try {
+      decode(e, biter);
+    } catch (ceph::buffer::error& err) {
+      CLS_LOG(0, "ERROR: %s: failed to decode buffer for plain bucket index entry \"%s\"",
+	      __func__, escape_str(iter.first).c_str());
+      return -EIO;
+    }
+
+    if (!name_filter.empty() && e.key.name > name_filter) {
+      CLS_LOG(20, "%s: due to filter \"%s\", skipping entry.idx=\"%s\" e.key.name=\"%s\"",
+	      __func__,
+	      escape_str(name_filter).c_str(),
+	      escape_str(iter.first).c_str(),
+	      escape_str(e.key.name).c_str());
+      // skip the rest of the entries
+      more = false;
       return count;
     }
 
     rgw_cls_bi_entry entry;
     entry.type = BIIndexType::Plain;
-    entry.idx = iter->first;
-    entry.data = iter->second;
-
-    auto biter = entry.data.cbegin();
-
-    rgw_bucket_dir_entry e;
-    try {
-      decode(e, biter);
-    } catch (ceph::buffer::error& err) {
-      CLS_LOG(0, "ERROR: %s(): failed to decode buffer", __func__);
-      return -EIO;
-    }
-
-    CLS_LOG(20, "%s(): entry.idx=%s e.key.name=%s", __func__, escape_str(entry.idx).c_str(), escape_str(e.key.name).c_str());
-
-    if (!name.empty() && e.key.name != name) {
-      /* we are skipping the rest of the entries */
-      if (pmore) {
-	*pmore = false;
-      }
-      return count;
-    }
+    entry.idx = iter.first;
+    entry.data = iter.second;
 
     entries->push_back(entry);
     count++;
-    if (count >= (int)max) {
+
+    CLS_LOG(20, "%s: adding entry %d entry.idx=\"%s\" e.key.name=\"%s\"",
+	    __func__,
+	    count,
+            escape_str(entry.idx).c_str(),
+	    escape_str(e.key.name).c_str());
+
+    if (count >= int(max)) {
+      // NB: this looks redundant, but leave in for time being
       return count;
     }
-    start_after_key = entry.idx;
-  }
+  } // iter for loop
 
   return count;
+}
+
+static int list_plain_entries(cls_method_context_t hctx,
+                              const std::string& name_filter,
+                              const std::string& marker,
+                              uint32_t max,
+                              std::list<rgw_cls_bi_entry>* entries,
+                              bool* pmore,
+			      const PlainEntriesRegion region = PlainEntriesRegion::Both)
+{
+  int r;
+  bool end_key_reached;
+  bool more;
+  const size_t start_size = entries->size();
+
+  if (region <= PlainEntriesRegion::Both && marker < BI_PREFIX_BEGIN) {
+    // listing ascii plain namespace
+    int r = list_plain_entries_help(hctx, name_filter, marker, BI_PREFIX_BEGIN, max,
+				    entries, end_key_reached, more);
+    if (r < 0) {
+      return r;
+    }
+
+    // see if we're done for this call (there may be more for a later call)
+    if (r >= int(max) || !end_key_reached || (!more && region != PlainEntriesRegion::Both)) {
+      if (pmore) {
+	*pmore = more;
+      }
+      return int(entries->size() - start_size);
+    }
+
+    max = max - r;
+  }
+
+  if (region >= PlainEntriesRegion::Both) {
+    const std::string start_after_key = std::max(marker, BI_PREFIX_END);
+
+    // listing non-ascii plain namespace
+    r = list_plain_entries_help(hctx, name_filter, start_after_key, {}, max, entries,
+				end_key_reached, more);
+    if (r < 0) {
+      return r;
+    }
+  }
+
+  if (pmore) {
+    *pmore = more;
+  }
+
+  return int(entries->size() - start_size);
 }
 
 static int list_instance_entries(cls_method_context_t hctx,
@@ -2688,10 +2855,32 @@ static int list_olh_entries(cls_method_context_t hctx,
   return count;
 }
 
+/* Lists all the entries that appear in a bucket index listing.
+ *
+ * It may not be obvious why this function calls three other "segment"
+ * functions (list_plain_entries (twice), list_instance_entries,
+ * list_olh_entries) that each list segments of the index space rather
+ * than just move a marker through the space from start to end. The
+ * reason is that a name filter may be provided in the op, and in that
+ * case most entries will be skipped over, and small segments within
+ * each larger segment will be listed.
+ *
+ * Ideally, each of the three segment functions should be able to
+ * handle a marker and filter, if either/both is provided,
+ * efficiently. So, for example, if the marker is after the segment,
+ * ideally return quickly rather than iterating through entries in the
+ * segment.
+ *
+ * Additionally, each of the three segment functions, if successful,
+ * is expected to return the number of entries added to the output
+ * list as a non-negative value. As per usual, negative return values
+ * indicate error condtions.
+ */
 static int rgw_bi_list_op(cls_method_context_t hctx,
 			  bufferlist *in,
 			  bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   // decode request
   rgw_cls_bi_list_op op;
   auto iter = in->cbegin();
@@ -2702,26 +2891,28 @@ static int rgw_bi_list_op(cls_method_context_t hctx,
     return -EINVAL;
   }
 
+  int ret;
+  int count = 0;
+  constexpr int MAX_BI_LIST_ENTRIES = 1000;
+  const int32_t max = (op.max < MAX_BI_LIST_ENTRIES ? op.max : MAX_BI_LIST_ENTRIES);
+  bool more = false;
   rgw_cls_bi_list_ret op_ret;
 
-  string filter = op.name;
-#define MAX_BI_LIST_ENTRIES 1000
-  int32_t max = (op.max < MAX_BI_LIST_ENTRIES ? op.max : MAX_BI_LIST_ENTRIES);
-  bool more;
-  int ret = list_plain_entries(hctx, op.name, op.marker, max,
-			       &op_ret.entries, &more);
+  ret = list_plain_entries(hctx, op.name_filter, op.marker, max,
+			   &op_ret.entries, &more, PlainEntriesRegion::Low);
   if (ret < 0) {
-    CLS_LOG(0, "ERROR: %s(): list_plain_entries returned ret=%d", __func__, ret);
+    CLS_LOG(0, "ERROR: %s: list_plain_entries (low) returned ret=%d, marker=\"%s\", filter=\"%s\", max=%d",
+	    __func__, ret, escape_str(op.marker).c_str(), escape_str(op.name_filter).c_str(), max);
     return ret;
   }
-  int count = ret;
 
-  CLS_LOG(20, "found %d plain entries", count);
+  count = ret;
+  CLS_LOG(20, "found %d plain ascii (low) entries", count);
 
   if (!more) {
-    ret = list_instance_entries(hctx, op.name, op.marker, max - count, &op_ret.entries, &more);
+    ret = list_instance_entries(hctx, op.name_filter, op.marker, max - count, &op_ret.entries, &more);
     if (ret < 0) {
-      CLS_LOG(0, "ERROR: %s(): list_instance_entries returned ret=%d", __func__, ret);
+      CLS_LOG(0, "ERROR: %s: list_instance_entries returned ret=%d", __func__, ret);
       return ret;
     }
 
@@ -2729,16 +2920,29 @@ static int rgw_bi_list_op(cls_method_context_t hctx,
   }
 
   if (!more) {
-    ret = list_olh_entries(hctx, op.name, op.marker, max - count, &op_ret.entries, &more);
+    ret = list_olh_entries(hctx, op.name_filter, op.marker, max - count, &op_ret.entries, &more);
     if (ret < 0) {
-      CLS_LOG(0, "ERROR: %s(): list_olh_entries returned ret=%d", __func__, ret);
+      CLS_LOG(0, "ERROR: %s: list_olh_entries returned ret=%d", __func__, ret);
       return ret;
     }
 
     count += ret;
   }
 
-  op_ret.is_truncated = (count >= max) || more;
+  if (!more) {
+    ret = list_plain_entries(hctx, op.name_filter, op.marker, max,
+			     &op_ret.entries, &more, PlainEntriesRegion::High);
+    if (ret < 0) {
+      CLS_LOG(0, "ERROR: %s: list_plain_entries (high) returned ret=%d, marker=\"%s\", filter=\"%s\", max=%d",
+	      __func__, ret, escape_str(op.marker).c_str(), escape_str(op.name_filter).c_str(), max);
+      return ret;
+    }
+
+    count = ret;
+    CLS_LOG(20, "found %d non-ascii (high) plain entries", count);
+  }
+
+  op_ret.is_truncated = (count > max) || more;
   while (count > max) {
     op_ret.entries.pop_back();
     count--;
@@ -2748,6 +2952,7 @@ static int rgw_bi_list_op(cls_method_context_t hctx,
 
   return 0;
 }
+
 
 int bi_log_record_decode(bufferlist& bl, rgw_bi_log_entry& e)
 {
@@ -2760,6 +2965,7 @@ int bi_log_record_decode(bufferlist& bl, rgw_bi_log_entry& e)
   }
   return 0;
 }
+
 
 static int bi_log_iterate_entries(cls_method_context_t hctx,
 				  const string& marker,
@@ -2866,6 +3072,7 @@ static int bi_log_list_entries(cls_method_context_t hctx, const string& marker,
 
 static int rgw_bi_log_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_bi_log_list_op op;
@@ -2888,6 +3095,7 @@ static int rgw_bi_log_list(cls_method_context_t hctx, bufferlist *in, bufferlist
 
 static int rgw_bi_log_trim(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_bi_log_trim_op op;
@@ -2949,6 +3157,7 @@ static int rgw_bi_log_trim(cls_method_context_t hctx, bufferlist *in, bufferlist
 
 static int rgw_bi_log_resync(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   rgw_bucket_dir_header header;
   int rc = read_bucket_header(hctx, &header);
   if (rc < 0) {
@@ -2981,8 +3190,9 @@ static int rgw_bi_log_resync(cls_method_context_t hctx, bufferlist *in, bufferli
   return write_bucket_header(hctx, &header);
 }
 
-static int rgw_bi_log_stop(cls_method_context_t hctx, bufferlist *in, bufferlist *out) 
+static int rgw_bi_log_stop(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   rgw_bucket_dir_header header;
   int rc = read_bucket_header(hctx, &header);
   if (rc < 0) {
@@ -3058,7 +3268,7 @@ static int usage_record_decode(bufferlist& record_bl, rgw_usage_log_entry& e)
 
 int rgw_user_usage_log_add(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
-  CLS_LOG(10, "rgw_user_usage_log_add()");
+  CLS_LOG(10, "entered %s()\n", __func__);
 
   auto in_iter = in->cbegin();
   rgw_cls_usage_log_add_op op;
@@ -3118,7 +3328,7 @@ static int usage_iterate_range(cls_method_context_t hctx, uint64_t start, uint64
                             int (*cb)(cls_method_context_t, const string&, rgw_usage_log_entry&, void *),
                             void *param)
 {
-  CLS_LOG(10, "usage_iterate_range");
+  CLS_LOG(10, "entered %s()\n", __func__);
 
   map<string, bufferlist> keys;
   string filter_prefix;
@@ -3217,7 +3427,7 @@ static int usage_log_read_cb(cls_method_context_t hctx, const string& key, rgw_u
 
 int rgw_user_usage_log_read(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
-  CLS_LOG(10, "rgw_user_usage_log_read()");
+  CLS_LOG(10, "entered %s()\n", __func__);
 
   auto in_iter = in->cbegin();
   rgw_cls_usage_log_read_op op;
@@ -3267,7 +3477,7 @@ static int usage_log_trim_cb(cls_method_context_t hctx, const string& key, rgw_u
 
 int rgw_user_usage_log_trim(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
-  CLS_LOG(10, "rgw_user_usage_log_trim()");
+  CLS_LOG(10, "entered %s()\n", __func__);
 
   /* only continue if object exists! */
   int ret = cls_cxx_stat(hctx, NULL, NULL);
@@ -3300,7 +3510,7 @@ int rgw_user_usage_log_trim(cls_method_context_t hctx, bufferlist *in, bufferlis
 
 int rgw_usage_log_clear(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
-  CLS_LOG(10,"%s", __func__);
+  CLS_LOG(10, "entered %s()\n", __func__);
 
   int ret = cls_cxx_map_clear(hctx);
   /* if object doesn't exist all the logs are cleared anyway */
@@ -3459,6 +3669,7 @@ int gc_record_decode(bufferlist& bl, cls_rgw_gc_obj_info& e)
 
 static int rgw_cls_gc_set_entry(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_gc_set_entry_op op;
@@ -3474,6 +3685,7 @@ static int rgw_cls_gc_set_entry(cls_method_context_t hctx, bufferlist *in, buffe
 
 static int rgw_cls_gc_defer_entry(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_gc_defer_entry_op op;
@@ -3596,6 +3808,7 @@ static int gc_list_entries(cls_method_context_t hctx, const string& marker,
 
 static int rgw_cls_gc_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_gc_list_op op;
@@ -3608,7 +3821,7 @@ static int rgw_cls_gc_list(cls_method_context_t hctx, bufferlist *in, bufferlist
 
   cls_rgw_gc_list_ret op_ret;
 #define GC_LIST_ENTRIES_DEFAULT 128
-  int ret = gc_list_entries(hctx, op.marker, (op.max ? op.max : GC_LIST_ENTRIES_DEFAULT), op.expired_only, 
+  int ret = gc_list_entries(hctx, op.marker, (op.max ? op.max : GC_LIST_ENTRIES_DEFAULT), op.expired_only,
    op_ret.entries, &op_ret.truncated, op_ret.next_marker);
   if (ret < 0)
     return ret;
@@ -3651,6 +3864,7 @@ static int gc_remove(cls_method_context_t hctx, vector<string>& tags)
 
 static int rgw_cls_gc_remove(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_gc_remove_op op;
@@ -3666,6 +3880,7 @@ static int rgw_cls_gc_remove(cls_method_context_t hctx, bufferlist *in, bufferli
 
 static int rgw_cls_lc_get_entry(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_lc_get_entry_op op;
@@ -3689,6 +3904,7 @@ static int rgw_cls_lc_get_entry(cls_method_context_t hctx, bufferlist *in, buffe
 
 static int rgw_cls_lc_set_entry(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_lc_set_entry_op op;
@@ -3708,6 +3924,7 @@ static int rgw_cls_lc_set_entry(cls_method_context_t hctx, bufferlist *in, buffe
 
 static int rgw_cls_lc_rm_entry(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_lc_rm_entry_op op;
@@ -3724,6 +3941,7 @@ static int rgw_cls_lc_rm_entry(cls_method_context_t hctx, bufferlist *in, buffer
 
 static int rgw_cls_lc_get_next_entry(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
   cls_rgw_lc_get_next_entry_ret op_ret;
   cls_rgw_lc_get_next_entry_op op;
@@ -3759,6 +3977,7 @@ static int rgw_cls_lc_get_next_entry(cls_method_context_t hctx, bufferlist *in, 
 static int rgw_cls_lc_list_entries(cls_method_context_t hctx, bufferlist *in,
 				   bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   cls_rgw_lc_list_entries_op op;
   auto in_iter = in->cbegin();
   try {
@@ -3801,6 +4020,7 @@ static int rgw_cls_lc_list_entries(cls_method_context_t hctx, bufferlist *in,
 
 static int rgw_cls_lc_put_head(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_lc_put_head_op op;
@@ -3819,6 +4039,7 @@ static int rgw_cls_lc_put_head(cls_method_context_t hctx, bufferlist *in, buffer
 
 static int rgw_cls_lc_get_head(cls_method_context_t hctx, bufferlist *in,  bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   bufferlist bl;
   int ret = cls_cxx_map_read_header(hctx, &bl);
   if (ret < 0)
@@ -3844,6 +4065,7 @@ static int rgw_cls_lc_get_head(cls_method_context_t hctx, bufferlist *in,  buffe
 
 static int rgw_reshard_add(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_reshard_add_op op;
@@ -3871,6 +4093,7 @@ static int rgw_reshard_add(cls_method_context_t hctx, bufferlist *in, bufferlist
 
 static int rgw_reshard_list(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   cls_rgw_reshard_list_op op;
   auto in_iter = in->cbegin();
   try {
@@ -3906,6 +4129,7 @@ static int rgw_reshard_list(cls_method_context_t hctx, bufferlist *in, bufferlis
 
 static int rgw_reshard_get(cls_method_context_t hctx, bufferlist *in,  bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_reshard_get_op op;
@@ -3932,6 +4156,7 @@ static int rgw_reshard_get(cls_method_context_t hctx, bufferlist *in,  bufferlis
 
 static int rgw_reshard_remove(cls_method_context_t hctx, bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   auto in_iter = in->cbegin();
 
   cls_rgw_reshard_remove_op op;
@@ -3965,6 +4190,7 @@ static int rgw_reshard_remove(cls_method_context_t hctx, bufferlist *in, bufferl
 
 static int rgw_set_bucket_resharding(cls_method_context_t hctx, bufferlist *in,  bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   cls_rgw_set_bucket_resharding_op op;
 
   auto in_iter = in->cbegin();
@@ -3989,6 +4215,7 @@ static int rgw_set_bucket_resharding(cls_method_context_t hctx, bufferlist *in, 
 
 static int rgw_clear_bucket_resharding(cls_method_context_t hctx, bufferlist *in,  bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   cls_rgw_clear_bucket_resharding_op op;
 
   auto in_iter = in->cbegin();
@@ -4012,6 +4239,7 @@ static int rgw_clear_bucket_resharding(cls_method_context_t hctx, bufferlist *in
 
 static int rgw_guard_bucket_resharding(cls_method_context_t hctx, bufferlist *in,  bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   cls_rgw_guard_bucket_resharding_op op;
 
   auto in_iter = in->cbegin();
@@ -4039,6 +4267,7 @@ static int rgw_guard_bucket_resharding(cls_method_context_t hctx, bufferlist *in
 static int rgw_get_bucket_resharding(cls_method_context_t hctx,
 				     bufferlist *in, bufferlist *out)
 {
+  CLS_LOG(10, "entered %s()\n", __func__);
   cls_rgw_get_bucket_resharding_op op;
 
   auto in_iter = in->cbegin();

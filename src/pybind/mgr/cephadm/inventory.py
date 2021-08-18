@@ -1,7 +1,9 @@
 import datetime
 from copy import copy
+import ipaddress
 import json
 import logging
+import socket
 from typing import TYPE_CHECKING, Dict, List, Iterator, Optional, Any, Tuple, Set, Mapping, cast, \
     NamedTuple, Type
 
@@ -10,6 +12,9 @@ from ceph.deployment import inventory
 from ceph.deployment.service_spec import ServiceSpec, PlacementSpec
 from ceph.utils import str_to_datetime, datetime_to_str, datetime_now
 from orchestrator import OrchestratorError, HostSpec, OrchestratorEvent, service_to_daemon_types
+
+from .utils import resolve_ip
+from .migrations import queue_migrate_nfs_spec
 
 if TYPE_CHECKING:
     from .module import CephadmOrchestrator
@@ -28,6 +33,15 @@ class Inventory:
 
     def __init__(self, mgr: 'CephadmOrchestrator'):
         self.mgr = mgr
+        adjusted_addrs = False
+
+        def is_valid_ip(ip: str) -> bool:
+            try:
+                ipaddress.ip_address(ip)
+                return True
+            except ValueError:
+                return False
+
         # load inventory
         i = self.mgr.get_store('inventory')
         if i:
@@ -36,6 +50,34 @@ class Inventory:
             for k, v in self._inventory.items():
                 if 'hostname' not in v:
                     v['hostname'] = k
+
+                # convert legacy non-IP addr?
+                if is_valid_ip(str(v.get('addr'))):
+                    continue
+                if len(self._inventory) > 1:
+                    if k == socket.gethostname():
+                        # Never try to resolve our own host!  This is
+                        # fraught and can lead to either a loopback
+                        # address (due to podman's futzing with
+                        # /etc/hosts) or a private IP based on the CNI
+                        # configuration.  Instead, wait until the mgr
+                        # fails over to another host and let them resolve
+                        # this host.
+                        continue
+                    ip = resolve_ip(cast(str, v.get('addr')))
+                else:
+                    # we only have 1 node in the cluster, so we can't
+                    # rely on another host doing the lookup.  use the
+                    # IP the mgr binds to.
+                    ip = self.mgr.get_mgr_ip()
+                if is_valid_ip(ip) and not ip.startswith('127.0.'):
+                    self.mgr.log.info(
+                        f"inventory: adjusted host {v['hostname']} addr '{v['addr']}' -> '{ip}'"
+                    )
+                    v['addr'] = ip
+                    adjusted_addrs = True
+            if adjusted_addrs:
+                self.save()
         else:
             self._inventory = dict()
         logger.debug('Loaded inventory %s' % self._inventory)
@@ -122,6 +164,7 @@ class Inventory:
 
 class SpecDescription(NamedTuple):
     spec: ServiceSpec
+    rank_map: Optional[Dict[int, Dict[int, Optional[str]]]]
     created: datetime.datetime
     deleted: Optional[datetime.datetime]
 
@@ -131,6 +174,8 @@ class SpecStore():
         # type: (CephadmOrchestrator) -> None
         self.mgr = mgr
         self._specs = {}  # type: Dict[str, ServiceSpec]
+        # service_name -> rank -> gen -> daemon_id
+        self._rank_maps = {}    # type: Dict[str, Dict[int, Dict[int, Optional[str]]]]
         self.spec_created = {}  # type: Dict[str, datetime.datetime]
         self.spec_deleted = {}  # type: Dict[str, datetime.datetime]
         self.spec_preview = {}  # type: Dict[str, ServiceSpec]
@@ -149,6 +194,7 @@ class SpecStore():
         if name not in self._specs:
             raise OrchestratorError(f'Service {name} not found.')
         return SpecDescription(self._specs[name],
+                               self._rank_maps.get(name),
                                self.spec_created[name],
                                self.spec_deleted.get(name, None))
 
@@ -162,14 +208,39 @@ class SpecStore():
             service_name = k[len(SPEC_STORE_PREFIX):]
             try:
                 j = cast(Dict[str, dict], json.loads(v))
+                if (
+                        (self.mgr.migration_current or 0) < 3
+                        and j['spec'].get('service_type') == 'nfs'
+                ):
+                    self.mgr.log.debug(f'found legacy nfs spec {j}')
+                    queue_migrate_nfs_spec(self.mgr, j)
                 spec = ServiceSpec.from_json(j['spec'])
                 created = str_to_datetime(cast(str, j['created']))
                 self._specs[service_name] = spec
                 self.spec_created[service_name] = created
 
-                if 'deleted' in v:
+                if 'deleted' in j:
                     deleted = str_to_datetime(cast(str, j['deleted']))
                     self.spec_deleted[service_name] = deleted
+
+                if 'rank_map' in j and isinstance(j['rank_map'], dict):
+                    self._rank_maps[service_name] = {}
+                    for rank_str, m in j['rank_map'].items():
+                        try:
+                            rank = int(rank_str)
+                        except ValueError:
+                            logger.exception(f"failed to parse rank in {j['rank_map']}")
+                            continue
+                        if isinstance(m, dict):
+                            self._rank_maps[service_name][rank] = {}
+                            for gen_str, name in m.items():
+                                try:
+                                    gen = int(gen_str)
+                                except ValueError:
+                                    logger.exception(f"failed to parse gen in {j['rank_map']}")
+                                    continue
+                                if isinstance(name, str) or m is None:
+                                    self._rank_maps[service_name][rank][gen] = name
 
                 self.mgr.log.debug('SpecStore: loaded spec for %s' % (
                     service_name))
@@ -178,7 +249,11 @@ class SpecStore():
                     service_name, e))
                 pass
 
-    def save(self, spec: ServiceSpec, update_create: bool = True) -> None:
+    def save(
+            self,
+            spec: ServiceSpec,
+            update_create: bool = True,
+    ) -> None:
         name = spec.service_name()
         if spec.preview_only:
             self.spec_preview[name] = spec
@@ -187,11 +262,21 @@ class SpecStore():
 
         if update_create:
             self.spec_created[name] = datetime_now()
+        self._save(name)
 
-        data = {
-            'spec': spec.to_json(),
+    def save_rank_map(self,
+                      name: str,
+                      rank_map: Dict[int, Dict[int, Optional[str]]]) -> None:
+        self._rank_maps[name] = rank_map
+        self._save(name)
+
+    def _save(self, name: str) -> None:
+        data: Dict[str, Any] = {
+            'spec': self._specs[name].to_json(),
             'created': datetime_to_str(self.spec_created[name]),
         }
+        if name in self._rank_maps:
+            data['rank_map'] = self._rank_maps[name]
         if name in self.spec_deleted:
             data['deleted'] = datetime_to_str(self.spec_deleted[name])
 
@@ -199,7 +284,9 @@ class SpecStore():
             SPEC_STORE_PREFIX + name,
             json.dumps(data, sort_keys=True),
         )
-        self.mgr.events.for_service(spec, OrchestratorEvent.INFO, 'service was created')
+        self.mgr.events.for_service(self._specs[name],
+                                    OrchestratorEvent.INFO,
+                                    'service was created')
 
     def rm(self, service_name: str) -> bool:
         if service_name not in self._specs:
@@ -218,6 +305,8 @@ class SpecStore():
         found = service_name in self._specs
         if found:
             del self._specs[service_name]
+            if service_name in self._rank_maps:
+                del self._rank_maps[service_name]
             del self.spec_created[service_name]
             if service_name in self.spec_deleted:
                 del self.spec_deleted[service_name]

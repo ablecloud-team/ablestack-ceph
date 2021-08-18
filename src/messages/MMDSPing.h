@@ -27,7 +27,7 @@ public:
     return "mdsping";
   }
 
-  void print(ostream &out) const override {
+  void print(std::ostream &out) const override {
     out << "mdsping";
   }
 
@@ -46,7 +46,7 @@ private:
   template<class T, typename... Args>
   friend boost::intrusive_ptr<T> ceph::make_message(Args&&... args);
   template<class T, typename... Args>
-  friend MURef<T> crimson::net::make_message(Args&&... args);
+  friend MURef<T> crimson::make_message(Args&&... args);
 };
 
 #endif // CEPH_MESSAGES_MMDSPING_H

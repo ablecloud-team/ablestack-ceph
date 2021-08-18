@@ -45,6 +45,8 @@ extern "C" {
 #undef dout_prefix
 #define dout_prefix *_dout << "smrbdev(" << this << " " << path << ") "
 
+using namespace std;
+
 HMSMRDevice::HMSMRDevice(CephContext* cct, aio_callback_t cb, void *cbpriv, aio_callback_t d_cb, void *d_cbpriv)
   : BlockDevice(cct, cb, cbpriv),
     aio(false), dio(false),
@@ -410,6 +412,14 @@ void HMSMRDevice::_detect_vdo()
     dout(20) << __func__ << " no VDO volume maps to " << devname << dendl;
   }
   return;
+}
+
+void HMSMRDevice::reset_zones(const std::set<uint64_t>& zones) {
+  for (auto zone_num : zones) {
+    if (zbd_reset_zones(zbd_fd, zone_num * zone_size, zone_size) != 0) {
+      derr << __func__ << " resetting zone failed for zone " << zone_num << dendl;
+    }
+  }
 }
 
 bool HMSMRDevice::get_thin_utilization(uint64_t *total, uint64_t *avail) const

@@ -27,8 +27,8 @@
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
+using namespace std;
 using namespace rgw;
-
 
 template<typename M>
 class canonical_char_sorter {
@@ -791,7 +791,7 @@ int RGWGetObj_BlockDecrypt::flush() {
 }
 
 RGWPutObj_BlockEncrypt::RGWPutObj_BlockEncrypt(CephContext* cct,
-                                               rgw::putobj::DataProcessor *next,
+                                               rgw::sal::DataProcessor *next,
                                                std::unique_ptr<BlockCrypt> crypt)
   : Pipe(next),
     cct(cct),

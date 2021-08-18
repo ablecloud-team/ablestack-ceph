@@ -7,7 +7,7 @@ OSD Service
 List Devices
 ============
 
-``ceph-volume`` scans each cluster in the host from time to time in order
+``ceph-volume`` scans each host in the cluster from time to time in order
 to determine which devices are present and whether they are eligible to be
 used as OSDs.
 
@@ -211,6 +211,7 @@ If you want to avoid this behavior (disable automatic creation of OSD on availab
 
 * For cephadm, see also :ref:`cephadm-spec-unmanaged`.
 
+.. _cephadm-osd-removal:
 
 Remove an OSD
 =============
@@ -268,7 +269,7 @@ It is possible to stop queued OSD removals by using the following command:
 
 .. prompt:: bash #
 
-  ceph orch osd rm stop <svc_id(s)>
+  ceph orch osd rm stop <osd_id(s)>
 
 Example:
 
@@ -288,7 +289,7 @@ Replacing an OSD
 
 .. prompt:: bash #
 
-  orch osd rm <svc_id(s)> --replace [--force]
+  orch osd rm <osd_id(s)> --replace [--force]
 
 Example:
 
@@ -347,7 +348,7 @@ zap`` on the remote host.
 
 .. prompt:: bash #
 
-  orch device zap <hostname> <path>
+  ceph orch device zap <hostname> <path>
 
 Example command:
 

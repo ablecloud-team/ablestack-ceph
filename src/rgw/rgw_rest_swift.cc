@@ -39,6 +39,8 @@
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
+using namespace std;
+
 int RGWListBuckets_ObjStore_SWIFT::get_params(optional_yield y)
 {
   prefix = s->info.args.get("prefix");
@@ -2856,10 +2858,6 @@ int RGWHandler_REST_SWIFT::validate_bucket_name(const string& bucket)
     return -ERR_INVALID_BUCKET_NAME;
   }
 
-  const auto ret = RGWHandler_REST::validate_bucket_name(bucket);
-  if (ret < 0) {
-    return ret;
-  }
 
   if (len == 0)
     return 0;

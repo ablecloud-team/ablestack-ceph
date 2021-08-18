@@ -14,6 +14,8 @@
 
 #include "common/Formatter.h"
 
+using namespace std;
+
 static string shadow_ns = RGW_OBJ_NS_SHADOW;
 
 static void init_bucket(rgw_bucket *b, const char *t, const char *n, const char *dp, const char *ip, const char *m, const char *id)
@@ -80,6 +82,7 @@ void rgw_log_entry::generate_test_instances(list<rgw_log_entry*>& o)
   e->referrer = "referrer";
   e->bucket_id = "10";
   e->trans_id = "trans_id";
+  e->identity_type = TYPE_RGW;
   o.push_back(e);
   o.push_back(new rgw_log_entry);
 }

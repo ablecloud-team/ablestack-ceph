@@ -967,29 +967,36 @@ int BlueFS::_open_super()
   return 0;
 }
 
-int BlueFS::_check_new_allocations(const bluefs_fnode_t& fnode,
-  size_t dev_count,
-  boost::dynamic_bitset<uint64_t>* used_blocks)
+int BlueFS::_check_allocations(const bluefs_fnode_t& fnode,
+  boost::dynamic_bitset<uint64_t>* used_blocks,
+  bool is_alloc, //true when allocating, false when deallocating
+  const char* op_name)
 {
   auto& fnode_extents = fnode.extents;
   for (auto e : fnode_extents) {
     auto id = e.bdev;
     bool fail = false;
-    ceph_assert(id < dev_count);
+    ceph_assert(id < MAX_BDEV);
+    if (int r = _verify_alloc_granularity(id, e.offset, e.length,
+					  op_name); r < 0) {
+      return r;
+    }
 
     apply_for_bitset_range(e.offset, e.length, alloc_size[id], used_blocks[id],
       [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
-        if (bs.test(pos)) {
-          fail = true;
-        }
-        bs.set(pos);
+	if (is_alloc == bs.test(pos)) {
+	  fail = true;
+	} else {
+	  bs.flip(pos);
+	}
       }
     );
     if (fail) {
-      derr << __func__ << " invalid extent " << int(e.bdev)
-        << ": 0x" << std::hex << e.offset << "~" << e.length
-        << std::dec << ": duplicate reference, ino " << fnode.ino
-        << dendl;
+      derr << __func__ << " " << op_name << " invalid extent " << int(e.bdev)
+        << ": 0x" << std::hex << e.offset << "~" << e.length << std::dec
+	<< (is_alloc == true ?
+	    ": duplicate reference, ino " : ": double free, ino ")
+	<< fnode.ino << dendl;
       return -EFAULT;
     }
   }
@@ -1067,10 +1074,14 @@ int BlueFS::_replay(bool noop, bool to_stdout)
 	  used_blocks[i].resize(round_up_to(bdev[i]->get_size(), alloc_size[i]) / alloc_size[i]);
 	}
       }
+      // check initial log layout
+      int r = _check_allocations(log_file->fnode,
+				 used_blocks, true, "Log from super");
+      if (r < 0) {
+	return r;
+      }
     }
   }
-  
-  bool first_log_check = true;
   
   while (true) {
     ceph_assert((log_reader->buf.pos & ~super.block_mask()) == 0);
@@ -1375,34 +1386,13 @@ int BlueFS::_replay(bool noop, bool to_stdout)
           }
           if (!noop) {
 	    FileRef f = _get_file(fnode.ino);
-            if (cct->_conf->bluefs_log_replay_check_allocations) {
-              // check initial log layout
-              if (first_log_check) {
-                first_log_check = false;
-                int r = _check_new_allocations(log_file->fnode,
-                  MAX_BDEV, used_blocks);
-                if (r < 0) {
-                  return r;
-                }
-              }
-            
-              auto& fnode_extents = f->fnode.extents;
-              for (auto e : fnode_extents) {
-                auto id = e.bdev;
-		if (int r = _verify_alloc_granularity(id, e.offset, e.length,
-						      "OP_FILE_UPDATE"); r < 0) {
-		  return r;
-		}
-                apply_for_bitset_range(e.offset, e.length, alloc_size[id],
-				       used_blocks[id],
-                  [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
-                    ceph_assert(bs.test(pos));
-                    bs.reset(pos);
-                  }
-                );
+	    if (cct->_conf->bluefs_log_replay_check_allocations) {
+              int r = _check_allocations(f->fnode,
+		used_blocks, false, "OP_FILE_UPDATE");
+              if (r < 0) {
+                return r;
               }
             }
-
             if (fnode.ino != 1) {
               vselector->sub_usage(f->vselector_hint, f->fnode);
             }
@@ -1415,8 +1405,8 @@ int BlueFS::_replay(bool noop, bool to_stdout)
 	      ino_last = fnode.ino;
 	    }
             if (cct->_conf->bluefs_log_replay_check_allocations) {
-              int r = _check_new_allocations(f->fnode,
-                MAX_BDEV, used_blocks);
+              int r = _check_allocations(f->fnode,
+		used_blocks, true, "OP_FILE_UPDATE");
               if (r < 0) {
                 return r;
               }
@@ -1441,27 +1431,10 @@ int BlueFS::_replay(bool noop, bool to_stdout)
             ceph_assert(p != file_map.end());
             vselector->sub_usage(p->second->vselector_hint, p->second->fnode);
             if (cct->_conf->bluefs_log_replay_check_allocations) {
-              auto& fnode_extents = p->second->fnode.extents;
-              for (auto e : fnode_extents) {
-                auto id = e.bdev;
-                bool fail = false;
-
-                apply_for_bitset_range(e.offset, e.length, alloc_size[id], used_blocks[id],
-                  [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
-                    if (!bs.test(pos)) {
-                      fail = true;
-                    }
-                    bs.reset(pos);
-                  }
-                );
-                if (fail) {
-                  derr << __func__ << " invalid extent " << int(id)
-                    << ": 0x" << std::hex << e.offset << "~" << e.length
-                    << std::dec
-                    << ": not in use but is allocated for removed ino " << ino
-                    << dendl;
-                  return -EFAULT;
-                }
+	      int r = _check_allocations(p->second->fnode,
+		used_blocks, false, "OP_FILE_REMOVE");
+              if (r < 0) {
+		return r;
               }
             }
             file_map.erase(p);
@@ -1484,14 +1457,6 @@ int BlueFS::_replay(bool noop, bool to_stdout)
   }
   if (!noop) {
     vselector->add_usage(log_file->vselector_hint, log_file->fnode);
-  }
-  if (!noop && first_log_check &&
-        cct->_conf->bluefs_log_replay_check_allocations) {
-    int r = _check_new_allocations(log_file->fnode,
-      MAX_BDEV, used_blocks);
-    if (r < 0) {
-      return r;
-    }
   }
 
   dout(10) << __func__ << " log file size was 0x"
@@ -2680,6 +2645,33 @@ ceph::bufferlist BlueFS::FileWriter::flush_buffer(
   return bl;
 }
 
+int BlueFS::_signal_dirty_to_log(FileWriter *h)
+{
+  h->file->fnode.mtime = ceph_clock_now();
+  ceph_assert(h->file->fnode.ino >= 1);
+  if (h->file->dirty_seq == 0) {
+    h->file->dirty_seq = log_seq + 1;
+    dirty_files[h->file->dirty_seq].push_back(*h->file);
+    dout(20) << __func__ << " dirty_seq = " << log_seq + 1
+	     << " (was clean)" << dendl;
+  } else {
+    if (h->file->dirty_seq != log_seq + 1) {
+      // need re-dirty, erase from list first
+      ceph_assert(dirty_files.count(h->file->dirty_seq));
+      auto it = dirty_files[h->file->dirty_seq].iterator_to(*h->file);
+      dirty_files[h->file->dirty_seq].erase(it);
+      h->file->dirty_seq = log_seq + 1;
+      dirty_files[h->file->dirty_seq].push_back(*h->file);
+      dout(20) << __func__ << " dirty_seq = " << log_seq + 1
+	       << " (was " << h->file->dirty_seq << ")" << dendl;
+    } else {
+      dout(20) << __func__ << " dirty_seq = " << log_seq + 1
+	       << " (unchanged, do nothing) " << dendl;
+    }
+  }
+  return 0;
+}
+
 int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
 {
   dout(10) << __func__ << " " << h << " pos 0x" << std::hex << h->pos
@@ -2713,7 +2705,7 @@ int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
   vselector->sub_usage(h->file->vselector_hint, h->file->fnode);
   // do not bother to dirty the file if we are overwriting
   // previously allocated extents.
-  bool must_dirty = false;
+
   if (allocated < offset + length) {
     // we should never run out of log space here; see the min runway check
     // in _flush_and_sync_log.
@@ -2729,7 +2721,7 @@ int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
       ceph_abort_msg("bluefs enospc");
       return r;
     }
-    must_dirty = true;
+    h->file->is_dirty = true;
   }
   if (h->file->fnode.size < offset + length) {
     h->file->fnode.size = offset + length;
@@ -2737,34 +2729,10 @@ int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
       // we do not need to dirty the log file (or it's compacting
       // replacement) when the file size changes because replay is
       // smart enough to discover it on its own.
-      must_dirty = true;
+      h->file->is_dirty = true;
     }
   }
-  if (must_dirty) {
-    h->file->fnode.mtime = ceph_clock_now();
-    ceph_assert(h->file->fnode.ino >= 1);
-    if (h->file->dirty_seq == 0) {
-      h->file->dirty_seq = log_seq + 1;
-      dirty_files[h->file->dirty_seq].push_back(*h->file);
-      dout(20) << __func__ << " dirty_seq = " << log_seq + 1
-	       << " (was clean)" << dendl;
-    } else {
-      if (h->file->dirty_seq != log_seq + 1) {
-        // need re-dirty, erase from list first
-        ceph_assert(dirty_files.count(h->file->dirty_seq));
-        auto it = dirty_files[h->file->dirty_seq].iterator_to(*h->file);
-        dirty_files[h->file->dirty_seq].erase(it);
-        h->file->dirty_seq = log_seq + 1;
-        dirty_files[h->file->dirty_seq].push_back(*h->file);
-        dout(20) << __func__ << " dirty_seq = " << log_seq + 1
-                 << " (was " << h->file->dirty_seq << ")" << dendl;
-      } else {
-        dout(20) << __func__ << " dirty_seq = " << log_seq + 1
-                 << " (unchanged, do nothing) " << dendl;
-      }
-    }
-  }
-  dout(20) << __func__ << " file now " << h->file->fnode << dendl;
+  dout(20) << __func__ << " file now, unflushed " << h->file->fnode << dendl;
 
   uint64_t x_off = 0;
   auto p = h->file->fnode.seek(offset, &x_off);
@@ -2956,6 +2924,10 @@ int BlueFS::_fsync(FileWriter *h, std::unique_lock<ceph::mutex>& l)
   int r = _flush(h, true);
   if (r < 0)
      return r;
+  if (h->file->is_dirty) {
+    _signal_dirty_to_log(h);
+    h->file->is_dirty = false;
+  }
   uint64_t old_dirty_seq = h->file->dirty_seq;
 
   _flush_bdev_safely(h);
@@ -3092,11 +3064,13 @@ int BlueFS::_allocate(uint8_t id, uint64_t len,
               << ", fragmentation " << alloc[id]->get_fragmentation()
               << ", allocated 0x" << (alloc_len > 0 ? alloc_len : 0)
 	      << std::dec << dendl;
+    } else {
+      dout(20) << __func__ << " alloc-id not set on index="<< (int)id << " unable to allocate 0x" << std::hex << need
+	       << " on bdev " << (int)id << std::dec << dendl;
     }
-
     if (id != BDEV_SLOW) {
       dout(20) << __func__ << " fallback to bdev "
-               << (int)id + 1
+	       << (int)id + 1
 	       << dendl;
       return _allocate(id + 1, len, node);
     } else {
@@ -3294,6 +3268,18 @@ void BlueFS::_close_writer(FileWriter *h)
     }
   }
   delete h;
+}
+
+uint64_t BlueFS::debug_get_dirty_seq(FileWriter *h)
+{
+  std::lock_guard l(lock);
+  return h->file->dirty_seq;
+}
+
+bool BlueFS::debug_get_is_dev_dirty(FileWriter *h, uint8_t dev)
+{
+  std::lock_guard l(lock);
+  return h->dirty_devs[dev];
 }
 
 int BlueFS::open_for_read(
