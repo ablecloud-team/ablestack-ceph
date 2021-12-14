@@ -2089,6 +2089,123 @@ TEST_F(TestLibRBD, TestCreateLsRenameSnapPP)
   ioctx.close();
 }
 
+TEST_F(TestLibRBD, ConcurrentCreatesUnvalidatedPool)
+{
+  rados_ioctx_t ioctx;
+  ASSERT_EQ(0, rados_ioctx_create(_cluster, create_pool(true).c_str(),
+                                  &ioctx));
+
+  std::vector<std::string> names;
+  for (int i = 0; i < 4; i++) {
+    names.push_back(get_temp_image_name());
+  }
+  uint64_t size = 2 << 20;
+
+  std::vector<std::thread> threads;
+  for (const auto& name : names) {
+    threads.emplace_back([ioctx, &name, size]() {
+      int order = 0;
+      ASSERT_EQ(0, create_image(ioctx, name.c_str(), size, &order));
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  for (const auto& name : names) {
+    ASSERT_EQ(0, rbd_remove(ioctx, name.c_str()));
+  }
+  rados_ioctx_destroy(ioctx);
+}
+
+static void remove_full_try(rados_ioctx_t ioctx, const std::string& image_name,
+                            const std::string& data_pool_name)
+{
+  int order = 0;
+  uint64_t quota = 10 << 20;
+  uint64_t size = 5 * quota;
+  ASSERT_EQ(0, create_image(ioctx, image_name.c_str(), size, &order));
+
+  std::string cmdstr = "{\"prefix\": \"osd pool set-quota\", \"pool\": \"" +
+      data_pool_name + "\", \"field\": \"max_bytes\", \"val\": \"" +
+      std::to_string(quota) + "\"}";
+  char *cmd[1];
+  cmd[0] = (char *)cmdstr.c_str();
+  ASSERT_EQ(0, rados_mon_command(rados_ioctx_get_cluster(ioctx),
+                                 (const char **)cmd, 1, "", 0, nullptr, 0,
+                                 nullptr, 0));
+
+  rados_set_pool_full_try(ioctx);
+
+  rbd_image_t image;
+  ASSERT_EQ(0, rbd_open(ioctx, image_name.c_str(), &image, nullptr));
+
+  uint64_t off;
+  size_t len = 1 << 20;
+  ssize_t ret;
+  for (off = 0; off < size; off += len) {
+    ret = rbd_write_zeroes(image, off, len,
+                           RBD_WRITE_ZEROES_FLAG_THICK_PROVISION,
+                           LIBRADOS_OP_FLAG_FADVISE_FUA);
+    if (ret < 0) {
+      break;
+    }
+    ASSERT_EQ(ret, len);
+    sleep(1);
+  }
+  ASSERT_TRUE(off >= quota && off < size);
+  ASSERT_EQ(ret, -EDQUOT);
+
+  ASSERT_EQ(0, rbd_close(image));
+
+  // make sure we have latest map that marked the pool full
+  ASSERT_EQ(0, rados_wait_for_latest_osdmap(rados_ioctx_get_cluster(ioctx)));
+  ASSERT_EQ(0, rbd_remove(ioctx, image_name.c_str()));
+}
+
+TEST_F(TestLibRBD, RemoveFullTry)
+{
+  REQUIRE(!is_rbd_pwl_enabled((CephContext *)_rados.cct()));
+  REQUIRE(!is_librados_test_stub(_rados));
+
+  rados_ioctx_t ioctx;
+  auto pool_name = create_pool(true);
+  ASSERT_EQ(0, rados_ioctx_create(_cluster, pool_name.c_str(), &ioctx));
+  // cancel out rbd_default_data_pool -- we need an image without
+  // a separate data pool
+  ASSERT_EQ(0, rbd_pool_metadata_set(ioctx, "conf_rbd_default_data_pool",
+                                     pool_name.c_str()));
+
+  int order = 0;
+  auto image_name = get_temp_image_name();
+  // FIXME: this is a workaround for rbd_trash object being created
+  // on the first remove -- pre-create it to avoid bumping into quota
+  ASSERT_EQ(0, create_image(ioctx, image_name.c_str(), 0, &order));
+  ASSERT_EQ(0, rbd_remove(ioctx, image_name.c_str()));
+  remove_full_try(ioctx, image_name, pool_name);
+
+  rados_ioctx_destroy(ioctx);
+}
+
+TEST_F(TestLibRBD, RemoveFullTryDataPool)
+{
+  REQUIRE_FORMAT_V2();
+  REQUIRE(!is_rbd_pwl_enabled((CephContext *)_rados.cct()));
+  REQUIRE(!is_librados_test_stub(_rados));
+
+  rados_ioctx_t ioctx;
+  auto pool_name = create_pool(true);
+  auto data_pool_name = create_pool(true);
+  ASSERT_EQ(0, rados_ioctx_create(_cluster, pool_name.c_str(), &ioctx));
+  ASSERT_EQ(0, rbd_pool_metadata_set(ioctx, "conf_rbd_default_data_pool",
+                                     data_pool_name.c_str()));
+
+  auto image_name = get_temp_image_name();
+  remove_full_try(ioctx, image_name, data_pool_name);
+
+  rados_ioctx_destroy(ioctx);
+}
+
 TEST_F(TestLibRBD, TestIO)
 {
   rados_ioctx_t ioctx;

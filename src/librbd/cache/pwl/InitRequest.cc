@@ -122,8 +122,8 @@ void InitRequest<I>::init_image_cache() {
   ldout(cct, 10) << dendl;
 
   using klass = InitRequest<I>;
-  Context *ctx = create_context_callback<
-    klass, &klass::handle_init_image_cache>(this);
+  Context *ctx = create_async_context_callback(m_image_ctx,
+    create_context_callback<klass, &klass::handle_init_image_cache>(this));
   m_image_cache->init(ctx);
 }
 
@@ -176,12 +176,6 @@ void InitRequest<I>::handle_set_feature_bit(int r) {
     save_result(r);
 
     shutdown_image_cache();
-  }
-
-  if (m_image_ctx.discard_granularity_bytes) {
-    ldout(cct, 1) << "RWL image cache is enabled and "
-                  << "set discard_granularity_bytes = 0." << dendl;
-    m_image_ctx.discard_granularity_bytes = 0;
   }
 
   // Register RWL dispatch
