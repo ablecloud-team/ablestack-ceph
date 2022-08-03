@@ -422,6 +422,8 @@ PGBackend::cmp_ext(const ObjectState& os, OSDOp& osd_op)
       char byte_from_disk = (index < read_bl.length() ? read_bl[index] : 0);
       if (byte_in_op != byte_from_disk) {
         logger().debug("cmp_ext: mismatch at {}", index);
+        // Unlike other ops, we set osd_op.rval here and return a different
+        // error code via ct_error::cmp_fail.
         osd_op.rval = -MAX_ERRNO - index;
         return crimson::ct_error::cmp_fail::make();
       }
@@ -508,6 +510,25 @@ static bool is_offset_and_length_valid(
   } else {
     return true;
   }
+}
+
+PGBackend::interruptible_future<> PGBackend::set_allochint(
+  ObjectState& os,
+  const OSDOp& osd_op,
+  ceph::os::Transaction& txn,
+  object_stat_sum_t& delta_stats)
+{
+  maybe_create_new_object(os, txn, delta_stats);
+
+  os.oi.expected_object_size = osd_op.op.alloc_hint.expected_object_size;
+  os.oi.expected_write_size = osd_op.op.alloc_hint.expected_write_size;
+  os.oi.alloc_hint_flags = osd_op.op.alloc_hint.flags;
+  txn.set_alloc_hint(coll->get_cid(),
+                     ghobject_t{os.oi.soid},
+                     os.oi.expected_object_size,
+                     os.oi.expected_write_size,
+                     os.oi.alloc_hint_flags);
+  return seastar::now();
 }
 
 PGBackend::write_iertr::future<> PGBackend::write(

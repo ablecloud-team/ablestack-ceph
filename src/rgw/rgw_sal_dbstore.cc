@@ -722,9 +722,10 @@ namespace rgw::sal {
     return op_target.obj_omap_set_val_by_key(dpp, key, val, must_exist);
   }
 
-  MPSerializer* DBObject::get_serializer(const DoutPrefixProvider *dpp, const std::string& lock_name)
+  std::unique_ptr<MPSerializer> DBObject::get_serializer(const DoutPrefixProvider *dpp,
+							 const std::string& lock_name)
   {
-    return new MPDBSerializer(dpp, store, this, lock_name);
+    return std::make_unique<MPDBSerializer>(dpp, store, this, lock_name);
   }
 
   int DBObject::transition(Bucket* bucket,
@@ -734,7 +735,9 @@ namespace rgw::sal {
       const DoutPrefixProvider* dpp,
       optional_yield y)
   {
-    return 0;
+    DB::Object op_target(store->getDB(),
+        get_bucket()->get_info(), get_obj());
+    return op_target.transition(dpp, placement_rule, mtime, olh_epoch);
   }
 
   int DBObject::transition_to_cloud(Bucket* bucket,
@@ -1146,6 +1149,7 @@ namespace rgw::sal {
 
     obj_op.meta.owner = owner.get_id();
     obj_op.meta.flags = PUT_OBJ_CREATE;
+    obj_op.meta.category = RGWObjCategory::Main;
     obj_op.meta.modify_tail = true;
     obj_op.meta.completeMultipart = true;
 
@@ -1251,7 +1255,7 @@ namespace rgw::sal {
     		    const rgw_user& _owner,
 	    	    const rgw_placement_rule *_ptail_placement_rule,
                 uint64_t _part_num, const std::string& _part_num_str):
-    			Writer(dpp, y),
+			StoreWriter(dpp, y),
 	    		store(_store),
                 owner(_owner),
                 ptail_placement_rule(_ptail_placement_rule),
@@ -1400,7 +1404,7 @@ namespace rgw::sal {
 	    	    const rgw_placement_rule *_ptail_placement_rule,
 		        uint64_t _olh_epoch,
 		        const std::string& _unique_tag) :
-    			Writer(dpp, y),
+			StoreWriter(dpp, y),
 	    		store(_store),
                 owner(_owner),
                 ptail_placement_rule(_ptail_placement_rule),
@@ -1523,6 +1527,7 @@ namespace rgw::sal {
     parent_op.meta.if_nomatch = if_nomatch;
     parent_op.meta.user_data = user_data;
     parent_op.meta.zones_trace = zones_trace;
+    parent_op.meta.category = RGWObjCategory::Main;
     
     /* XXX: handle accounted size */
     accounted_size = total_data_size;
@@ -1609,7 +1614,9 @@ namespace rgw::sal {
 
   bool DBStore::valid_placement(const rgw_placement_rule& rule)
   {
-    return zone.get_rgw_params().valid_placement(rule);
+    // XXX: Till zonegroup, zone and storage-classes can be configured
+    // for dbstore return true
+    return true; //zone.get_rgw_params().valid_placement(rule);
   }
 
   std::unique_ptr<User> DBStore::get_user(const rgw_user &u)
@@ -1766,46 +1773,48 @@ namespace rgw::sal {
   }
 
   int DBLifecycle::get_entry(const std::string& oid, const std::string& marker,
-			      LCEntry& entry)
+			      std::unique_ptr<LCEntry>* entry)
   {
     return store->getDB()->get_entry(oid, marker, entry);
   }
 
-  int DBLifecycle::get_next_entry(const std::string& oid, std::string& marker,
-				   LCEntry& entry)
+  int DBLifecycle::get_next_entry(const std::string& oid, const std::string& marker,
+				  std::unique_ptr<LCEntry>* entry)
   {
     return store->getDB()->get_next_entry(oid, marker, entry);
   }
 
-  int DBLifecycle::set_entry(const std::string& oid, const LCEntry& entry)
+  int DBLifecycle::set_entry(const std::string& oid, LCEntry& entry)
   {
     return store->getDB()->set_entry(oid, entry);
   }
 
   int DBLifecycle::list_entries(const std::string& oid, const std::string& marker,
-  				 uint32_t max_entries, vector<LCEntry>& entries)
+  				 uint32_t max_entries, vector<std::unique_ptr<LCEntry>>& entries)
   {
     return store->getDB()->list_entries(oid, marker, max_entries, entries);
   }
 
-  int DBLifecycle::rm_entry(const std::string& oid, const LCEntry& entry)
+  int DBLifecycle::rm_entry(const std::string& oid, LCEntry& entry)
   {
     return store->getDB()->rm_entry(oid, entry);
   }
 
-  int DBLifecycle::get_head(const std::string& oid, LCHead& head)
+  int DBLifecycle::get_head(const std::string& oid, std::unique_ptr<LCHead>* head)
   {
     return store->getDB()->get_head(oid, head);
   }
 
-  int DBLifecycle::put_head(const std::string& oid, const LCHead& head)
+  int DBLifecycle::put_head(const std::string& oid, LCHead& head)
   {
     return store->getDB()->put_head(oid, head);
   }
 
-  LCSerializer* DBLifecycle::get_serializer(const std::string& lock_name, const std::string& oid, const std::string& cookie)
+  std::unique_ptr<LCSerializer> DBLifecycle::get_serializer(const std::string& lock_name,
+							    const std::string& oid,
+							    const std::string& cookie)
   {
-    return new LCDBSerializer(store, oid, lock_name, cookie);
+    return std::make_unique<LCDBSerializer>(store, oid, lock_name, cookie);
   }
 
   std::unique_ptr<Notification> DBStore::get_notification(

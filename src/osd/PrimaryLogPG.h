@@ -1152,7 +1152,7 @@ protected:
   void _make_clone(
     OpContext *ctx,
     PGTransaction* t,
-    ObjectContextRef obc,
+    ObjectContextRef clone_obc,
     const hobject_t& head, const hobject_t& coid,
     object_info_t *poi);
   void execute_ctx(OpContext *ctx);
@@ -1459,7 +1459,7 @@ protected:
   int do_cdc(const object_info_t& oi, std::map<uint64_t, chunk_info_t>& chunk_map,
 	     std::map<uint64_t, bufferlist>& chunks);
   int start_dedup(OpRequestRef op, ObjectContextRef obc);
-  hobject_t get_fpoid_from_chunk(const hobject_t soid, bufferlist& chunk);
+  std::pair<int, hobject_t> get_fpoid_from_chunk(const hobject_t soid, bufferlist& chunk);
   int finish_set_dedup(hobject_t oid, int r, ceph_tid_t tid, uint64_t offset);
   int finish_set_manifest_refcount(hobject_t oid, int r, ceph_tid_t tid, uint64_t offset);
 

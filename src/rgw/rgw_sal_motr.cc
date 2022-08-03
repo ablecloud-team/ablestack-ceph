@@ -1110,9 +1110,10 @@ int MotrObject::omap_set_val_by_key(const DoutPrefixProvider *dpp, const std::st
   return 0;
 }
 
-MPSerializer* MotrObject::get_serializer(const DoutPrefixProvider *dpp, const std::string& lock_name)
+std::unique_ptr<MPSerializer> MotrObject::get_serializer(const DoutPrefixProvider *dpp,
+                                                         const std::string& lock_name)
 {
-  return new MPMotrSerializer(dpp, store, this, lock_name);
+  return std::make_unique<MPMotrSerializer>(dpp, store, this, lock_name);
 }
 
 int MotrObject::transition(Bucket* bucket,
@@ -1341,7 +1342,7 @@ MotrAtomicWriter::MotrAtomicWriter(const DoutPrefixProvider *dpp,
           const rgw_placement_rule *_ptail_placement_rule,
           uint64_t _olh_epoch,
           const std::string& _unique_tag) :
-        Writer(dpp, y),
+        StoreWriter(dpp, y),
         store(_store),
               owner(_owner),
               ptail_placement_rule(_ptail_placement_rule),

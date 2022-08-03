@@ -132,7 +132,7 @@ bool Elector::ever_participated() const
 
 unsigned Elector::paxos_size() const
 {
-  return (unsigned)mon->monmap->size();
+  return mon->monmap->size();
 }
 
 void Elector::shutdown()
@@ -708,7 +708,7 @@ void Elector::notify_rank_changed(int new_rank)
   dead_pinging.erase(new_rank);
 }
 
-void Elector::notify_rank_removed(int rank_removed)
+void Elector::notify_rank_removed(unsigned rank_removed)
 {
   peer_tracker.notify_rank_removed(rank_removed);
   /* we have to clean up the pinging state, which is annoying

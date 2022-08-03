@@ -10,7 +10,7 @@
 
 #include "crimson/os/seastore/logging.h"
 #include "crimson/common/config_proxy.h"
-#include "crimson/os/seastore/segment_cleaner.h"
+#include "crimson/os/seastore/async_cleaner.h"
 
 // included for get_extent_by_type
 #include "crimson/os/seastore/collection_manager/collection_flat_node.h"
@@ -27,6 +27,15 @@ using std::string_view;
 SET_SUBSYS(seastore_cache);
 
 namespace crimson::os::seastore {
+
+std::ostream &operator<<(std::ostream &out, const backref_buf_entry_t &ent) {
+  return out << "backref_buf_entry_t{"
+	     << ent.paddr << "~" << ent.len << ", "
+	     << "laddr: " << ent.laddr << ", "
+	     << "type: " << ent.type << ", "
+	     << "seq: " << ent.seq << ", "
+	     << "}";
+}
 
 Cache::Cache(
   ExtentPlacementManager &epm)
@@ -85,11 +94,14 @@ Cache::retire_extent_ret Cache::retire_extent_addr(
     // add a new placeholder to Cache
     ext = CachedExtent::make_cached_extent_ref<
       RetiredExtentPlaceholder>(length);
-    ext->set_paddr(addr);
-    ext->state = CachedExtent::extent_state_t::CLEAN;
+    ext->init(CachedExtent::extent_state_t::CLEAN,
+              addr,
+              PLACEMENT_HINT_NULL,
+              NULL_GENERATION);
     DEBUGT("retire {}~{} as placeholder, add extent -- {}",
            t, addr, length, *ext);
-    add_extent(ext);
+    const auto t_src = t.get_src();
+    add_extent(ext, &t_src);
   }
 
   // add the retired-placeholder to transaction
@@ -121,8 +133,8 @@ void Cache::register_metrics()
   std::map<src_t, sm::label_instance> labels_by_src {
     {src_t::MUTATE, sm::label_instance("src", "MUTATE")},
     {src_t::READ, sm::label_instance("src", "READ")},
-    {src_t::CLEANER_TRIM, sm::label_instance("src", "CLEANER_TRIM")},
-    {src_t::TRIM_BACKREF, sm::label_instance("src", "TRIM_BACKREF")},
+    {src_t::CLEANER_TRIM_DIRTY, sm::label_instance("src", "CLEANER_TRIM_DIRTY")},
+    {src_t::CLEANER_TRIM_ALLOC, sm::label_instance("src", "CLEANER_TRIM_ALLOC")},
     {src_t::CLEANER_RECLAIM, sm::label_instance("src", "CLEANER_RECLAIM")},
   };
   assert(labels_by_src.size() == (std::size_t)src_t::MAX);
@@ -138,7 +150,7 @@ void Cache::register_metrics()
     {extent_types_t::OBJECT_DATA_BLOCK,   sm::label_instance("ext", "OBJECT_DATA_BLOCK")},
     {extent_types_t::RETIRED_PLACEHOLDER, sm::label_instance("ext", "RETIRED_PLACEHOLDER")},
     {extent_types_t::ALLOC_INFO,      	  sm::label_instance("ext", "ALLOC_INFO")},
-    {extent_types_t::ALLOC_TAIL,          sm::label_instance("ext", "ALLOC_TAIL")},
+    {extent_types_t::JOURNAL_TAIL,        sm::label_instance("ext", "JOURNAL_TAIL")},
     {extent_types_t::TEST_BLOCK,          sm::label_instance("ext", "TEST_BLOCK")},
     {extent_types_t::TEST_BLOCK_PHYSICAL, sm::label_instance("ext", "TEST_BLOCK_PHYSICAL")},
     {extent_types_t::BACKREF_INTERNAL,    sm::label_instance("ext", "BACKREF_INTERNAL")},
@@ -610,12 +622,12 @@ void Cache::register_metrics()
       // should be consistent with checks in account_conflict()
       if ((src1 == Transaction::src_t::READ &&
            src2 == Transaction::src_t::READ) ||
-          (src1 == Transaction::src_t::CLEANER_TRIM &&
-           src2 == Transaction::src_t::CLEANER_TRIM) ||
+          (src1 == Transaction::src_t::CLEANER_TRIM_DIRTY &&
+           src2 == Transaction::src_t::CLEANER_TRIM_DIRTY) ||
           (src1 == Transaction::src_t::CLEANER_RECLAIM &&
            src2 == Transaction::src_t::CLEANER_RECLAIM) ||
-          (src1 == Transaction::src_t::TRIM_BACKREF &&
-           src2 == Transaction::src_t::TRIM_BACKREF)) {
+          (src1 == Transaction::src_t::CLEANER_TRIM_ALLOC &&
+           src2 == Transaction::src_t::CLEANER_TRIM_ALLOC)) {
         continue;
       }
       std::ostringstream oss;
@@ -683,14 +695,16 @@ void Cache::register_metrics()
   );
 }
 
-void Cache::add_extent(CachedExtentRef ref)
+void Cache::add_extent(
+    CachedExtentRef ref,
+    const Transaction::src_t* p_src=nullptr)
 {
   assert(ref->is_valid());
   extents.insert(*ref);
   if (ref->is_dirty()) {
     add_to_dirty(ref);
   } else {
-    touch_extent(*ref);
+    touch_extent(*ref, p_src);
   }
 }
 
@@ -710,6 +724,7 @@ void Cache::add_to_dirty(CachedExtentRef ref)
 {
   assert(ref->is_dirty());
   assert(!ref->primary_ref_list_hook.is_linked());
+  ceph_assert(ref->get_modify_time() != NULL_TIME);
   intrusive_ptr_add_ref(&*ref);
   dirty.push_back(*ref);
   stats.dirty_bytes += ref->get_length();
@@ -744,7 +759,7 @@ void Cache::commit_retire_extent(
 {
   remove_extent(ref);
 
-  ref->dirty_from_or_retired_at = JOURNAL_SEQ_MAX;
+  ref->dirty_from_or_retired_at = JOURNAL_SEQ_NULL;
   invalidate_extent(t, *ref);
 }
 
@@ -924,40 +939,41 @@ void Cache::on_transaction_destruct(Transaction& t)
 }
 
 CachedExtentRef Cache::alloc_new_extent_by_type(
-  Transaction &t,       ///< [in, out] current transaction
-  extent_types_t type,  ///< [in] type tag
+  Transaction &t,        ///< [in, out] current transaction
+  extent_types_t type,   ///< [in] type tag
   seastore_off_t length, ///< [in] length
-  placement_hint_t hint
+  placement_hint_t hint, ///< [in] user hint
+  reclaim_gen_t gen      ///< [in] reclaim generation
 )
 {
   LOG_PREFIX(Cache::alloc_new_extent_by_type);
-  SUBDEBUGT(seastore_cache, "allocate {} {}B, hint={}",
-            t, type, length, hint);
+  SUBDEBUGT(seastore_cache, "allocate {} {}B, hint={}, gen={}",
+            t, type, length, hint, reclaim_gen_printer_t{gen});
   switch (type) {
   case extent_types_t::ROOT:
     ceph_assert(0 == "ROOT is never directly alloc'd");
     return CachedExtentRef();
   case extent_types_t::LADDR_INTERNAL:
-    return alloc_new_extent<lba_manager::btree::LBAInternalNode>(t, length, hint);
+    return alloc_new_extent<lba_manager::btree::LBAInternalNode>(t, length, hint, gen);
   case extent_types_t::LADDR_LEAF:
-    return alloc_new_extent<lba_manager::btree::LBALeafNode>(t, length, hint);
+    return alloc_new_extent<lba_manager::btree::LBALeafNode>(t, length, hint, gen);
   case extent_types_t::ONODE_BLOCK_STAGED:
-    return alloc_new_extent<onode::SeastoreNodeExtent>(t, length, hint);
+    return alloc_new_extent<onode::SeastoreNodeExtent>(t, length, hint, gen);
   case extent_types_t::OMAP_INNER:
-    return alloc_new_extent<omap_manager::OMapInnerNode>(t, length, hint);
+    return alloc_new_extent<omap_manager::OMapInnerNode>(t, length, hint, gen);
   case extent_types_t::OMAP_LEAF:
-    return alloc_new_extent<omap_manager::OMapLeafNode>(t, length, hint);
+    return alloc_new_extent<omap_manager::OMapLeafNode>(t, length, hint, gen);
   case extent_types_t::COLL_BLOCK:
-    return alloc_new_extent<collection_manager::CollectionNode>(t, length, hint);
+    return alloc_new_extent<collection_manager::CollectionNode>(t, length, hint, gen);
   case extent_types_t::OBJECT_DATA_BLOCK:
-    return alloc_new_extent<ObjectDataBlock>(t, length, hint);
+    return alloc_new_extent<ObjectDataBlock>(t, length, hint, gen);
   case extent_types_t::RETIRED_PLACEHOLDER:
     ceph_assert(0 == "impossible");
     return CachedExtentRef();
   case extent_types_t::TEST_BLOCK:
-    return alloc_new_extent<TestBlock>(t, length, hint);
+    return alloc_new_extent<TestBlock>(t, length, hint, gen);
   case extent_types_t::TEST_BLOCK_PHYSICAL:
-    return alloc_new_extent<TestBlockPhysical>(t, length, hint);
+    return alloc_new_extent<TestBlockPhysical>(t, length, hint, gen);
   case extent_types_t::NONE: {
     ceph_assert(0 == "NONE is an invalid extent type");
     return CachedExtentRef();
@@ -975,6 +991,15 @@ CachedExtentRef Cache::duplicate_for_write(
   if (i->is_pending())
     return i;
 
+  if (i->is_exist_clean()) {
+    i->version++;
+    i->state = CachedExtent::extent_state_t::EXIST_MUTATION_PENDING;
+    i->last_committed_crc = i->get_crc32c();
+    t.add_mutated_extent(i);
+    DEBUGT("duplicate existing extent {}", t, *i);
+    return i;
+  }
+
   auto ret = i->duplicate_for_write();
   ret->prior_instance = i;
   t.add_mutated_extent(ret);
@@ -986,6 +1011,7 @@ CachedExtentRef Cache::duplicate_for_write(
 
   ret->version++;
   ret->state = CachedExtent::extent_state_t::MUTATION_PENDING;
+  ret->set_reclaim_generation(DIRTY_GENERATION);
   DEBUGT("{} -> {}", t, *i, *ret);
   return ret;
 }
@@ -1019,12 +1045,8 @@ record_t Cache::prepare_record(
   t.read_set.clear();
   t.write_set.clear();
 
-  record_t record;
+  record_t record(trans_src);
   auto commit_time = seastar::lowres_system_clock::now();
-  record.commit_time = commit_time.time_since_epoch().count();
-  record.commit_type = (t.get_src() == Transaction::src_t::MUTATE)
-			? record_commit_type_t::MODIFY
-			: record_commit_type_t::REWRITE;
 
   // Add new copy of mutated blocks, set_io_wait to block until written
   record.deltas.reserve(t.mutated_block_list.size());
@@ -1034,20 +1056,29 @@ record_t Cache::prepare_record(
       DEBUGT("invalid mutated extent -- {}", t, *i);
       continue;
     }
-    assert(i->prior_instance);
+    assert(i->is_exist_mutation_pending() ||
+	   i->prior_instance);
     get_by_ext(efforts.mutate_by_ext,
                i->get_type()).increment(i->get_length());
 
     auto delta_bl = i->get_delta();
     auto delta_length = delta_bl.length();
-    DEBUGT("mutated extent with {}B delta, commit replace extent ... -- {}, prior={}",
-           t, delta_length, *i, *i->prior_instance);
-    commit_replace_extent(t, i, i->prior_instance);
+    i->set_modify_time(commit_time);
+    DEBUGT("mutated extent with {}B delta -- {}",
+	   t, delta_length, *i);
+    if (!i->is_exist_mutation_pending()) {
+      DEBUGT("commit replace extent ... -- {}, prior={}",
+	     t, *i, *i->prior_instance);
+      // extent with EXIST_MUTATION_PENDING doesn't have
+      // prior_instance field so skip these extents.
+      // the existing extents should be added into Cache
+      // during complete_commit to sync with gc transaction.
+      commit_replace_extent(t, i, i->prior_instance);
+    }
 
     i->prepare_write();
     i->set_io_wait();
 
-    i->set_last_modified(commit_time);
     assert(i->get_version() > 0);
     auto final_crc = i->get_crc32c();
     if (i->get_type() == extent_types_t::ROOT) {
@@ -1113,9 +1144,8 @@ record_t Cache::prepare_record(
     retire_stat.increment(i->get_length());
     DEBUGT("retired and remove extent -- {}", t, *i);
     commit_retire_extent(t, i);
-    if ((is_backref_mapped_extent_node(i)
-	  || is_retired_placeholder(i->get_type()))
-	&& t.should_record_release(i->get_paddr())) {
+    if (is_backref_mapped_extent_node(i)
+	  || is_retired_placeholder(i->get_type())) {
       rel_delta.alloc_blk_ranges.emplace_back(
 	i->get_paddr(),
 	L_ADDR_NULL,
@@ -1151,14 +1181,11 @@ record_t Cache::prepare_record(
       ceph_assert(0 == "ROOT never gets written as a fresh block");
     }
 
-    if (t.get_src() == Transaction::src_t::MUTATE) {
-      i->set_last_modified(commit_time);
-    } else {
-      assert(is_cleaner_transaction(t.get_src()));
-      i->set_last_rewritten(commit_time);
-    }
-
     assert(bl.length() == i->get_length());
+    auto modify_time = i->get_modify_time();
+    if (modify_time == NULL_TIME) {
+      modify_time = commit_time;
+    }
     record.push_back(extent_t{
 	i->get_type(),
 	i->is_logical()
@@ -1166,9 +1193,9 @@ record_t Cache::prepare_record(
 	: (is_lba_node(i->get_type())
 	  ? i->cast<lba_manager::btree::LBANode>()->get_node_meta().begin
 	  : L_ADDR_NULL),
-	std::move(bl),
-	i->get_last_modified().time_since_epoch().count()
-      });
+	std::move(bl)
+      },
+      modify_time);
     if (i->is_valid()
 	&& is_backref_mapped_extent_node(i)) {
       alloc_delta.alloc_blk_ranges.emplace_back(
@@ -1199,6 +1226,16 @@ record_t Cache::prepare_record(
 	i->get_type());
     }
   }
+
+  for (auto &i: t.existing_block_list) {
+    if (i->is_valid()) {
+      alloc_delta.alloc_blk_ranges.emplace_back(
+        i->get_paddr(),
+	i->cast<LogicalCachedExtent>()->get_laddr(),
+	i->get_length(),
+	i->get_type());
+    }
+  }
   alloc_deltas.emplace_back(std::move(alloc_delta));
 
   for (auto b : alloc_deltas) {
@@ -1211,10 +1248,42 @@ record_t Cache::prepare_record(
   }
 
   if (is_cleaner_transaction(trans_src)) {
+    assert(cleaner != nullptr);
+    journal_seq_t dirty_tail;
+    auto maybe_dirty_tail = get_oldest_dirty_from();
+    if (!maybe_dirty_tail.has_value()) {
+      dirty_tail = cleaner->get_journal_head();
+      SUBINFOT(seastore_t, "dirty_tail all trimmed, set to head {}, src={}",
+               t, dirty_tail, trans_src);
+    } else if (*maybe_dirty_tail == JOURNAL_SEQ_NULL) {
+      dirty_tail = cleaner->get_dirty_tail();
+      SUBINFOT(seastore_t, "dirty_tail is pending, set to {}, src={}",
+               t, dirty_tail, trans_src);
+    } else {
+      dirty_tail = *maybe_dirty_tail;
+    }
+    ceph_assert(dirty_tail != JOURNAL_SEQ_NULL);
+    journal_seq_t alloc_tail;
+    auto maybe_alloc_tail = get_oldest_backref_dirty_from();
+    if (!maybe_alloc_tail.has_value()) {
+      // FIXME: the replay point of the allocations requires to be accurate.
+      // Setting the alloc_tail to get_journal_head() cannot skip replaying the
+      // last unnecessary record.
+      alloc_tail = cleaner->get_journal_head();
+      SUBINFOT(seastore_t, "alloc_tail all trimmed, set to head {}, src={}",
+               t, alloc_tail, trans_src);
+    } else if (*maybe_alloc_tail == JOURNAL_SEQ_NULL) {
+      ceph_abort("impossible");
+    } else {
+      alloc_tail = *maybe_alloc_tail;
+    }
+    ceph_assert(alloc_tail != JOURNAL_SEQ_NULL);
+    auto tails = journal_tail_delta_t{alloc_tail, dirty_tail};
+    SUBDEBUGT(seastore_t, "update tails as delta {}", t, tails);
     bufferlist bl;
-    encode(get_oldest_backref_dirty_from().value_or(JOURNAL_SEQ_NULL), bl);
+    encode(tails, bl);
     delta_info_t delta;
-    delta.type = extent_types_t::ALLOC_TAIL;
+    delta.type = extent_types_t::JOURNAL_TAIL;
     delta.bl = bl;
     record.push_back(std::move(delta));
   }
@@ -1237,12 +1306,18 @@ record_t Cache::prepare_record(
     assert(ool_stats.is_clear());
   }
 
+  if (record.modify_time == NULL_TIME) {
+    record.modify_time = commit_time;
+  }
+
   SUBDEBUGT(seastore_t,
-      "commit H{} dirty_from={}, {} read, {} fresh with {} invalid, "
+      "commit H{} dirty_from={}, alloc_from={}, "
+      "{} read, {} fresh with {} invalid, "
       "{} delta, {} retire, {}(md={}B, data={}B) ool-records, "
-      "{}B md, {}B data",
+      "{}B md, {}B data, modify_time={}",
       t, (void*)&t.get_handle(),
       get_oldest_dirty_from().value_or(JOURNAL_SEQ_NULL),
+      get_oldest_backref_dirty_from().value_or(JOURNAL_SEQ_NULL),
       read_stat,
       fresh_stat,
       fresh_invalid_stat,
@@ -1252,7 +1327,8 @@ record_t Cache::prepare_record(
       ool_stats.md_bytes,
       ool_stats.get_data_bytes(),
       record.size.get_raw_mdlength(),
-      record.size.dlength);
+      record.size.dlength,
+      sea_time_point_printer_t{record.modify_time});
   if (is_cleaner_transaction(trans_src)) {
     // CLEANER transaction won't contain any onode tree operations
     assert(t.onode_tree_stats.is_clear());
@@ -1297,7 +1373,7 @@ record_t Cache::prepare_record(
     (record.size.get_raw_mdlength() - record.get_delta_size());
 
   auto &rewrite_version_stats = t.get_rewrite_version_stats();
-  if (trans_src == Transaction::src_t::CLEANER_TRIM) {
+  if (trans_src == Transaction::src_t::CLEANER_TRIM_DIRTY) {
     stats.committed_dirty_version.increment_stat(rewrite_version_stats);
   } else if (trans_src == Transaction::src_t::CLEANER_RECLAIM) {
     stats.committed_reclaim_version.increment_stat(rewrite_version_stats);
@@ -1313,43 +1389,14 @@ void Cache::backref_batch_update(
   const journal_seq_t &seq)
 {
   LOG_PREFIX(Cache::backref_batch_update);
-  DEBUG("inserting {} entries", list.size());
+  DEBUG("inserting {} entries at {}", list.size(), seq);
+  ceph_assert(seq != JOURNAL_SEQ_NULL);
   if (!backref_buffer) {
     backref_buffer = std::make_unique<backref_cache_t>();
   }
-  // backref_buf_entry_t::laddr == L_ADDR_NULL means erase
+
   for (auto &ent : list) {
-    if (ent->laddr == L_ADDR_NULL) {
-      auto insert_set_iter = backref_inserted_set.find(
-	ent->paddr, backref_buf_entry_t::cmp_t());
-      if (insert_set_iter == backref_inserted_set.end()) {
-	// backref to be removed isn't in the backref buffer,
-	// it must be in the backref tree.
-	auto [it, insert] = backref_remove_set.insert(*ent);
-	boost::ignore_unused(insert);
-#ifndef NDEBUG
-	if (!insert) {
-	  ERROR("backref_remove_set already contains {}", ent->paddr);
-	}
-#endif
-	assert(insert);
-      } else {
-	// the backref insertion hasn't been applied to the
-	// backref tree
-	auto seq = insert_set_iter->seq;
-	auto it = backref_buffer->backrefs_by_seq.find(seq);
-	ceph_assert(it != backref_buffer->backrefs_by_seq.end());
-	auto &backref_buf = it->second;
-	assert(insert_set_iter->backref_buf_hook.is_linked());
-	backref_buf.br_list.erase(
-	  backref_buf_entry_t::list_t::s_iterator_to(*insert_set_iter));
-	backref_inserted_set.erase(insert_set_iter);
-      }
-    } else {
-      auto [it, insert] = backref_inserted_set.insert(*ent);
-      boost::ignore_unused(insert);
-      assert(insert);
-    }
+    backref_set.insert(*ent);
   }
 
   auto iter = backref_buffer->backrefs_by_seq.find(seq);
@@ -1370,12 +1417,12 @@ void Cache::backref_batch_update(
 void Cache::complete_commit(
   Transaction &t,
   paddr_t final_block_start,
-  journal_seq_t seq,
-  SegmentCleaner *cleaner)
+  journal_seq_t start_seq,
+  AsyncCleaner *cleaner)
 {
   LOG_PREFIX(Cache::complete_commit);
-  SUBTRACET(seastore_t, "final_block_start={}, seq={}",
-            t, final_block_start, seq);
+  SUBTRACET(seastore_t, "final_block_start={}, start_seq={}",
+            t, final_block_start, start_seq);
 
   std::vector<backref_buf_entry_ref> backref_list;
   t.for_each_fresh_block([&](const CachedExtentRef &i) {
@@ -1391,19 +1438,18 @@ void Cache::complete_commit(
       i->state = CachedExtent::extent_state_t::CLEAN;
       DEBUGT("add extent as fresh, inline={} -- {}",
              t, is_inline, *i);
-      add_extent(i);
+      const auto t_src = t.get_src();
+      add_extent(i, &t_src);
       if (cleaner) {
 	cleaner->mark_space_used(
 	  i->get_paddr(),
-	  i->get_length(),
-	  (t.get_src() == Transaction::src_t::MUTATE)
-	    ? i->last_modified
-	    : seastar::lowres_system_clock::time_point(),
-	  (is_cleaner_transaction(t.get_src()))
-	    ? i->last_rewritten
-	    : seastar::lowres_system_clock::time_point());
+	  i->get_length());
       }
       if (is_backref_mapped_extent_node(i)) {
+	DEBUGT("backref_list new {} len {}",
+	       t,
+	       i->get_paddr(),
+	       i->get_length());
 	backref_list.emplace_back(
 	  std::make_unique<backref_buf_entry_t>(
 	    i->get_paddr(),
@@ -1414,7 +1460,7 @@ void Cache::complete_commit(
 	      : L_ADDR_NULL),
 	    i->get_length(),
 	    i->get_type(),
-	    seq));
+	    start_seq));
       } else if (is_backref_node(i->get_type())) {
 	add_backref_extent(i->get_paddr(), i->get_type());
       } else {
@@ -1429,13 +1475,14 @@ void Cache::complete_commit(
     if (!i->is_valid()) {
       continue;
     }
-    assert(i->prior_instance);
+    assert(i->is_exist_mutation_pending() ||
+	   i->prior_instance);
     i->on_delta_write(final_block_start);
     i->prior_instance = CachedExtentRef();
     i->state = CachedExtent::extent_state_t::DIRTY;
     assert(i->version > 0);
     if (i->version == 1 || i->get_type() == extent_types_t::ROOT) {
-      i->dirty_from_or_retired_at = seq;
+      i->dirty_from_or_retired_at = start_seq;
       DEBUGT("commit extent done, become dirty -- {}", t, *i);
     } else {
       DEBUGT("commit extent done -- {}", t, *i);
@@ -1448,6 +1495,13 @@ void Cache::complete_commit(
 	i->get_paddr(),
 	i->get_length());
     }
+    for (auto &i: t.existing_block_list) {
+      if (i->is_valid()) {
+	cleaner->mark_space_used(
+	  i->get_paddr(),
+	  i->get_length());
+      }
+    }
   }
 
   for (auto &i: t.mutated_block_list) {
@@ -1457,20 +1511,22 @@ void Cache::complete_commit(
     i->complete_io();
   }
 
-  last_commit = seq;
+  last_commit = start_seq;
   for (auto &i: t.retired_set) {
-    i->dirty_from_or_retired_at = last_commit;
+    i->dirty_from_or_retired_at = start_seq;
     if (is_backref_mapped_extent_node(i)
 	  || is_retired_placeholder(i->get_type())) {
-      if (t.should_record_release(i->get_paddr())) {
-	backref_list.emplace_back(
-	  std::make_unique<backref_buf_entry_t>(
-	    i->get_paddr(),
-	    L_ADDR_NULL,
-	    i->get_length(),
-	    i->get_type(),
-	    seq));
-      }
+      DEBUGT("backref_list free {} len {}",
+	     t,
+	     i->get_paddr(),
+	     i->get_length());
+      backref_list.emplace_back(
+	std::make_unique<backref_buf_entry_t>(
+	  i->get_paddr(),
+	  L_ADDR_NULL,
+	  i->get_length(),
+	  i->get_type(),
+	  start_seq));
     } else if (is_backref_node(i->get_type())) {
       remove_backref_extent(i->get_paddr());
     } else {
@@ -1478,8 +1534,39 @@ void Cache::complete_commit(
       ceph_abort("not possible");
     }
   }
-  if (!backref_list.empty())
-    backref_batch_update(std::move(backref_list), seq);
+
+  auto existing_stats = t.get_existing_block_stats();
+  DEBUGT("total existing blocks num: {}, exist clean num: {}, "
+	 "exist mutation pending num: {}",
+	 t,
+	 existing_stats.valid_num,
+	 existing_stats.clean_num,
+	 existing_stats.mutated_num);
+  for (auto &i: t.existing_block_list) {
+    if (i->is_valid()) {
+      if (i->is_exist_clean()) {
+	i->state = CachedExtent::extent_state_t::CLEAN;
+      } else {
+	assert(i->state == CachedExtent::extent_state_t::DIRTY);
+      }
+      DEBUGT("backref_list new existing {} len {}",
+	     t,
+	     i->get_paddr(),
+	     i->get_length());
+      backref_list.emplace_back(
+        std::make_unique<backref_buf_entry_t>(
+	  i->get_paddr(),
+	  i->cast<LogicalCachedExtent>()->get_laddr(),
+	  i->get_length(),
+	  i->get_type(),
+	  start_seq));
+      const auto t_src = t.get_src();
+      add_extent(i, &t_src);
+    }
+  }
+  if (!backref_list.empty()) {
+    backref_batch_update(std::move(backref_list), start_seq);
+  }
 }
 
 void Cache::init()
@@ -1492,7 +1579,10 @@ void Cache::init()
     root = nullptr;
   }
   root = new RootBlock();
-  root->state = CachedExtent::extent_state_t::CLEAN;
+  root->init(CachedExtent::extent_state_t::CLEAN,
+             P_ADDR_NULL,
+             PLACEMENT_HINT_NULL,
+             NULL_GENERATION);
   INFO("init root -- {}", *root);
   extents.insert(*root);
 }
@@ -1515,10 +1605,12 @@ Cache::mkfs_iertr::future<> Cache::mkfs(Transaction &t)
 Cache::close_ertr::future<> Cache::close()
 {
   LOG_PREFIX(Cache::close);
-  INFO("close with {}({}B) dirty from {}, {}({}B) lru, totally {}({}B) indexed extents",
+  INFO("close with {}({}B) dirty, dirty_from={}, alloc_from={}, "
+       "{}({}B) lru, totally {}({}B) indexed extents",
        dirty.size(),
        stats.dirty_bytes,
        get_oldest_dirty_from().value_or(JOURNAL_SEQ_NULL),
+       get_oldest_backref_dirty_from().value_or(JOURNAL_SEQ_NULL),
        lru.get_current_contents_extents(),
        lru.get_current_contents_bytes(),
        extents.size(),
@@ -1542,29 +1634,28 @@ Cache::replay_delta(
   journal_seq_t journal_seq,
   paddr_t record_base,
   const delta_info_t &delta,
-  const journal_seq_t &alloc_replay_from,
-  seastar::lowres_system_clock::time_point& last_modified)
+  const journal_seq_t &dirty_tail,
+  const journal_seq_t &alloc_tail,
+  sea_time_point modify_time)
 {
   LOG_PREFIX(Cache::replay_delta);
-  assert(alloc_replay_from != JOURNAL_SEQ_NULL);
-  if (delta.type == extent_types_t::ROOT) {
-    TRACE("replay root delta at {} {}, remove extent ... -- {}, prv_root={}",
-          journal_seq, record_base, delta, *root);
-    remove_extent(root);
-    root->apply_delta_and_adjust_crc(record_base, delta.bl);
-    root->dirty_from_or_retired_at = journal_seq;
-    root->state = CachedExtent::extent_state_t::DIRTY;
-    DEBUG("replayed root delta at {} {}, add extent -- {}, root={}",
-          journal_seq, record_base, delta, *root);
-    root->set_last_modified(last_modified);
-    add_extent(root);
-    return replay_delta_ertr::now();
-  } else if (delta.type == extent_types_t::ALLOC_INFO) {
-    if (journal_seq < alloc_replay_from) {
-      DEBUG("journal_seq {} < alloc_replay_from {}, don't replay {}",
-	journal_seq, alloc_replay_from, delta);
-      return replay_delta_ertr::now();
+  assert(dirty_tail != JOURNAL_SEQ_NULL);
+  assert(alloc_tail != JOURNAL_SEQ_NULL);
+  ceph_assert(modify_time != NULL_TIME);
+
+  if (delta.type == extent_types_t::JOURNAL_TAIL) {
+    // this delta should have been dealt with during segment cleaner mounting
+    return replay_delta_ertr::make_ready_future<bool>(false);
+  }
+
+  // replay alloc
+  if (delta.type == extent_types_t::ALLOC_INFO) {
+    if (journal_seq < alloc_tail) {
+      DEBUG("journal_seq {} < alloc_tail {}, don't replay {}",
+	journal_seq, alloc_tail, delta);
+      return replay_delta_ertr::make_ready_future<bool>(false);
     }
+
     alloc_delta_t alloc_delta;
     decode(alloc_delta, delta.bl);
     std::vector<backref_buf_entry_ref> backref_list;
@@ -1583,12 +1674,31 @@ Cache::replay_delta(
 	  alloc_blk.type,
 	  journal_seq));
     }
-    if (!backref_list.empty())
+    if (!backref_list.empty()) {
       backref_batch_update(std::move(backref_list), journal_seq);
-    return replay_delta_ertr::now();
-  } else if (delta.type == extent_types_t::ALLOC_TAIL) {
-    // this delta should have been dealt with during segment cleaner mounting
-    return replay_delta_ertr::now();
+    }
+    return replay_delta_ertr::make_ready_future<bool>(true);
+  }
+
+  // replay dirty
+  if (journal_seq < dirty_tail) {
+    DEBUG("journal_seq {} < dirty_tail {}, don't replay {}",
+      journal_seq, dirty_tail, delta);
+    return replay_delta_ertr::make_ready_future<bool>(false);
+  }
+
+  if (delta.type == extent_types_t::ROOT) {
+    TRACE("replay root delta at {} {}, remove extent ... -- {}, prv_root={}",
+          journal_seq, record_base, delta, *root);
+    remove_extent(root);
+    root->apply_delta_and_adjust_crc(record_base, delta.bl);
+    root->dirty_from_or_retired_at = journal_seq;
+    root->state = CachedExtent::extent_state_t::DIRTY;
+    DEBUG("replayed root delta at {} {}, add extent -- {}, root={}",
+          journal_seq, record_base, delta, *root);
+    root->set_modify_time(modify_time);
+    add_extent(root);
+    return replay_delta_ertr::make_ready_future<bool>(true);
   } else {
     auto _get_extent_if_cached = [this](paddr_t addr)
       -> get_extent_ertr::future<CachedExtentRef> {
@@ -1623,12 +1733,12 @@ Cache::replay_delta(
 	"Invalid error in Cache::replay_delta"
       }
     );
-    return extent_fut.safe_then([=, &delta](auto extent) {
+    return extent_fut.safe_then([=, this, &delta](auto extent) {
       if (!extent) {
 	DEBUG("replay extent is not present, so delta is obsolete at {} {} -- {}",
 	      journal_seq, record_base, delta);
 	assert(delta.pversion > 0);
-	return;
+	return replay_delta_ertr::make_ready_future<bool>(true);
       }
 
       DEBUG("replay extent delta at {} {} ... -- {}, prv_extent={}",
@@ -1638,7 +1748,7 @@ Cache::replay_delta(
 
       assert(extent->last_committed_crc == delta.prev_crc);
       extent->apply_delta_and_adjust_crc(record_base, delta.bl);
-      extent->set_last_modified(last_modified);
+      extent->set_modify_time(modify_time);
       assert(extent->last_committed_crc == delta.final_crc);
 
       extent->version++;
@@ -1651,6 +1761,7 @@ Cache::replay_delta(
               journal_seq, record_base, delta, *extent);
       }
       mark_dirty(extent);
+      return replay_delta_ertr::make_ready_future<bool>(true);
     });
   }
 }
@@ -1674,10 +1785,8 @@ Cache::get_next_dirty_extents_ret Cache::get_next_dirty_extents(
        i != dirty.end() && bytes_so_far < max_bytes;
        ++i) {
     auto dirty_from = i->get_dirty_from();
-    if (unlikely(!(dirty_from != JOURNAL_SEQ_NULL &&
-                dirty_from != JOURNAL_SEQ_MAX &&
-                dirty_from != NO_DELTAS))) {
-      ERRORT("{}", t, *i);
+    if (unlikely(dirty_from == JOURNAL_SEQ_NULL)) {
+      ERRORT("got dirty extent with JOURNAL_SEQ_NULL -- {}", t, *i);
       ceph_abort();
     }
     if (dirty_from < seq) {
@@ -1768,7 +1877,7 @@ Cache::get_extent_ertr::future<CachedExtentRef> Cache::_get_extent_by_type(
   extent_init_func_t &&extent_init_func,
   extent_init_func_t &&on_cache)
 {
-  return [=, extent_init_func=std::move(extent_init_func)]() mutable {
+  return [=, this, extent_init_func=std::move(extent_init_func)]() mutable {
     src_ext_t* p_metric_key = nullptr;
     src_ext_t metric_key;
     if (p_src) {

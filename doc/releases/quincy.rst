@@ -5,6 +5,62 @@ Quincy
 Quincy is the 17th stable release of Ceph.  It is named after Squidward
 Quincy Tentacles from Spongebob Squarepants.
 
+v17.2.3 Quincy
+==============
+
+This is a hotfix release that addresses a libcephsqlite crash in the mgr.
+
+Notable Changes
+---------------
+* A libcephsqlite bug that caused the mgr to crash repeatedly and die is now
+  fixed. The bug was exposed due to 17.2.2 being built with gcc 8.5.0-14, which contains
+  a new patch to check for invalid regex. 17.2.1 was built using gcc 8.5.0-13, which
+  does not contain the invalid regex patch.
+
+  Relevant tracker: https://tracker.ceph.com/issues/55304
+
+  Relevant BZ: https://bugzilla.redhat.com/show_bug.cgi?id=2110797
+
+Changelog
+---------
+
+* libcephsqlite: ceph-mgr crashes when compiled with gcc12 (`pr#47270 <https://github.com/ceph/ceph/pull/47270>`_, Ganesh Maharaj Mahalingam)
+
+v17.2.2 Quincy
+==============
+
+This is a hotfix release that resolves two security flaws.
+
+Notable Changes
+---------------
+* Users who were running OpenStack Manila to export native CephFS, who
+  upgraded their Ceph cluster from Nautilus (or earlier) to a later
+  major version, were vulnerable to an attack by malicious users. The
+  vulnerability allowed users to obtain access to arbitrary portions of
+  the CephFS filesystem hierarchy, instead of being properly restricted
+  to their own subvolumes. The vulnerability is due to a bug in the
+  "volumes" plugin in Ceph Manager. This plugin is responsible for
+  managing Ceph File System subvolumes which are used by OpenStack
+  Manila services as a way to provide shares to Manila users.
+  
+  With this hotfix, the vulnerability is fixed. Administrators who are
+  concerned they may have been impacted should audit the CephX keys in
+  their cluster for proper path restrictions.
+  
+  Again, this vulnerability only impacts OpenStack Manila clusters which
+  provided native CephFS access to their users.
+
+* A regression made it possible to dereference a null pointer for
+  for s3website requests that don't refer to a bucket resulting in an RGW
+  segfault.
+
+Changelog
+---------
+* mgr/volumes: Fix subvolume discover during upgrade (:ref:`CVE-2022-0670`, Kotresh HR)
+* mgr/volumes: V2 Fix for test_subvolume_retain_snapshot_invalid_recreate (:ref:`CVE-2022-0670`, Kotresh HR)
+* qa: validate subvolume discover on upgrade (Kotresh HR)
+* rgw: s3website check for bucket before retargeting (Seena Fallah)
+
 v17.2.1 Quincy
 ==============
 
@@ -180,7 +236,8 @@ General
 
 * telemetry: Improved the opt-in flow so that users can keep sharing the same
   data, even when new data collections are available. A new 'perf' channel that
-  collects various performance metrics is now avaiable to opt into with:
+  collects various performance metrics is now available for operators to opt
+  into with:
   `ceph telemetry on`
   `ceph telemetry enable channel perf`
   See a sample report with `ceph telemetry preview`.
@@ -191,7 +248,7 @@ General
 
 * MGR: The progress module disables the pg recovery event by default since the
   event is expensive and has interrupted other services when there are OSDs
-  being marked in/out from the the cluster. However, the user can still enable
+  being marked in/out from the cluster. However, the user can still enable
   this event anytime. For more detail, see:
 
   https://docs.ceph.com/en/quincy/mgr/progress/

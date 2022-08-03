@@ -17,7 +17,7 @@
 #include "crimson/os/seastore/journal.h"
 #include "include/uuid.h"
 #include "crimson/os/seastore/random_block_manager.h"
-#include "crimson/os/seastore/random_block_manager/nvmedevice.h"
+#include "crimson/os/seastore/random_block_manager/rbm_device.h"
 #include <list>
 
 
@@ -25,7 +25,7 @@ namespace crimson::os::seastore::journal {
 
 constexpr rbm_abs_addr CBJOURNAL_START_ADDRESS = 0;
 constexpr uint64_t CBJOURNAL_MAGIC = 0xCCCC;
-using NVMeBlockDevice = nvme_device::NVMeBlockDevice;
+using RBMDevice = random_block_device::RBMDevice;
 
 /**
  * CircularBoundedJournal
@@ -61,7 +61,6 @@ class CircularBoundedJournal : public Journal {
 public:
   struct mkfs_config_t {
     std::string path;
-    rbm_abs_addr start = 0;
     size_t block_size = 0;
     size_t total_size = 0;
     device_id_t device_id = 0;
@@ -70,7 +69,6 @@ public:
       device_id_t d_id = 1 << (std::numeric_limits<device_id_t>::digits - 1);
       return mkfs_config_t {
 	"",
-	0,
 	DEFAULT_BLOCK_SIZE,
 	DEFAULT_SIZE,
 	d_id,
@@ -79,11 +77,14 @@ public:
     }
   };
 
-  CircularBoundedJournal(NVMeBlockDevice* device, const std::string path);
+  CircularBoundedJournal(RBMDevice* device, const std::string &path);
   ~CircularBoundedJournal() {}
 
-  open_for_write_ret open_for_write() final;
-  open_for_write_ret open_device_read_header(rbm_abs_addr start);
+  open_for_mkfs_ret open_for_mkfs() final;
+
+  open_for_mount_ret open_for_mount() final;
+
+  open_for_mount_ret open_device_read_header();
   close_ertr::future<> close() final;
 
   journal_type_t get_type() final {
@@ -102,24 +103,12 @@ public:
     return seastar::now();
   }
 
-  replay_ret replay(delta_handler_t &&delta_handler);
+  replay_ret replay(delta_handler_t &&delta_handler) final;
 
-  open_for_write_ertr::future<> _open_device(const std::string path);
+  open_for_mount_ertr::future<> _open_device(const std::string &path);
 
   struct cbj_header_t;
-  using write_ertr = crimson::errorator<
-    crimson::ct_error::input_output_error,
-    crimson::ct_error::erange>;
-  /*
-   * append_record
-   *
-   * append data to current write position of CircularBoundedJournal
-   *
-   * @param bufferlist to write
-   * @param rbm_abs_addr where data is written
-   *
-   */
-  write_ertr::future<> append_record(ceph::bufferlist bl, rbm_abs_addr addr);
+  using write_ertr = submit_record_ertr;
   /*
    * device_write_bl
    *
@@ -148,9 +137,10 @@ public:
    * read record from given address
    *
    * @param paddr_t to read
+   * @param expected_seq
    *
    */
-  read_record_ret read_record(paddr_t offset);
+  read_record_ret read_record(paddr_t offset, segment_seq_t expected_seq);
   /*
    * read_header
    *
@@ -159,7 +149,7 @@ public:
    * @param absolute address
    *
    */
-  read_header_ret read_header(rbm_abs_addr start);
+  read_header_ret read_header();
 
   ceph::bufferlist encode_header();
 
@@ -210,8 +200,6 @@ public:
 
     // start offset of CircularBoundedJournal in the device
     rbm_abs_addr journal_tail = 0;
-    // address to represent where last appllied record is written
-    rbm_abs_addr applied_to = 0;
 
     device_id_t device_id;
 
@@ -223,8 +211,6 @@ public:
       denc(v.size, p);
 
       denc(v.journal_tail, p);
-
-      denc(v.applied_to, p);
 
       denc(v.device_id, p);
 
@@ -246,13 +232,13 @@ public:
   size_t get_used_size() const {
     return get_written_to() >= get_journal_tail() ?
       get_written_to() - get_journal_tail() :
-      get_written_to() + get_total_size() - get_journal_tail();
+      get_written_to() + header.size + get_block_size() - get_journal_tail();
   }
   size_t get_total_size() const {
     return header.size;
   }
   rbm_abs_addr get_start_addr() const {
-    return get_block_size();
+    return CBJOURNAL_START_ADDRESS + get_block_size();
   }
   size_t get_available_size() const {
     return get_total_size() - get_used_size();
@@ -278,6 +264,8 @@ public:
     return written_to;
   }
   void set_written_to(rbm_abs_addr addr) {
+    assert(addr >= get_start_addr());
+    assert(addr < get_journal_end());
     written_to = addr;
   }
   device_id_t get_device_id() const {
@@ -287,14 +275,14 @@ public:
     return header.block_size;
   }
   rbm_abs_addr get_journal_end() const {
-    return header.size + get_block_size(); // journal size + header length
+    return get_start_addr() + header.size + get_block_size(); // journal size + header length
   }
-  void add_device(NVMeBlockDevice* dev) {
+  void add_device(RBMDevice* dev) {
     device = dev;
   }
 private:
   cbj_header_t header;
-  NVMeBlockDevice* device;
+  RBMDevice* device;
   std::string path;
   WritePipeline *write_pipeline = nullptr;
   /**
@@ -304,13 +292,17 @@ private:
    * Indicates that device is open and in-memory header is valid.
    */
   bool initialized = false;
-  segment_seq_t cur_segment_seq = 0; // segment seq to track the sequence to written records
-  rbm_abs_addr start_dev_addr = 0; // cbjournal start address in device
+
+  // circulation seq to track the sequence to written records
+  segment_seq_t circulation_seq = NULL_SEG_SEQ;
+
   // start address where the newest record will be written
+  // should be in range [get_start_addr(), get_journal_end())
   rbm_abs_addr written_to = 0;
 };
 
 std::ostream &operator<<(std::ostream &out, const CircularBoundedJournal::cbj_header_t &header);
+
 }
 
 WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::journal::CircularBoundedJournal::cbj_header_t)

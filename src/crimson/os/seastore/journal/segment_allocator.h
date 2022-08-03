@@ -30,13 +30,18 @@ class SegmentAllocator {
       crimson::ct_error::input_output_error>;
 
  public:
-  SegmentAllocator(std::string name,
-                   segment_type_t type,
+  SegmentAllocator(segment_type_t type,
+                   data_category_t category,
+                   reclaim_gen_t gen,
                    SegmentProvider &sp,
                    SegmentSeqAllocator &ssa);
 
   const std::string& get_name() const {
     return print_name;
+  }
+
+  SegmentProvider &get_provider() {
+    return segment_provider;
   }
 
   seastore_off_t get_block_size() const {
@@ -81,7 +86,7 @@ class SegmentAllocator {
   // open for write and generate the correct print name
   using open_ertr = base_ertr;
   using open_ret = open_ertr::future<journal_seq_t>;
-  open_ret open();
+  open_ret open(bool is_mkfs);
 
   // close the current segment and initialize next one
   using roll_ertr = base_ertr;
@@ -99,7 +104,7 @@ class SegmentAllocator {
   close_ertr::future<> close();
 
  private:
-  open_ret do_open();
+  open_ret do_open(bool is_mkfs);
 
   void reset() {
     current_segment.reset();
@@ -111,11 +116,12 @@ class SegmentAllocator {
   using close_segment_ertr = base_ertr;
   close_segment_ertr::future<> close_segment();
 
-  const std::string name;
   // device id is not available during construction,
   // so generate the print_name later.
   std::string print_name;
   const segment_type_t type; // JOURNAL or OOL
+  const data_category_t category;
+  const reclaim_gen_t gen;
   SegmentProvider &segment_provider;
   SegmentManagerGroup &sm_group;
   SegmentRef current_segment;
@@ -353,7 +359,7 @@ public:
   // open for write, generate the correct print name, and register metrics
   using open_ertr = base_ertr;
   using open_ret = open_ertr::future<journal_seq_t>;
-  open_ret open();
+  open_ret open(bool is_mkfs);
 
   using close_ertr = base_ertr;
   close_ertr::future<> close();

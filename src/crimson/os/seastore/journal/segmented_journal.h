@@ -9,7 +9,7 @@
 #include "include/buffer.h"
 #include "include/denc.h"
 
-#include "crimson/os/seastore/segment_cleaner.h"
+#include "crimson/os/seastore/async_cleaner.h"
 #include "crimson/os/seastore/journal.h"
 #include "crimson/os/seastore/segment_manager_group.h"
 #include "crimson/os/seastore/ordering_handle.h"
@@ -27,7 +27,9 @@ public:
   SegmentedJournal(SegmentProvider &segment_provider);
   ~SegmentedJournal() {}
 
-  open_for_write_ret open_for_write() final;
+  open_for_mkfs_ret open_for_mkfs() final;
+
+  open_for_mount_ret open_for_mount() final;
 
   close_ertr::future<> close() final;
 
@@ -63,20 +65,30 @@ private:
   /// return ordered vector of segments to replay
   using replay_segments_t = std::vector<
     std::pair<journal_seq_t, segment_header_t>>;
-  using prep_replay_segments_ertr = crimson::errorator<
-    crimson::ct_error::input_output_error
-    >;
-  using prep_replay_segments_fut = prep_replay_segments_ertr::future<
+  using prep_replay_segments_fut = replay_ertr::future<
     replay_segments_t>;
   prep_replay_segments_fut prep_replay_segments(
     std::vector<std::pair<segment_id_t, segment_header_t>> segments);
+
+  /// scan the last segment for tail deltas
+  using scan_last_segment_ertr = replay_ertr;
+  scan_last_segment_ertr::future<> scan_last_segment(
+      const segment_id_t&, const segment_header_t&);
+
+  struct replay_stats_t {
+    std::size_t num_record_groups = 0;
+    std::size_t num_records = 0;
+    std::size_t num_alloc_deltas = 0;
+    std::size_t num_dirty_deltas = 0;
+  };
 
   /// replays records starting at start through end of segment
   replay_ertr::future<>
   replay_segment(
     journal_seq_t start,             ///< [in] starting addr, seq
     segment_header_t header,         ///< [in] segment header
-    delta_handler_t &delta_handler   ///< [in] processes deltas in order
+    delta_handler_t &delta_handler,  ///< [in] processes deltas in order
+    replay_stats_t &stats            ///< [out] replay stats
   );
 };
 

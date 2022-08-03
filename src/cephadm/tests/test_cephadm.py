@@ -17,6 +17,8 @@ from .fixtures import (
     mock_bad_firewalld,
 )
 
+from pyfakefs import fake_filesystem_unittest
+
 with mock.patch('builtins.open', create=True):
     from importlib.machinery import SourceFileLoader
     cd = SourceFileLoader('cephadm', 'cephadm').load_module()
@@ -242,6 +244,83 @@ class TestCephAdm(object):
         ctx.skip_firewalld = False
         with pytest.raises(Exception):
             cd.prepare_dashboard(ctx, 0, 0, lambda _, extra_mounts=None, ___=None : '5', lambda : None)
+
+    @mock.patch('cephadm.logger')
+    @mock.patch('cephadm.get_custom_config_files')
+    @mock.patch('cephadm.get_container')
+    def test_get_deployment_container(self, _get_container, _get_config, logger):
+        """
+        test get_deployment_container properly makes use of extra container args and custom conf files
+        """
+
+        ctx = cd.CephadmContext()
+        ctx.config_json = '-'
+        ctx.extra_container_args = [
+            '--pids-limit=12345',
+            '--something',
+        ]
+        ctx.data_dir = 'data'
+        _get_config.return_value = {'custom_config_files': [
+            {
+                'mount_path': '/etc/testing.str',
+                'content': 'this\nis\na\nstring',
+            }
+        ]}
+        _get_container.return_value = cd.CephContainer.for_daemon(
+            ctx,
+            fsid='9b9d7609-f4d5-4aba-94c8-effa764d96c9',
+            daemon_type='grafana',
+            daemon_id='host1',
+            entrypoint='',
+            args=[],
+            container_args=[],
+            volume_mounts={},
+            bind_mounts=[],
+            envs=[],
+            privileged=False,
+            ptrace=False,
+            host_network=True,
+        )
+        c = cd.get_deployment_container(ctx,
+                                    '9b9d7609-f4d5-4aba-94c8-effa764d96c9',
+                                    'grafana',
+                                    'host1',)
+
+        assert '--pids-limit=12345' in c.container_args
+        assert '--something' in c.container_args
+        assert os.path.join('data', '9b9d7609-f4d5-4aba-94c8-effa764d96c9', 'custom_config_files', 'grafana.host1', 'testing.str') in c.volume_mounts
+        assert c.volume_mounts[os.path.join('data', '9b9d7609-f4d5-4aba-94c8-effa764d96c9', 'custom_config_files', 'grafana.host1', 'testing.str')] == '/etc/testing.str'
+
+    @mock.patch('cephadm.logger')
+    @mock.patch('cephadm.get_custom_config_files')
+    def test_write_custom_conf_files(self, _get_config, logger, cephadm_fs):
+        """
+        test _write_custom_conf_files writes the conf files correctly
+        """
+
+        ctx = cd.CephadmContext()
+        ctx.config_json = '-'
+        ctx.data_dir = cd.DATA_DIR
+        _get_config.return_value = {'custom_config_files': [
+            {
+                'mount_path': '/etc/testing.str',
+                'content': 'this\nis\na\nstring',
+            },
+            {
+                'mount_path': '/etc/testing.conf',
+                'content': 'very_cool_conf_setting: very_cool_conf_value\nx: y',
+            },
+            {
+                'mount_path': '/etc/no-content.conf',
+            },
+        ]}
+        cd._write_custom_conf_files(ctx, 'mon', 'host1', 'fsid', 0, 0)
+        with open(os.path.join(cd.DATA_DIR, 'fsid', 'custom_config_files', 'mon.host1', 'testing.str'), 'r') as f:
+            assert 'this\nis\na\nstring' == f.read()
+        with open(os.path.join(cd.DATA_DIR, 'fsid', 'custom_config_files', 'mon.host1', 'testing.conf'), 'r') as f:
+            assert 'very_cool_conf_setting: very_cool_conf_value\nx: y' == f.read()
+        with pytest.raises(FileNotFoundError):
+            open(os.path.join(cd.DATA_DIR, 'fsid', 'custom_config_files', 'mon.host1', 'no-content.conf'), 'r')
 
     @mock.patch('cephadm.call_throws')
     @mock.patch('cephadm.get_parm')
@@ -2364,3 +2443,106 @@ class TestSysctl:
             "fs.aio-max-nr = 1048576",
             "  vm.max_map_count       =            65530    ",
         ]
+
+class TestJaeger:
+    single_es_node_conf = {
+        'elasticsearch_nodes': 'http://192.168.0.1:9200'}
+    multiple_es_nodes_conf = {
+        'elasticsearch_nodes': 'http://192.168.0.1:9200,http://192.168.0.2:9300'}
+    agent_conf = {
+        'collector_nodes': 'test:14250'}
+
+    def test_single_es(self, cephadm_fs):
+        fsid = 'ca734440-3dc6-11ec-9b98-5254002537a6'
+        with with_cephadm_ctx(['--image=quay.io/jaegertracing/jaeger-collector:1.29'], list_networks={}) as ctx:
+            import json
+            ctx.config_json = json.dumps(self.single_es_node_conf)
+            ctx.fsid = fsid
+            c = cd.get_container(ctx, fsid, 'jaeger-collector', 'daemon_id')
+            cd.create_daemon_dirs(ctx, fsid, 'jaeger-collector', 'daemon_id', 0, 0)
+            cd.deploy_daemon_units(
+                ctx,
+                fsid,
+                0, 0,
+                'jaeger-collector',
+                'daemon_id',
+                c,
+                True, True
+            )
+            with open(f'/var/lib/ceph/{fsid}/jaeger-collector.daemon_id/unit.run', 'r') as f:
+                run_cmd = f.readlines()[-1].rstrip()
+                assert run_cmd.endswith('SPAN_STORAGE_TYPE=elasticsearch -e ES_SERVER_URLS=http://192.168.0.1:9200 quay.io/jaegertracing/jaeger-collector:1.29')
+
+    def test_multiple_es(self, cephadm_fs):
+        fsid = 'ca734440-3dc6-11ec-9b98-5254002537a6'
+        with with_cephadm_ctx(['--image=quay.io/jaegertracing/jaeger-collector:1.29'], list_networks={}) as ctx:
+            import json
+            ctx.config_json = json.dumps(self.multiple_es_nodes_conf)
+            ctx.fsid = fsid
+            c = cd.get_container(ctx, fsid, 'jaeger-collector', 'daemon_id')
+            cd.create_daemon_dirs(ctx, fsid, 'jaeger-collector', 'daemon_id', 0, 0)
+            cd.deploy_daemon_units(
+                ctx,
+                fsid,
+                0, 0,
+                'jaeger-collector',
+                'daemon_id',
+                c,
+                True, True
+            )
+            with open(f'/var/lib/ceph/{fsid}/jaeger-collector.daemon_id/unit.run', 'r') as f:
+                run_cmd = f.readlines()[-1].rstrip()
+                assert run_cmd.endswith('SPAN_STORAGE_TYPE=elasticsearch -e ES_SERVER_URLS=http://192.168.0.1:9200,http://192.168.0.2:9300 quay.io/jaegertracing/jaeger-collector:1.29')
+
+    def test_jaeger_agent(self, cephadm_fs):
+        fsid = 'ca734440-3dc6-11ec-9b98-5254002537a6'
+        with with_cephadm_ctx(['--image=quay.io/jaegertracing/jaeger-agent:1.29'], list_networks={}) as ctx:
+            import json
+            ctx.config_json = json.dumps(self.agent_conf)
+            ctx.fsid = fsid
+            c = cd.get_container(ctx, fsid, 'jaeger-agent', 'daemon_id')
+            cd.create_daemon_dirs(ctx, fsid, 'jaeger-agent', 'daemon_id', 0, 0)
+            cd.deploy_daemon_units(
+                ctx,
+                fsid,
+                0, 0,
+                'jaeger-agent',
+                'daemon_id',
+                c,
+                True, True
+            )
+            with open(f'/var/lib/ceph/{fsid}/jaeger-agent.daemon_id/unit.run', 'r') as f:
+                run_cmd = f.readlines()[-1].rstrip()
+                assert run_cmd.endswith('quay.io/jaegertracing/jaeger-agent:1.29 --reporter.grpc.host-port=test:14250 --processor.jaeger-compact.server-host-port=6799')
+
+class TestRescan(fake_filesystem_unittest.TestCase):
+
+    def setUp(self):
+        self.setUpPyfakefs()
+        self.fs.create_dir('/sys/class')
+        self.ctx = cd.CephadmContext()
+        self.ctx.func = cd.command_rescan_disks
+
+    def test_no_hbas(self):
+        out = cd.command_rescan_disks(self.ctx)
+        assert out == 'Ok. No compatible HBAs found'
+
+    def test_success(self):
+        self.fs.create_file('/sys/class/scsi_host/host0/scan')
+        self.fs.create_file('/sys/class/scsi_host/host1/scan')
+        out = cd.command_rescan_disks(self.ctx)
+        assert out.startswith('Ok. 2 adapters detected: 2 rescanned, 0 skipped, 0 failed')
+
+    def test_skip_usb_adapter(self):
+        self.fs.create_file('/sys/class/scsi_host/host0/scan')
+        self.fs.create_file('/sys/class/scsi_host/host1/scan')
+        self.fs.create_file('/sys/class/scsi_host/host1/proc_name', contents='usb-storage')
+        out = cd.command_rescan_disks(self.ctx)
+        assert out.startswith('Ok. 2 adapters detected: 1 rescanned, 1 skipped, 0 failed')
+
+    def test_skip_unknown_adapter(self):
+        self.fs.create_file('/sys/class/scsi_host/host0/scan')
+        self.fs.create_file('/sys/class/scsi_host/host1/scan')
+        self.fs.create_file('/sys/class/scsi_host/host1/proc_name', contents='unknown')
+        out = cd.command_rescan_disks(self.ctx)
+        assert out.startswith('Ok. 2 adapters detected: 1 rescanned, 1 skipped, 0 failed')

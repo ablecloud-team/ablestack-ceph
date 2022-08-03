@@ -91,7 +91,7 @@ PG::PG(
     pg_whoami{pg_shard},
     coll_ref{coll_ref},
     pgmeta_oid{pgid.make_pgmeta_oid()},
-    osdmap_gate("PG::osdmap_gate", std::nullopt),
+    osdmap_gate("PG::osdmap_gate"),
     shard_services{shard_services},
     osdmap{osdmap},
     backend(
@@ -137,7 +137,6 @@ bool PG::try_flush_or_schedule_async() {
     [this, epoch=get_osdmap_epoch()]() {
       return shard_services.start_operation<LocalPeeringEvent>(
 	this,
-	shard_services,
 	pg_whoami,
 	pgid,
 	epoch,
@@ -176,7 +175,6 @@ void PG::queue_check_readable(epoch_t last_peering_reset, ceph::timespan delay)
   check_readable_timer.set_callback([last_peering_reset, this] {
     (void) shard_services.start_operation<LocalPeeringEvent>(
       this,
-      shard_services,
       pg_whoami,
       pgid,
       last_peering_reset,
@@ -266,7 +264,6 @@ void PG::on_activate_complete()
                   __func__);
     (void) shard_services.start_operation<LocalPeeringEvent>(
       this,
-      shard_services,
       pg_whoami,
       pgid,
       float(0.001),
@@ -278,7 +275,6 @@ void PG::on_activate_complete()
                   __func__);
     (void) shard_services.start_operation<LocalPeeringEvent>(
       this,
-      shard_services,
       pg_whoami,
       pgid,
       float(0.001),
@@ -290,7 +286,6 @@ void PG::on_activate_complete()
 		   " for pg: {}", __func__, pgid);
     (void) shard_services.start_operation<LocalPeeringEvent>(
       this,
-      shard_services,
       pg_whoami,
       pgid,
       float(0.001),
@@ -380,7 +375,7 @@ void PG::log_state_exit(
     events);
 }
 
-ceph::signedspan PG::get_mnow()
+ceph::signedspan PG::get_mnow() const
 {
   return shard_services.get_mnow();
 }
@@ -397,7 +392,6 @@ void PG::schedule_renew_lease(epoch_t last_peering_reset, ceph::timespan delay)
   renew_lease_timer.set_callback([last_peering_reset, this] {
     (void) shard_services.start_operation<LocalPeeringEvent>(
       this,
-      shard_services,
       pg_whoami,
       pgid,
       last_peering_reset,
@@ -459,7 +453,6 @@ seastar::future<> PG::read_state(crimson::os::FuturizedStore* store)
     epoch_t epoch = get_osdmap_epoch();
     (void) shard_services.start_operation<LocalPeeringEvent>(
 	this,
-	shard_services,
 	pg_whoami,
 	pgid,
 	epoch,
@@ -838,6 +831,17 @@ PG::do_osd_ops(
             m->ops.back().op.flags & CEPH_OSD_OP_FLAG_FAILOK) {
             reply->set_result(0);
           }
+          // For all ops except for CMPEXT, the correct error value is encoded
+          // in e.value(). For CMPEXT, osdop.rval has the actual error value.
+          if (e.value() == ct_error::cmp_fail_error_value) {
+            assert(!m->ops.empty());
+            for (auto &osdop : m->ops) {
+              if (osdop.rval < 0) {
+                reply->set_result(osdop.rval);
+                break;
+              }
+            }
+          }
           reply->set_enoent_reply_versions(
           peering_state.get_info().last_update,
           peering_state.get_info().last_user_version);
@@ -885,7 +889,7 @@ PG::do_osd_ops(
   do_osd_ops_success_func_t success_func,
   do_osd_ops_failure_func_t failure_func)
 {
-  return seastar::do_with(std::move(msg_params), [=, &ops, &op_info]
+  return seastar::do_with(std::move(msg_params), [=, this, &ops, &op_info]
     (auto &msg_params) {
     return do_osd_ops_execute<void>(
       seastar::make_lw_shared<OpsExecuter>(
@@ -915,7 +919,7 @@ PG::interruptible_future<MURef<MOSDOpReply>> PG::do_pg_ops(Ref<MOSDOp> m)
     reply->set_reply_versions(peering_state.get_info().last_update,
       peering_state.get_info().last_user_version);
     return seastar::make_ready_future<MURef<MOSDOpReply>>(std::move(reply));
-  }).handle_exception_type_interruptible([=](const crimson::osd::error& e) {
+  }).handle_exception_type_interruptible([=, this](const crimson::osd::error& e) {
     auto reply = crimson::make_message<MOSDOpReply>(
       m.get(), -e.code().value(), get_osdmap_epoch(), 0, false);
     reply->set_enoent_reply_versions(peering_state.get_info().last_update,
@@ -1006,7 +1010,7 @@ PG::load_obc_iertr::future<>
 PG::with_head_obc(hobject_t oid, with_obc_func_t&& func)
 {
   auto [obc, existed] =
-    shard_services.obc_registry.get_cached_obc(std::move(oid));
+    shard_services.get_cached_obc(std::move(oid));
   return with_head_obc<State>(std::move(obc), existed, std::move(func));
 }
 
@@ -1033,7 +1037,7 @@ PG::with_clone_obc(hobject_t oid, with_obc_func_t&& func)
       logger().error("with_clone_obc: {} clone not found", coid);
       return load_obc_ertr::make_ready_future<>();
     }
-    auto [clone, existed] = shard_services.obc_registry.get_cached_obc(*coid);
+    auto [clone, existed] = shard_services.get_cached_obc(*coid);
     return clone->template with_lock<State>(
       [coid=*coid, existed=existed,
        head=std::move(head), clone=std::move(clone),

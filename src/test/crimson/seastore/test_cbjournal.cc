@@ -10,7 +10,7 @@
 #include "crimson/os/seastore/journal.h"
 #include "crimson/os/seastore/journal/circular_bounded_journal.h"
 #include "crimson/os/seastore/random_block_manager.h"
-#include "crimson/os/seastore/random_block_manager/nvmedevice.h"
+#include "crimson/os/seastore/random_block_manager/rbm_device.h"
 #include "test/crimson/seastore/transaction_manager_test_state.h"
 
 using namespace crimson;
@@ -101,7 +101,7 @@ struct entry_validator_t {
       paddr_t paddr = convert_abs_addr_to_paddr(
 	addr + offset,
 	cbj.get_device_id());
-      auto [header, buf] = *(cbj.read_record(paddr).unsafe_get0());
+      auto [header, buf] = *(cbj.read_record(paddr, NULL_SEG_SEQ).unsafe_get0());
       auto record = decode_record(buf);
       validate(*record);
       offset += header.mdlength + header.dlength;
@@ -126,7 +126,7 @@ struct cbjournal_test_t : public seastar_test_suite_t
   Cache cache;
   std::vector<entry_validator_t> entries;
   std::unique_ptr<CircularBoundedJournal> cbj;
-  nvme_device::NVMeBlockDevice *device;
+  random_block_device::RBMDevice *device;
 
   std::default_random_engine generator;
   uint64_t block_size;
@@ -135,13 +135,12 @@ struct cbjournal_test_t : public seastar_test_suite_t
 
   cbjournal_test_t() :
       segment_manager(segment_manager::create_test_ephemeral()),
-      epm(new ExtentPlacementManager()),
+      epm(new ExtentPlacementManager(true)),
       cache(*epm)
   {
-    device = new nvme_device::TestMemory(CBTEST_DEFAULT_TEST_SIZE);
+    device = new random_block_device::TestMemory(CBTEST_DEFAULT_TEST_SIZE + CBTEST_DEFAULT_BLOCK_SIZE);
     cbj.reset(new CircularBoundedJournal(device, std::string()));
     device_id_t d_id = 1 << (std::numeric_limits<device_id_t>::digits - 1);
-    config.start = 0;
     config.block_size = CBTEST_DEFAULT_BLOCK_SIZE;
     config.total_size = CBTEST_DEFAULT_TEST_SIZE;
     config.device_id = d_id;
@@ -213,8 +212,11 @@ struct cbjournal_test_t : public seastar_test_suite_t
 
   auto replay() {
     cbj->replay(
-      [this](const auto &offsets, const auto &e, auto j_seq, auto last_modified) 
-      -> Journal::replay_ret {
+      [this](const auto &offsets,
+             const auto &e,
+             auto &dirty_seq,
+             auto &alloc_seq,
+             auto last_modified) {
       bool found = false;
       for (auto &i : entries) {
 	paddr_t base = offsets.write_result.start_seq.offset; 
@@ -226,15 +228,16 @@ struct cbjournal_test_t : public seastar_test_suite_t
 	}
       }
       assert(found == true);
-      return Journal::replay_ertr::now();
+      return Journal::replay_ertr::make_ready_future<bool>(true);
     }).unsafe_get0();
   }
 
   auto mkfs() {
     return cbj->mkfs(config).unsafe_get0();
   }
-  auto open() {
-    return cbj->open_device_read_header(config.start).unsafe_get0();
+  void open() {
+    cbj->open_device_read_header().unsafe_get0();
+    cbj->open_for_mkfs().unsafe_get0();
   }
   auto get_available_size() {
     return cbj->get_available_size();
@@ -385,7 +388,7 @@ TEST_F(cbjournal_test_t, update_header)
   run_async([this] {
     mkfs();
     open();
-    auto [header, _buf] = *(cbj->read_header(0).unsafe_get0());
+    auto [header, _buf] = *(cbj->read_header().unsafe_get0());
     record_t rec {
      { generate_extent(1), generate_extent(2) },
      { generate_delta(20), generate_delta(21) }
@@ -396,7 +399,7 @@ TEST_F(cbjournal_test_t, update_header)
 
     update_journal_tail(entries.front().addr, record_total_size);
     cbj->write_header().unsafe_get0();
-    auto [update_header, update_buf2] = *(cbj->read_header(0).unsafe_get0());
+    auto [update_header, update_buf2] = *(cbj->read_header().unsafe_get0());
     cbj->close().unsafe_get0();
     replay();
 

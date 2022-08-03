@@ -15,7 +15,7 @@
 
 #pragma once
 
-#include "rgw_sal.h"
+#include "rgw_sal_store.h"
 #include "rgw_oidc_provider.h"
 #include "rgw_role.h"
 #include "rgw_lc.h"
@@ -28,8 +28,7 @@ namespace rgw { namespace sal {
 
   class DBStore;
 
-class LCDBSerializer : public LCSerializer {
-  const std::string oid;
+class LCDBSerializer : public StoreLCSerializer {
 
 public:
   LCDBSerializer(DBStore* store, const std::string& oid, const std::string& lock_name, const std::string& cookie) {}
@@ -40,28 +39,32 @@ public:
   }
 };
 
-class DBLifecycle : public Lifecycle {
+class DBLifecycle : public StoreLifecycle {
   DBStore* store;
 
 public:
   DBLifecycle(DBStore* _st) : store(_st) {}
 
-  virtual int get_entry(const std::string& oid, const std::string& marker, LCEntry& entry) override;
-  virtual int get_next_entry(const std::string& oid, std::string& marker, LCEntry& entry) override;
-  virtual int set_entry(const std::string& oid, const LCEntry& entry) override;
+  using StoreLifecycle::get_entry;
+  virtual int get_entry(const std::string& oid, const std::string& marker, std::unique_ptr<LCEntry>* entry) override;
+  virtual int get_next_entry(const std::string& oid, const std::string& marker, std::unique_ptr<LCEntry>* entry) override;
+  virtual int set_entry(const std::string& oid, LCEntry& entry) override;
   virtual int list_entries(const std::string& oid, const std::string& marker,
-			   uint32_t max_entries, std::vector<LCEntry>& entries) override;
-  virtual int rm_entry(const std::string& oid, const LCEntry& entry) override;
-  virtual int get_head(const std::string& oid, LCHead& head) override;
-  virtual int put_head(const std::string& oid, const LCHead& head) override;
-  virtual LCSerializer* get_serializer(const std::string& lock_name, const std::string& oid, const std::string& cookie) override;
+			   uint32_t max_entries,
+			   std::vector<std::unique_ptr<LCEntry>>& entries) override;
+  virtual int rm_entry(const std::string& oid, LCEntry& entry) override;
+  virtual int get_head(const std::string& oid, std::unique_ptr<LCHead>* head) override;
+  virtual int put_head(const std::string& oid, LCHead& head) override;
+  virtual std::unique_ptr<LCSerializer> get_serializer(const std::string& lock_name,
+						       const std::string& oid,
+						       const std::string& cookie) override;
 };
 
-class DBNotification : public Notification {
+class DBNotification : public StoreNotification {
 protected:
   public:
   DBNotification(Object* _obj, Object* _src_obj, rgw::notify::EventType _type)
-    : Notification(_obj, _src_obj, _type) {}
+    : StoreNotification(_obj, _src_obj, _type) {}
     ~DBNotification() = default;
 
     virtual int publish_reserve(const DoutPrefixProvider *dpp, RGWObjTags* obj_tags = nullptr) override { return 0;}
@@ -69,13 +72,13 @@ protected:
 			       const ceph::real_time& mtime, const std::string& etag, const std::string& version) override { return 0; }
 };
 
-  class DBUser : public User {
+  class DBUser : public StoreUser {
     private:
       DBStore *store;
 
     public:
-      DBUser(DBStore *_st, const rgw_user& _u) : User(_u), store(_st) { }
-      DBUser(DBStore *_st, const RGWUserInfo& _i) : User(_i), store(_st) { }
+      DBUser(DBStore *_st, const rgw_user& _u) : StoreUser(_u), store(_st) { }
+      DBUser(DBStore *_st, const RGWUserInfo& _i) : StoreUser(_i), store(_st) { }
       DBUser(DBStore *_st) : store(_st) { }
       DBUser(DBUser& _o) = default;
       DBUser() {}
@@ -122,7 +125,7 @@ protected:
       friend class DBBucket;
   };
 
-  class DBBucket : public Bucket {
+  class DBBucket : public StoreBucket {
     private:
       DBStore *store;
       RGWAccessControlPolicy acls;
@@ -134,43 +137,43 @@ protected:
         }
 
       DBBucket(DBStore *_st, User* _u)
-        : Bucket(_u),
+        : StoreBucket(_u),
         store(_st),
         acls() {
         }
 
       DBBucket(DBStore *_st, const rgw_bucket& _b)
-        : Bucket(_b),
+        : StoreBucket(_b),
         store(_st),
         acls() {
         }
 
       DBBucket(DBStore *_st, const RGWBucketEnt& _e)
-        : Bucket(_e),
+        : StoreBucket(_e),
         store(_st),
         acls() {
         }
 
       DBBucket(DBStore *_st, const RGWBucketInfo& _i)
-        : Bucket(_i),
+        : StoreBucket(_i),
         store(_st),
         acls() {
         }
 
       DBBucket(DBStore *_st, const rgw_bucket& _b, User* _u)
-        : Bucket(_b, _u),
+        : StoreBucket(_b, _u),
         store(_st),
         acls() {
         }
 
       DBBucket(DBStore *_st, const RGWBucketEnt& _e, User* _u)
-        : Bucket(_e, _u),
+        : StoreBucket(_e, _u),
         store(_st),
         acls() {
         }
 
       DBBucket(DBStore *_st, const RGWBucketInfo& _i, User* _u)
-        : Bucket(_i, _u),
+        : StoreBucket(_i, _u),
         store(_st),
         acls() {
         }
@@ -234,7 +237,7 @@ protected:
       friend class DBStore;
   };
 
-  class DBPlacementTier: public PlacementTier {
+  class DBPlacementTier: public StorePlacementTier {
     DBStore* store;
     RGWZoneGroupPlacementTier tier;
   public:
@@ -247,7 +250,7 @@ protected:
     RGWZoneGroupPlacementTier& get_rt() { return tier; }
   };
 
-  class DBZoneGroup : public ZoneGroup {
+  class DBZoneGroup : public StoreZoneGroup {
     DBStore* store;
     std::unique_ptr<RGWZoneGroup> group;
     std::string empty;
@@ -286,9 +289,13 @@ protected:
 				   std::unique_ptr<PlacementTier>* tier) {
       return -1;
     }
+    virtual std::unique_ptr<ZoneGroup> clone() override {
+      std::unique_ptr<RGWZoneGroup>zg = std::make_unique<RGWZoneGroup>(*group.get());
+      return std::make_unique<DBZoneGroup>(store, std::move(zg));
+    }
   };
 
-  class DBZone : public Zone {
+  class DBZone : public StoreZone {
     protected:
       DBStore* store;
       RGWRealm *realm{nullptr};
@@ -322,6 +329,9 @@ protected:
 	delete current_period;
       }
 
+      virtual std::unique_ptr<Zone> clone() override {
+	return std::make_unique<DBZone>(store);
+      }
       virtual ZoneGroup& get_zonegroup() override;
       virtual int get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zonegroup) override;
       const RGWZoneParams& get_rgw_params();
@@ -334,9 +344,10 @@ protected:
       virtual const RGWAccessKey& get_system_key() override;
       virtual const std::string& get_realm_name() override;
       virtual const std::string& get_realm_id() override;
+      virtual const std::string_view get_tier_type() override { return "rgw"; }
   };
 
-  class DBLuaScriptManager : public LuaScriptManager {
+  class DBLuaScriptManager : public StoreLuaScriptManager {
     DBStore* store;
 
     public:
@@ -382,7 +393,7 @@ protected:
    *                     rename all data/tail objects to orig object name and update
    *                     metadata of the orig object.
    */
-  class DBMultipartPart : public MultipartPart {
+  class DBMultipartPart : public StoreMultipartPart {
   protected:
     RGWUploadPartInfo info; /* XXX: info contains manifest also which is not needed */
 
@@ -451,7 +462,7 @@ protected:
     }
   };
 
-  class DBMultipartUpload : public MultipartUpload {
+  class DBMultipartUpload : public StoreMultipartUpload {
     DBStore* store;
     DBMPObj mp_obj;
     ACLOwner owner;
@@ -459,7 +470,7 @@ protected:
     rgw_placement_rule placement;
 
   public:
-    DBMultipartUpload(DBStore* _store, Bucket* _bucket, const std::string& oid, std::optional<std::string> upload_id, ACLOwner _owner, ceph::real_time _mtime) : MultipartUpload(_bucket), store(_store), mp_obj(oid, upload_id), owner(_owner), mtime(_mtime) {}
+    DBMultipartUpload(DBStore* _store, Bucket* _bucket, const std::string& oid, std::optional<std::string> upload_id, ACLOwner _owner, ceph::real_time _mtime) : StoreMultipartUpload(_bucket), store(_store), mp_obj(oid, upload_id), owner(_owner), mtime(_mtime) {}
     virtual ~DBMultipartUpload() = default;
 
     virtual const std::string& get_meta() const { return mp_obj.get_meta(); }
@@ -493,7 +504,7 @@ protected:
 			  const std::string& part_num_str) override;
   };
 
-  class DBObject : public Object {
+  class DBObject : public StoreObject {
     private:
       DBStore* store;
       RGWAccessControlPolicy acls;
@@ -530,12 +541,12 @@ protected:
       DBObject() = default;
 
       DBObject(DBStore *_st, const rgw_obj_key& _k)
-        : Object(_k),
+        : StoreObject(_k),
         store(_st),
         acls() {}
 
       DBObject(DBStore *_st, const rgw_obj_key& _k, Bucket* _b)
-        : Object(_k, _b),
+        : StoreObject(_k, _b),
         store(_st),
         acls() {}
 
@@ -574,7 +585,8 @@ protected:
       virtual std::unique_ptr<Object> clone() override {
         return std::unique_ptr<Object>(new DBObject(*this));
       }
-      virtual MPSerializer* get_serializer(const DoutPrefixProvider *dpp, const std::string& lock_name) override;
+      virtual std::unique_ptr<MPSerializer> get_serializer(const DoutPrefixProvider *dpp,
+							   const std::string& lock_name) override;
       virtual int transition(Bucket* bucket,
           const rgw_placement_rule& placement_rule,
           const real_time& mtime,
@@ -617,7 +629,7 @@ protected:
       int read_attrs(const DoutPrefixProvider* dpp, DB::Object::Read &read_op, optional_yield y, rgw_obj* target_obj = nullptr);
   };
 
-  class MPDBSerializer : public MPSerializer {
+  class MPDBSerializer : public StoreMPSerializer {
 
   public:
     MPDBSerializer(const DoutPrefixProvider *dpp, DBStore* store, DBObject* obj, const std::string& lock_name) {}
@@ -626,7 +638,7 @@ protected:
     virtual int unlock() override { return 0;}
   };
 
-  class DBAtomicWriter : public Writer {
+  class DBAtomicWriter : public StoreWriter {
     protected:
     rgw::sal::DBStore* store;
     const rgw_user& owner;
@@ -671,7 +683,7 @@ protected:
                          optional_yield y) override;
   };
 
-  class DBMultipartWriter : public Writer {
+  class DBMultipartWriter : public StoreWriter {
   protected:
     rgw::sal::DBStore* store;
     const rgw_user& owner;
@@ -719,7 +731,7 @@ public:
                        optional_yield y) override;
   };
 
-  class DBStore : public Store {
+  class DBStore : public StoreStore {
     private:
       /* DBStoreManager is used in case multiple
        * connections are needed one for each tenant.

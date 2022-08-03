@@ -38,11 +38,8 @@ using BackrefBtree = FixedKVBtree<
 class BtreeBackrefManager : public BackrefManager {
 public:
 
-  BtreeBackrefManager(
-    SegmentManagerGroup &sm_group,
-    Cache &cache)
-    : sm_group(sm_group),
-      cache(cache)
+  BtreeBackrefManager(Cache &cache)
+    : cache(cache)
   {}
 
   mkfs_ret mkfs(
@@ -101,18 +98,10 @@ public:
   }
 
   Cache::backref_buf_entry_query_set_t
-  get_cached_backrefs_in_range(
+  get_cached_backref_entries_in_range(
     paddr_t start,
     paddr_t end) final;
-
-  Cache::backref_buf_entry_query_set_t
-  get_cached_backref_removals_in_range(
-    paddr_t start,
-    paddr_t end) final;
-
-  const backref_buf_entry_t::set_t& get_cached_backref_removals() final;
-  const backref_buf_entry_t::set_t& get_cached_backrefs() final;
-  backref_buf_entry_t get_cached_backref_removal(paddr_t addr) final;
+  const backref_set_t& get_cached_backrefs() final;
 
   Cache::backref_extent_buf_entry_query_set_t
   get_cached_backref_extents_in_range(
@@ -126,10 +115,7 @@ public:
 
   void cache_new_backref_extent(paddr_t paddr, extent_types_t type) final;
 
-  bool backref_should_be_removed(paddr_t paddr) final;
-
 private:
-  SegmentManagerGroup &sm_group;
   Cache &cache;
 
   btree_pin_set_t<paddr_t> pin_set;

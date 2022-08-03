@@ -42,6 +42,8 @@ struct btree_test_base :
   std::map<segment_id_t, segment_seq_t> segment_seqs;
   std::map<segment_id_t, segment_type_t> segment_types;
 
+  journal_seq_t dummy_tail;
+
   mutable segment_info_t tmp_info;
 
   btree_test_base() = default;
@@ -49,7 +51,15 @@ struct btree_test_base :
   /*
    * SegmentProvider interfaces
    */
-  journal_seq_t get_journal_tail_target() const final { return journal_seq_t{}; }
+  journal_seq_t get_journal_head() const final { return dummy_tail; }
+
+  void set_journal_head(journal_seq_t) final {}
+
+  journal_seq_t get_dirty_tail() const final { return dummy_tail; }
+
+  journal_seq_t get_alloc_tail() const final { return dummy_tail; }
+
+  void update_journal_tails(journal_seq_t, journal_seq_t) final {}
 
   const segment_info_t& get_seg_info(segment_id_t id) const final {
     tmp_info = {};
@@ -60,7 +70,9 @@ struct btree_test_base :
 
   segment_id_t allocate_segment(
     segment_seq_t seq,
-    segment_type_t type
+    segment_type_t type,
+    data_category_t,
+    reclaim_gen_t
   ) final {
     auto ret = next;
     next = segment_id_t{
@@ -73,19 +85,11 @@ struct btree_test_base :
 
   void close_segment(segment_id_t) final {}
 
-  void update_journal_tail_committed(journal_seq_t committed) final {}
-
   void update_segment_avail_bytes(segment_type_t, paddr_t) final {}
 
+  void update_modify_time(segment_id_t, sea_time_point, std::size_t) final {}
+
   SegmentManagerGroup* get_segment_manager_group() final { return sms.get(); }
-
-  journal_seq_t get_dirty_extents_replay_from() const final {
-    return JOURNAL_SEQ_NULL;
-  }
-
-  journal_seq_t get_alloc_info_replay_from() const final {
-    return JOURNAL_SEQ_NULL;
-  }
 
   virtual void complete_commit(Transaction &t) {}
   seastar::future<> submit_transaction(TransactionRef t)
@@ -111,7 +115,7 @@ struct btree_test_base :
     }).safe_then([this] {
       sms.reset(new SegmentManagerGroup());
       journal = journal::make_segmented(*this);
-      epm.reset(new ExtentPlacementManager());
+      epm.reset(new ExtentPlacementManager(false));
       cache.reset(new Cache(*epm));
 
       block_size = segment_manager->get_block_size();
@@ -120,8 +124,10 @@ struct btree_test_base :
       epm->add_device(segment_manager.get(), true);
       journal->set_write_pipeline(&pipeline);
 
-      return journal->open_for_write().discard_result();
+      return journal->open_for_mkfs().discard_result();
     }).safe_then([this] {
+      dummy_tail = journal_seq_t{0,
+        paddr_t::make_seg_paddr(segment_id_t(segment_manager->get_device_id(), 0), 0)};
       return epm->open();
     }).safe_then([this] {
       return seastar::do_with(
@@ -368,7 +374,11 @@ struct btree_lba_manager_test : btree_test_base {
       test_lba_mappings
     };
     if (create_fake_extent) {
-      cache->alloc_new_extent<TestBlockPhysical>(*t.t, TestBlockPhysical::SIZE);
+      cache->alloc_new_extent<TestBlockPhysical>(
+          *t.t,
+          TestBlockPhysical::SIZE,
+          placement_hint_t::HOT,
+          0);
     };
     return t;
   }

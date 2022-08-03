@@ -7,13 +7,14 @@
 #include <iostream>
 #include <vector>
 
+#include <fmt/ranges.h>
+
 #include "debug.h"
 
 #include "common/errno.h"
 #include "messages/MOSDOp.h"
 #include "messages/MOSDRepScrub.h"
 #include "messages/MOSDRepScrubMap.h"
-#include "messages/MOSDScrub.h"
 #include "messages/MOSDScrubReserve.h"
 #include "osd/OSD.h"
 #include "osd/PG.h"
@@ -127,7 +128,7 @@ bool PgScrubber::verify_against_abort(epoch_t epoch_to_verify)
 	   << " vs last-aborted: " << m_last_aborted << dendl;
 
   // if we were not aware of the abort before - kill the scrub.
-  if (epoch_to_verify > m_last_aborted) {
+  if (epoch_to_verify >= m_last_aborted) {
     scrub_clear_state();
     m_last_aborted = std::max(epoch_to_verify, m_epoch_start);
   }
@@ -146,9 +147,7 @@ bool PgScrubber::should_abort() const
       dout(10) << "nodeep_scrub set, aborting" << dendl;
       return true;
     }
-  }
-
-  if (get_osdmap()->test_flag(CEPH_OSDMAP_NOSCRUB) ||
+  } else if (get_osdmap()->test_flag(CEPH_OSDMAP_NOSCRUB) ||
       m_pg->pool.info.has_flag(pg_pool_t::FLAG_NOSCRUB)) {
     dout(10) << "noscrub set, aborting" << dendl;
     return true;
@@ -1634,7 +1633,7 @@ void PgScrubber::handle_scrub_reserve_grant(OpRequestRef op, pg_shard_t from)
   if (m_reservations.has_value()) {
     m_reservations->handle_reserve_grant(op, from);
   } else {
-    derr << __func__ << ": received unsolicited reservation grant from osd "
+    dout(20) << __func__ << ": late/unsolicited reservation grant from osd "
 	 << from << " (" << op << ")" << dendl;
   }
 }
@@ -2362,11 +2361,10 @@ ostream &operator<<(ostream &out, const PgScrubber &scrubber) {
 
 std::ostream& PgScrubber::gen_prefix(std::ostream& out) const
 {
-  const auto fsm_state = m_fsm ? m_fsm->current_states_desc() : "- :";
   if (m_pg) {
-    return m_pg->gen_prefix(out) << "scrubber " << fsm_state << ": ";
+    return m_pg->gen_prefix(out) << "scrubber<" << m_fsm_state_name << ">: ";
   } else {
-    return out << " scrubber [~] " << fsm_state << ": ";
+    return out << " scrubber [" << m_pg_id << "]: ";
   }
 }
 

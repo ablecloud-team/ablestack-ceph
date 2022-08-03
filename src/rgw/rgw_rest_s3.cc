@@ -632,27 +632,31 @@ int RGWGetObj_ObjStore_S3::override_range_hdr(const rgw::auth::StrategyRegistry&
 
 void RGWGetObjTags_ObjStore_S3::send_response_data(bufferlist& bl)
 {
+  if (op_ret)
+    set_req_state_err(s, op_ret);
   dump_errno(s);
   end_header(s, this, "application/xml");
   dump_start(s);
 
-  s->formatter->open_object_section_in_ns("Tagging", XMLNS_AWS_S3);
-  s->formatter->open_object_section("TagSet");
-  if (has_tags){
-    RGWObjTagSet_S3 tagset;
-    auto iter = bl.cbegin();
-    try {
-      tagset.decode(iter);
-    } catch (buffer::error& err) {
-      ldpp_dout(this,0) << "ERROR: caught buffer::error, couldn't decode TagSet" << dendl;
-      op_ret= -EIO;
-      return;
+  if (!op_ret){
+    s->formatter->open_object_section_in_ns("Tagging", XMLNS_AWS_S3);
+    s->formatter->open_object_section("TagSet");
+    if (has_tags){
+      RGWObjTagSet_S3 tagset;
+      auto iter = bl.cbegin();
+      try {
+        tagset.decode(iter);
+      } catch (buffer::error& err) {
+        ldpp_dout(this,0) << "ERROR: caught buffer::error, couldn't decode TagSet" << dendl;
+        op_ret= -EIO;
+        return;
+      }
+      tagset.dump_xml(s->formatter);
     }
-    tagset.dump_xml(s->formatter);
+    s->formatter->close_section();
+    s->formatter->close_section();
+    rgw_flush_formatter_and_reset(s, s->formatter);
   }
-  s->formatter->close_section();
-  s->formatter->close_section();
-  rgw_flush_formatter_and_reset(s, s->formatter);
 }
 
 
@@ -709,15 +713,14 @@ void RGWPutObjTags_ObjStore_S3::send_response()
 
 void RGWDeleteObjTags_ObjStore_S3::send_response()
 {
-  int r = op_ret;
-  if (r == -ENOENT)
-    r = 0;
-  if (!r)
-    r = STATUS_NO_CONTENT;
-
-  set_req_state_err(s, r);
+  if (op_ret == 0){
+    op_ret = STATUS_NO_CONTENT;
+  }
+  if (op_ret)
+    set_req_state_err(s, op_ret);
   dump_errno(s);
-  end_header(s, this);
+  end_header(s, this, "application/xml");
+  dump_start(s);
 }
 
 void RGWGetBucketTags_ObjStore_S3::send_response_data(bufferlist& bl)
@@ -807,6 +810,10 @@ void RGWPutBucketTags_ObjStore_S3::send_response()
 
 void RGWDeleteBucketTags_ObjStore_S3::send_response()
 {
+  // A successful DeleteBucketTagging should
+  // return a 204 status code.
+  if (op_ret == 0)
+    op_ret = STATUS_NO_CONTENT;
   if (op_ret)
     set_req_state_err(s, op_ret);
   dump_errno(s);
@@ -1074,7 +1081,7 @@ struct ReplicationConfiguration {
 
       for (auto& id : zone_ids) {
 	RGWZone *zone;
-	if (static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(id, &zone)) {
+	if ((zone = static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(id))) {
 	  names.emplace_back(zone->name);
 	}
       }
@@ -5128,9 +5135,14 @@ int RGWHandler_REST_S3Website::retarget(RGWOp* op, RGWOp** new_op, optional_yiel
   if (!(s->prot_flags & RGW_REST_WEBSITE))
     return 0;
 
+  if (rgw::sal::Bucket::empty(s->bucket.get())) {
+    // TODO-FUTURE: if the bucket does not exist, maybe expose it here?
+    return -ERR_NO_SUCH_BUCKET;
+  }
+
   if (!s->bucket->get_info().has_website) {
-      // TODO-FUTURE: if the bucket has no WebsiteConfig, expose it here
-      return -ERR_NO_SUCH_WEBSITE_CONFIGURATION;
+    // TODO-FUTURE: if the bucket has no WebsiteConfig, expose it here
+    return -ERR_NO_SUCH_WEBSITE_CONFIGURATION;
   }
 
   rgw_obj_key new_obj;

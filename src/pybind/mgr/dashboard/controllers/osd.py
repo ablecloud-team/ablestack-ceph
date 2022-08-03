@@ -371,7 +371,7 @@ class Osd(RESTController):
                     option]['encrypted'] = data[0]['encrypted']
                 orch.osds.create([DriveGroupSpec.from_json(
                     predefined_drive_groups[option])])
-            except (ValueError, TypeError, DriveGroupValidationError) as e:
+            except (ValueError, TypeError, KeyError, DriveGroupValidationError) as e:
                 raise DashboardException(e, component='osd')
 
     def _create_bare(self, data):
@@ -509,16 +509,17 @@ class OsdUi(Osd):
                 if device.available:
                     if device.human_readable_type == 'hdd':
                         hdds += 1
+                    # SSDs and NVMe are both counted as 'ssd'
+                    # so differentiating nvme using its path
+                    elif '/dev/nvme' in device.path:
+                        nvmes += 1
                     else:
                         ssds += 1
-                        # we still don't know how to infer nvmes
-                        # Tracker: https://tracker.ceph.com/issues/55728
-                        nvmes += 1
 
         if hdds:
             res.options[OsdDeploymentOptions.COST_CAPACITY].available = True
             res.recommended_option = OsdDeploymentOptions.COST_CAPACITY
-        if ssds:
+        if hdds and ssds:
             res.options[OsdDeploymentOptions.THROUGHPUT].available = True
             res.recommended_option = OsdDeploymentOptions.THROUGHPUT
         if nvmes:

@@ -693,12 +693,13 @@ class CephFSMount(object):
         ])
 
     def _run_python(self, pyscript, py_version='python3', sudo=False):
-        args = []
+        args, omit_sudo = [], True
         if sudo:
             args.append('sudo')
+            omit_sudo = False
         args += ['adjust-ulimits', 'daemon-helper', 'kill', py_version, '-c', pyscript]
         return self.client_remote.run(args=args, wait=False, stdin=run.PIPE,
-                                      stdout=StringIO(), omit_sudo=(not sudo))
+                                      stdout=StringIO(), omit_sudo=omit_sudo)
 
     def run_python(self, pyscript, py_version='python3', sudo=False):
         p = self._run_python(pyscript, py_version, sudo=sudo)
@@ -707,23 +708,20 @@ class CephFSMount(object):
 
     def run_shell(self, args, timeout=300, **kwargs):
         omit_sudo = kwargs.pop('omit_sudo', False)
-        sudo = kwargs.pop('sudo', False)
         cwd = kwargs.pop('cwd', self.mountpoint)
         stdout = kwargs.pop('stdout', StringIO())
         stderr = kwargs.pop('stderr', StringIO())
-
-        if sudo:
-            if isinstance(args, list):
-                args.insert(0, 'sudo')
-            elif isinstance(args, str):
-                args = 'sudo ' + args
 
         return self.client_remote.run(args=args, cwd=cwd, timeout=timeout,
                                       stdout=stdout, stderr=stderr,
                                       omit_sudo=omit_sudo, **kwargs)
 
     def run_shell_payload(self, payload, **kwargs):
-        return self.run_shell(["bash", "-c", Raw(f"'{payload}'")], **kwargs)
+        kwargs['args'] = ["bash", "-c", Raw(f"'{payload}'")]
+        if kwargs.pop('sudo', False):
+            kwargs['args'].insert(0, 'sudo')
+            kwargs['omit_sudo'] = False
+        return self.run_shell(**kwargs)
 
     def run_as_user(self, **kwargs):
         """
@@ -745,6 +743,7 @@ class CephFSMount(object):
             args = ['sudo', '-u', user, '-s', '/bin/bash', '-c', cmd]
 
         kwargs['args'] = args
+        kwargs['omit_sudo'] = False
         return self.run_shell(**kwargs)
 
     def run_as_root(self, **kwargs):
@@ -754,44 +753,66 @@ class CephFSMount(object):
         kwargs['user'] = 'root'
         return self.run_as_user(**kwargs)
 
-    def _verify(self, proc, retval=None, errmsg=None):
-        if retval:
-            msg = ('expected return value: {}\nreceived return value: '
-                   '{}\n'.format(retval, proc.returncode))
-            assert proc.returncode == retval, msg
+    def assert_retval(self, proc_retval, exp_retval):
+        msg = (f'expected return value: {exp_retval}\n'
+               f'received return value: {proc_retval}\n')
+        assert proc_retval == exp_retval, msg
 
-        if errmsg:
-            stderr = proc.stderr.getvalue().lower()
-            msg = ('didn\'t find given string in stderr -\nexpected string: '
-                   '{}\nreceived error message: {}\nnote: received error '
-                   'message is converted to lowercase'.format(errmsg, stderr))
-            assert errmsg in stderr, msg
+    def _verify(self, proc, exp_retval=None, exp_errmsgs=None):
+        if exp_retval is None and exp_errmsgs is None:
+            raise RuntimeError('Method didn\'t get enough parameters. Pass '
+                               'return value or error message expected from '
+                               'the command/process.')
 
-    def negtestcmd(self, args, retval=None, errmsg=None, stdin=None,
+        if exp_retval is not None:
+            self.assert_retval(proc.returncode, exp_retval)
+        if exp_errmsgs is None:
+            return
+
+        if isinstance(exp_errmsgs, str):
+            exp_errmsgs = (exp_errmsgs, )
+
+        proc_stderr = proc.stderr.getvalue().lower()
+        msg = ('didn\'t find any of the expected string in stderr.\n'
+               f'expected string: {exp_errmsgs}\n'
+               f'received error message: {proc_stderr}\n'
+               'note: received error message is converted to lowercase')
+        for e in exp_errmsgs:
+            if e in proc_stderr:
+                break
+        # this else is meant for for loop.
+        else:
+            assert False, msg
+
+    def negtestcmd(self, args, retval=None, errmsgs=None, stdin=None,
                    cwd=None, wait=True):
         """
         Conduct a negative test for the given command.
 
-        retval and errmsg are parameters to confirm the cause of command
+        retval and errmsgs are parameters to confirm the cause of command
         failure.
+
+        Note: errmsgs is expected to be a tuple, but in case there's only
+        error message, it can also be a string. This method will handle
+        that internally.
         """
         proc = self.run_shell(args=args, wait=wait, stdin=stdin, cwd=cwd,
                               check_status=False)
-        self._verify(proc, retval, errmsg)
+        self._verify(proc, retval, errmsgs)
         return proc
 
-    def negtestcmd_as_user(self, args, user, retval=None, errmsg=None,
+    def negtestcmd_as_user(self, args, user, retval=None, errmsgs=None,
                            stdin=None, cwd=None, wait=True):
         proc = self.run_as_user(args=args, user=user, wait=wait, stdin=stdin,
                                 cwd=cwd, check_status=False)
-        self._verify(proc, retval, errmsg)
+        self._verify(proc, retval, errmsgs)
         return proc
 
-    def negtestcmd_as_root(self, args, retval=None, errmsg=None, stdin=None,
+    def negtestcmd_as_root(self, args, retval=None, errmsgs=None, stdin=None,
                            cwd=None, wait=True):
         proc = self.run_as_root(args=args, wait=wait, stdin=stdin, cwd=cwd,
                                 check_status=False)
-        self._verify(proc, retval, errmsg)
+        self._verify(proc, retval, errmsgs)
         return proc
 
     def open_no_data(self, basename):
@@ -1322,11 +1343,13 @@ class CephFSMount(object):
         """
         Wrap ls: return a list of strings
         """
-        cmd = ["ls"]
+        kwargs['args'] = ["ls"]
         if path:
-            cmd.append(path)
-
-        ls_text = self.run_shell(cmd, **kwargs).stdout.getvalue().strip()
+            kwargs['args'].append(path)
+        if kwargs.pop('sudo', False):
+            kwargs['args'].insert(0, 'sudo')
+            kwargs['omit_sudo'] = False
+        ls_text = self.run_shell(**kwargs).stdout.getvalue().strip()
 
         if ls_text:
             return ls_text.split("\n")
@@ -1344,7 +1367,11 @@ class CephFSMount(object):
         :param val: xattr value
         :return: None
         """
-        self.run_shell(["setfattr", "-n", key, "-v", val, path], **kwargs)
+        kwargs['args'] = ["setfattr", "-n", key, "-v", val, path]
+        if kwargs.pop('sudo', False):
+            kwargs['args'].insert(0, 'sudo')
+            kwargs['omit_sudo'] = False
+        self.run_shell(**kwargs)
 
     def getfattr(self, path, attr, **kwargs):
         """
@@ -1353,7 +1380,12 @@ class CephFSMount(object):
 
         :return: a string
         """
-        p = self.run_shell(["getfattr", "--only-values", "-n", attr, path], wait=False, **kwargs)
+        kwargs['args'] = ["getfattr", "--only-values", "-n", attr, path]
+        if kwargs.pop('sudo', False):
+            kwargs['args'].insert(0, 'sudo')
+            kwargs['omit_sudo'] = False
+        kwargs['wait'] = False
+        p = self.run_shell(**kwargs)
         try:
             p.wait()
         except CommandFailedError as e:

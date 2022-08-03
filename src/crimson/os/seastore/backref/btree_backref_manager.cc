@@ -124,7 +124,7 @@ BtreeBackrefManager::new_mapping(
   ceph_assert(
     is_aligned(
       key.as_seg_paddr().get_segment_off(),
-      (uint64_t)sm_group.get_block_size()));
+      (uint64_t)cache.get_block_size()));
   struct state_t {
     paddr_t last_end;
 
@@ -430,37 +430,17 @@ void BtreeBackrefManager::complete_transaction(
 }
 
 Cache::backref_buf_entry_query_set_t
-BtreeBackrefManager::get_cached_backrefs_in_range(
+BtreeBackrefManager::get_cached_backref_entries_in_range(
   paddr_t start,
   paddr_t end)
 {
-  return cache.get_backrefs_in_range(start, end);
+  return cache.get_backref_entries_in_range(start, end);
 }
 
-Cache::backref_buf_entry_query_set_t
-BtreeBackrefManager::get_cached_backref_removals_in_range(
-  paddr_t start,
-  paddr_t end)
-{
-  return cache.get_del_backrefs_in_range(start, end);
-}
-
-const backref_buf_entry_t::set_t&
-BtreeBackrefManager::get_cached_backref_removals()
-{
-  return cache.get_del_backrefs();
-}
-
-const backref_buf_entry_t::set_t&
+const backref_set_t&
 BtreeBackrefManager::get_cached_backrefs()
 {
   return cache.get_backrefs();
-}
-
-backref_buf_entry_t
-BtreeBackrefManager::get_cached_backref_removal(paddr_t addr)
-{
-  return cache.get_del_backref(addr);
 }
 
 Cache::backref_extent_buf_entry_query_set_t
@@ -501,10 +481,6 @@ BtreeBackrefManager::retrieve_backref_extents(
       extents.emplace_back(std::move(ext));
     });
   });
-}
-
-bool BtreeBackrefManager::backref_should_be_removed(paddr_t paddr) {
-  return cache.backref_should_be_removed(paddr);
 }
 
 } // namespace crimson::os::seastore::backref

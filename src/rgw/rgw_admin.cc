@@ -69,6 +69,7 @@ extern "C" {
 #include "services/svc_bilog_rados.h"
 #include "services/svc_mdlog.h"
 #include "services/svc_meta_be_otp.h"
+#include "services/svc_user.h"
 #include "services/svc_zone.h"
 
 #define dout_context g_ceph_context
@@ -107,6 +108,18 @@ static const DoutPrefixProvider* dpp() {
       return _x_val; \
     } \
   } while (0)
+
+static inline int posix_errortrans(int r)
+{
+  switch(r) {
+  case ERR_NO_SUCH_BUCKET:
+    r = ENOENT;
+    break;
+  default:
+    break;
+  }
+  return r;
+}
 
 void usage()
 {
@@ -2262,7 +2275,7 @@ static void get_data_sync_status(const rgw_zone_id& source_zone, list<string>& s
 
   RGWZone *sz;
 
-  if (!static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(source_zone, &sz)) {
+  if (!(sz = static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(source_zone))) {
     push_ss(ss, status, tab) << string("zone not found");
     flush_ss(ss, status);
     return;
@@ -2477,7 +2490,7 @@ static void sync_status(Formatter *formatter)
     string source_str = "source: ";
     string s = source_str + source_id.id;
     RGWZone *sz;
-    if (static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(source_id, &sz)) {
+    if ((sz = static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(source_id))) {
       s += string(" (") + sz->name + ")";
     }
     data_status.push_back(s);
@@ -2661,7 +2674,7 @@ static rgw_zone_id resolve_zone_id(const string& s)
   rgw_zone_id result;
 
   RGWZone *zone;
-  if (static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(s, &zone)) {
+  if ((zone = static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(s))) {
     return rgw_zone_id(s);
   }
   if (static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone_id_by_name(s, &result)) {
@@ -3251,7 +3264,7 @@ class JSONFormatter_PrettyZone : public JSONFormatter {
       auto zone_id = *(static_cast<const rgw_zone_id *>(pval));
       string zone_name;
       RGWZone *zone;
-      if (static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(zone_id, &zone)) {
+      if ((zone = static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->find_zone(zone_id))) {
         zone_name = zone->name;
       } else {
         cerr << "WARNING: cannot find zone name for id=" << zone_id << std::endl;
@@ -4354,14 +4367,23 @@ int main(int argc, const char **argv)
     }
 #endif
 
+    // Get the filter
+    std::string rgw_filter = "none";
+    const auto& config_filter = g_conf().get_val<std::string>("rgw_filter");
+    if (config_filter == "base") {
+      rgw_filter = "base";
+    }
+
     if (raw_storage_op) {
       store = StoreManager::get_raw_storage(dpp(),
 					    g_ceph_context,
-					    rgw_store);
+					    rgw_store,
+					    rgw_filter);
     } else {
       store = StoreManager::get_storage(dpp(),
 					g_ceph_context,
 					rgw_store,
+					rgw_filter,
 					false,
 					false,
 					false,
@@ -6974,7 +6996,7 @@ int main(int argc, const char **argv)
     int r = RGWBucketAdminOp::info(store, bucket_op, stream_flusher, null_yield, dpp());
     if (r < 0) {
       cerr << "failure: " << cpp_strerror(-r) << ": " << err << std::endl;
-      return -r;
+      return posix_errortrans(-r);
     }
   }
 
@@ -8163,7 +8185,7 @@ next:
 
   if (opt_cmd == OPT::LC_LIST) {
     formatter->open_array_section("lifecycle_list");
-    vector<rgw::sal::Lifecycle::LCEntry> bucket_lc_map;
+    vector<std::unique_ptr<rgw::sal::Lifecycle::LCEntry>> bucket_lc_map;
     string marker;
     int index{0};
 #define MAX_LC_LIST_ENTRIES 100
@@ -8180,16 +8202,16 @@ next:
       }
       for (const auto& entry : bucket_lc_map) {
         formatter->open_object_section("bucket_lc_info");
-        formatter->dump_string("bucket", entry.bucket);
-	formatter->dump_string("shard", entry.oid);
+        formatter->dump_string("bucket", entry->get_bucket());
+	formatter->dump_string("shard", entry->get_oid());
 	char exp_buf[100];
-	time_t t{time_t(entry.start_time)};
+	time_t t{time_t(entry->get_start_time())};
 	if (std::strftime(
 	      exp_buf, sizeof(exp_buf),
 	      "%a, %d %b %Y %T %Z", std::gmtime(&t))) {
 	  formatter->dump_string("started", exp_buf);
 	}
-        string lc_status = LC_STATUS[entry.status];
+        string lc_status = LC_STATUS[entry->get_status()];
         formatter->dump_string("status", lc_status);
         formatter->close_section(); // objs
         formatter->flush(cout);
@@ -8385,7 +8407,7 @@ next:
 	  "so at most one of the two should be specified" << std::endl;
 	return EINVAL;
       }
-      ret = static_cast<rgw::sal::RadosStore*>(store)->ctl()->user->reset_stats(dpp(), user->get_id(), null_yield);
+      ret = static_cast<rgw::sal::RadosStore*>(store)->svc()->user->reset_bucket_stats(dpp(), user->get_id(), null_yield);
       if (ret < 0) {
 	cerr << "ERROR: could not reset user stats: " << cpp_strerror(-ret) <<
 	  std::endl;
@@ -8927,7 +8949,7 @@ next:
 
     auto sync = RGWBucketPipeSyncStatusManager::construct(
       dpp(), static_cast<rgw::sal::RadosStore*>(store), source_zone, opt_sb,
-      bucket->get_key());
+      bucket->get_key(), extra_info ? &std::cout : nullptr);
 
     if (!sync) {
       cerr << "ERROR: sync.init() returned error=" << sync.error() << std::endl;
@@ -9035,7 +9057,7 @@ next:
     }
     auto sync = RGWBucketPipeSyncStatusManager::construct(
       dpp(), static_cast<rgw::sal::RadosStore*>(store), source_zone,
-      opt_source_bucket, bucket->get_key());
+      opt_source_bucket, bucket->get_key(), nullptr);
 
     if (!sync) {
       cerr << "ERROR: sync.init() returned error=" << sync.error() << std::endl;
@@ -9068,7 +9090,7 @@ next:
     }
     auto sync = RGWBucketPipeSyncStatusManager::construct(
       dpp(), static_cast<rgw::sal::RadosStore*>(store), source_zone,
-      opt_source_bucket, bucket->get_key());
+      opt_source_bucket, bucket->get_key(), extra_info ? &std::cout : nullptr);
 
     if (!sync) {
       cerr << "ERROR: sync.init() returned error=" << sync.error() << std::endl;
