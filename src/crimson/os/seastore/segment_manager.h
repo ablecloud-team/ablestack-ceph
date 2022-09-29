@@ -55,7 +55,7 @@ struct block_sm_superblock_t {
     ceph_assert(first_segment_offset > tracker_offset &&
                 first_segment_offset % block_size == 0);
     ceph_assert(config.spec.magic != 0);
-    ceph_assert(config.spec.dtype == device_type_t::SEGMENTED);
+    ceph_assert(config.spec.dtype == device_type_t::SSD);
     ceph_assert(config.spec.id <= DEVICE_ID_MAX_VALID);
     if (!config.major_dev) {
       ceph_assert(config.secondary_devices.size() == 0);
@@ -128,6 +128,16 @@ public:
   virtual write_ertr::future<> write(
     seastore_off_t offset, ceph::bufferlist bl) = 0;
 
+  /**
+   * advance_wp
+   *
+   * advance the segment write pointer,
+   * needed when writing at wp is strictly implemented. ex: ZNS backed segments
+   * @param offset: advance write pointer till the given offset
+   */
+  virtual write_ertr::future<> advance_wp(
+    seastore_off_t offset) = 0;
+
   virtual ~Segment() {}
 };
 using SegmentRef = boost::intrusive_ptr<Segment>;
@@ -142,7 +152,11 @@ using SegmentManagerRef = std::unique_ptr<SegmentManager>;
 class SegmentManager : public Device {
 public:
   device_type_t get_device_type() const final {
-    return device_type_t::SEGMENTED;
+    return device_type_t::SSD;
+  }
+
+  backend_type_t get_backend_type() const final {
+    return backend_type_t::SEGMENTED;
   }
 
   using open_ertr = crimson::errorator<
@@ -160,8 +174,8 @@ public:
   /* Methods for discovering device geometry, segmentid set, etc */
   virtual seastore_off_t get_segment_size() const = 0;
   virtual device_segment_id_t get_num_segments() const {
-    ceph_assert(get_size() % get_segment_size() == 0);
-    return ((device_segment_id_t)(get_size() / get_segment_size()));
+    ceph_assert(get_available_size() % get_segment_size() == 0);
+    return ((device_segment_id_t)(get_available_size() / get_segment_size()));
   }
 
   virtual ~SegmentManager() {}

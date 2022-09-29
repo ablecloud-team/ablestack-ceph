@@ -16,6 +16,7 @@
 
 namespace crimson::os::seastore {
   class SegmentProvider;
+  class JournalTrimmer;
 }
 
 namespace crimson::os::seastore::journal {
@@ -30,7 +31,7 @@ class SegmentAllocator {
       crimson::ct_error::input_output_error>;
 
  public:
-  SegmentAllocator(segment_type_t type,
+  SegmentAllocator(JournalTrimmer *trimmer,
                    data_category_t category,
                    reclaim_gen_t gen,
                    SegmentProvider &sp,
@@ -98,7 +99,7 @@ class SegmentAllocator {
   // If rolling/opening, no write is allowed.
   using write_ertr = base_ertr;
   using write_ret = write_ertr::future<write_result_t>;
-  write_ret write(ceph::bufferlist to_write);
+  write_ret write(ceph::bufferlist&& to_write);
 
   using close_ertr = base_ertr;
   close_ertr::future<> close();
@@ -128,7 +129,7 @@ class SegmentAllocator {
   seastore_off_t written_to;
   SegmentSeqAllocator &segment_seq_allocator;
   segment_nonce_t current_segment_nonce;
-  //3. journal tail written to both segment_header_t and segment_tail_t
+  JournalTrimmer *trimmer;
 };
 
 /**

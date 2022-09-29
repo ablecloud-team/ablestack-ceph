@@ -679,7 +679,7 @@ public:
       }
       while (!lease_cr->is_locked()) {
         if (lease_cr->is_done()) {
-          ldpp_dout(dpp, 5) << "lease cr failed, done early " << dendl;
+          ldpp_dout(dpp, 5) << "failed to take lease" << dendl;
           set_status("lease lock failed, early abort");
           return set_cr_error(lease_cr->get_ret_status());
         }
@@ -926,8 +926,8 @@ public:
       }
       while (!lease_cr->is_locked()) {
         if (lease_cr->is_done()) {
-          ldpp_dout(dpp, 5) << "lease cr failed, done early " << dendl;
-          set_status("failed acquiring lock");
+          ldpp_dout(dpp, 5) << "failed to take lease" << dendl;
+          set_status("lease lock failed, early abort");
           return set_cr_error(lease_cr->get_ret_status());
         }
         set_sleeping(true);
@@ -977,6 +977,7 @@ public:
           for (; iter != result.keys.end(); ++iter) {
             if (!lease_cr->is_locked()) {
               lost_lock = true;
+              tn->log(1, "lease is lost, abort");
               break;
             }
             yield; // allow entries_index consumer to make progress
@@ -1322,13 +1323,12 @@ int RGWMetaSyncSingleEntryCR::operate(const DoutPrefixProvider *dpp) {
       sync_status = retcode;
 
       if (sync_status == -ENOENT) {
-        /* FIXME: do we need to remove the entry from the local zone? */
         break;
       }
 
       if (sync_status < 0) {
         if (tries < NUM_TRANSIENT_ERROR_RETRIES - 1) {
-          ldpp_dout(dpp, 20) << *this << ": failed to fetch remote metadata: " << section << ":" << key << ", will retry" << dendl;
+          ldpp_dout(dpp, 20) << *this << ": failed to fetch remote metadata entry: " << section << ":" << key << ", will retry" << dendl;
           continue;
         }
 
@@ -1345,14 +1345,18 @@ int RGWMetaSyncSingleEntryCR::operate(const DoutPrefixProvider *dpp) {
     retcode = 0;
     for (tries = 0; tries < NUM_TRANSIENT_ERROR_RETRIES; tries++) {
       if (sync_status != -ENOENT) {
-        tn->log(10, SSTR("storing local metadata entry"));
+        tn->log(10, SSTR("storing local metadata entry: " << section << ":" << key));
         yield call(new RGWMetaStoreEntryCR(sync_env, raw_key, md_bl));
       } else {
-        tn->log(10, SSTR("removing local metadata entry"));
+        tn->log(10, SSTR("removing local metadata entry:" << section << ":" << key));
         yield call(new RGWMetaRemoveEntryCR(sync_env, raw_key));
+        if (retcode == -ENOENT) {
+          retcode = 0;
+          break;
+        }
       }
       if ((retcode < 0) && (tries < NUM_TRANSIENT_ERROR_RETRIES - 1)) {
-        ldpp_dout(dpp, 20) << *this << ": failed to store metadata: " << section << ":" << key << ", got retcode=" << retcode << dendl;
+        ldpp_dout(dpp, 20) << *this << ": failed to store metadata entry: " << section << ":" << key << ", got retcode=" << retcode << ", will retry" << dendl;
         continue;
       }
       break;
@@ -1618,7 +1622,7 @@ public:
       /* sync! */
       do {
         if (!lease_cr->is_locked()) {
-          tn->log(10, "lost lease");
+          tn->log(1, "lease is lost, abort");
           lost_lock = true;
           break;
         }
@@ -1751,7 +1755,7 @@ public:
         while (!lease_cr->is_locked()) {
           if (lease_cr->is_done()) {
             drain_all();
-            tn->log(10, "failed to take lease");
+            tn->log(5, "failed to take lease");
             return lease_cr->get_ret_status();
           }
           set_sleeping(true);
@@ -1784,7 +1788,7 @@ public:
       do {
         if (!lease_cr->is_locked()) {
           lost_lock = true;
-          tn->log(10, "lost lease");
+          tn->log(1, "lease is lost, abort");
           break;
         }
 #define INCREMENTAL_MAX_ENTRIES 100

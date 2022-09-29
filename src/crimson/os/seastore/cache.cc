@@ -28,8 +28,8 @@ SET_SUBSYS(seastore_cache);
 
 namespace crimson::os::seastore {
 
-std::ostream &operator<<(std::ostream &out, const backref_buf_entry_t &ent) {
-  return out << "backref_buf_entry_t{"
+std::ostream &operator<<(std::ostream &out, const backref_entry_t &ent) {
+  return out << "backref_entry_t{"
 	     << ent.paddr << "~" << ent.len << ", "
 	     << "laddr: " << ent.laddr << ", "
 	     << "type: " << ent.type << ", "
@@ -133,9 +133,9 @@ void Cache::register_metrics()
   std::map<src_t, sm::label_instance> labels_by_src {
     {src_t::MUTATE, sm::label_instance("src", "MUTATE")},
     {src_t::READ, sm::label_instance("src", "READ")},
-    {src_t::CLEANER_TRIM_DIRTY, sm::label_instance("src", "CLEANER_TRIM_DIRTY")},
-    {src_t::CLEANER_TRIM_ALLOC, sm::label_instance("src", "CLEANER_TRIM_ALLOC")},
-    {src_t::CLEANER_RECLAIM, sm::label_instance("src", "CLEANER_RECLAIM")},
+    {src_t::TRIM_DIRTY, sm::label_instance("src", "TRIM_DIRTY")},
+    {src_t::TRIM_ALLOC, sm::label_instance("src", "TRIM_ALLOC")},
+    {src_t::CLEANER, sm::label_instance("src", "CLEANER")},
   };
   assert(labels_by_src.size() == (std::size_t)src_t::MAX);
 
@@ -531,7 +531,7 @@ void Cache::register_metrics()
         // READ transaction won't contain any tree inserts and erases
         continue;
       }
-      if (is_cleaner_transaction(src) &&
+      if (is_background_transaction(src) &&
           (tree_label == onode_label ||
            tree_label == omap_label)) {
         // CLEANER transaction won't contain any onode/omap tree operations
@@ -622,12 +622,12 @@ void Cache::register_metrics()
       // should be consistent with checks in account_conflict()
       if ((src1 == Transaction::src_t::READ &&
            src2 == Transaction::src_t::READ) ||
-          (src1 == Transaction::src_t::CLEANER_TRIM_DIRTY &&
-           src2 == Transaction::src_t::CLEANER_TRIM_DIRTY) ||
-          (src1 == Transaction::src_t::CLEANER_RECLAIM &&
-           src2 == Transaction::src_t::CLEANER_RECLAIM) ||
-          (src1 == Transaction::src_t::CLEANER_TRIM_ALLOC &&
-           src2 == Transaction::src_t::CLEANER_TRIM_ALLOC)) {
+          (src1 == Transaction::src_t::TRIM_DIRTY &&
+           src2 == Transaction::src_t::TRIM_DIRTY) ||
+          (src1 == Transaction::src_t::CLEANER &&
+           src2 == Transaction::src_t::CLEANER) ||
+          (src1 == Transaction::src_t::TRIM_ALLOC &&
+           src2 == Transaction::src_t::TRIM_ALLOC)) {
         continue;
       }
       std::ostringstream oss;
@@ -804,6 +804,7 @@ void Cache::invalidate_extent(
 {
   if (!extent.may_conflict()) {
     assert(extent.transactions.empty());
+    extent.state = CachedExtent::extent_state_t::INVALID;
     return;
   }
 
@@ -870,7 +871,7 @@ void Cache::mark_transaction_conflicted(
     auto ool_record_bytes = (ool_stats.md_bytes + ool_stats.get_data_bytes());
     efforts.ool_record_bytes += ool_record_bytes;
 
-    if (is_cleaner_transaction(t.get_src())) {
+    if (is_background_transaction(t.get_src())) {
       // CLEANER transaction won't contain any onode/omap tree operations
       assert(t.onode_tree_stats.is_clear());
       assert(t.omap_tree_stats.is_clear());
@@ -1018,7 +1019,8 @@ CachedExtentRef Cache::duplicate_for_write(
 
 record_t Cache::prepare_record(
   Transaction &t,
-  SegmentProvider *cleaner)
+  const journal_seq_t &journal_head,
+  const journal_seq_t &journal_dirty_tail)
 {
   LOG_PREFIX(Cache::prepare_record);
   SUBTRACET(seastore_t, "enter", t);
@@ -1102,13 +1104,16 @@ record_t Cache::prepare_record(
     } else {
       auto sseq = NULL_SEG_SEQ;
       auto stype = segment_type_t::NULL_SEG;
-      if (cleaner != nullptr && i->get_paddr().get_addr_type() ==
-	  addr_types_t::SEGMENT) {
+
+      // FIXME: This is specific to the segmented implementation
+      if (segment_provider != nullptr &&
+          i->get_paddr().get_addr_type() == paddr_types_t::SEGMENT) {
         auto sid = i->get_paddr().as_seg_paddr().get_segment_id();
-        auto &sinfo = cleaner->get_seg_info(sid);
+        auto &sinfo = segment_provider->get_seg_info(sid);
         sseq = sinfo.seq;
         stype = sinfo.type;
       }
+
       record.push_back(
 	delta_info_t{
 	  i->get_type(),
@@ -1247,16 +1252,17 @@ record_t Cache::prepare_record(
     record.push_back(std::move(delta));
   }
 
-  if (is_cleaner_transaction(trans_src)) {
-    assert(cleaner != nullptr);
+  if (is_background_transaction(trans_src)) {
+    assert(journal_head != JOURNAL_SEQ_NULL);
+    assert(journal_dirty_tail != JOURNAL_SEQ_NULL);
     journal_seq_t dirty_tail;
     auto maybe_dirty_tail = get_oldest_dirty_from();
     if (!maybe_dirty_tail.has_value()) {
-      dirty_tail = cleaner->get_journal_head();
+      dirty_tail = journal_head;
       SUBINFOT(seastore_t, "dirty_tail all trimmed, set to head {}, src={}",
                t, dirty_tail, trans_src);
     } else if (*maybe_dirty_tail == JOURNAL_SEQ_NULL) {
-      dirty_tail = cleaner->get_dirty_tail();
+      dirty_tail = journal_dirty_tail;
       SUBINFOT(seastore_t, "dirty_tail is pending, set to {}, src={}",
                t, dirty_tail, trans_src);
     } else {
@@ -1269,7 +1275,7 @@ record_t Cache::prepare_record(
       // FIXME: the replay point of the allocations requires to be accurate.
       // Setting the alloc_tail to get_journal_head() cannot skip replaying the
       // last unnecessary record.
-      alloc_tail = cleaner->get_journal_head();
+      alloc_tail = journal_head;
       SUBINFOT(seastore_t, "alloc_tail all trimmed, set to head {}, src={}",
                t, alloc_tail, trans_src);
     } else if (*maybe_alloc_tail == JOURNAL_SEQ_NULL) {
@@ -1329,8 +1335,8 @@ record_t Cache::prepare_record(
       record.size.get_raw_mdlength(),
       record.size.dlength,
       sea_time_point_printer_t{record.modify_time});
-  if (is_cleaner_transaction(trans_src)) {
-    // CLEANER transaction won't contain any onode tree operations
+  if (is_background_transaction(trans_src)) {
+    // background transaction won't contain any onode tree operations
     assert(t.onode_tree_stats.is_clear());
     assert(t.omap_tree_stats.is_clear());
   } else {
@@ -1373,9 +1379,9 @@ record_t Cache::prepare_record(
     (record.size.get_raw_mdlength() - record.get_delta_size());
 
   auto &rewrite_version_stats = t.get_rewrite_version_stats();
-  if (trans_src == Transaction::src_t::CLEANER_TRIM_DIRTY) {
+  if (trans_src == Transaction::src_t::TRIM_DIRTY) {
     stats.committed_dirty_version.increment_stat(rewrite_version_stats);
-  } else if (trans_src == Transaction::src_t::CLEANER_RECLAIM) {
+  } else if (trans_src == Transaction::src_t::CLEANER) {
     stats.committed_reclaim_version.increment_stat(rewrite_version_stats);
   } else {
     assert(rewrite_version_stats.is_clear());
@@ -1385,30 +1391,23 @@ record_t Cache::prepare_record(
 }
 
 void Cache::backref_batch_update(
-  std::vector<backref_buf_entry_ref> &&list,
+  std::vector<backref_entry_ref> &&list,
   const journal_seq_t &seq)
 {
   LOG_PREFIX(Cache::backref_batch_update);
   DEBUG("inserting {} entries at {}", list.size(), seq);
   ceph_assert(seq != JOURNAL_SEQ_NULL);
-  if (!backref_buffer) {
-    backref_buffer = std::make_unique<backref_cache_t>();
-  }
 
   for (auto &ent : list) {
-    backref_set.insert(*ent);
+    backref_entry_mset.insert(*ent);
   }
 
-  auto iter = backref_buffer->backrefs_by_seq.find(seq);
-  if (iter == backref_buffer->backrefs_by_seq.end()) {
-    backref_buffer->backrefs_by_seq.emplace(
-      seq, std::move(list));
+  auto iter = backref_entryrefs_by_seq.find(seq);
+  if (iter == backref_entryrefs_by_seq.end()) {
+    backref_entryrefs_by_seq.emplace(seq, std::move(list));
   } else {
-    for (auto &ref : list) {
-      iter->second.br_list.push_back(*ref);
-    }
-    iter->second.backrefs.insert(
-      iter->second.backrefs.end(),
+    iter->second.insert(
+      iter->second.end(),
       std::make_move_iterator(list.begin()),
       std::make_move_iterator(list.end()));
   }
@@ -1417,15 +1416,18 @@ void Cache::backref_batch_update(
 void Cache::complete_commit(
   Transaction &t,
   paddr_t final_block_start,
-  journal_seq_t start_seq,
-  AsyncCleaner *cleaner)
+  journal_seq_t start_seq)
 {
   LOG_PREFIX(Cache::complete_commit);
   SUBTRACET(seastore_t, "final_block_start={}, start_seq={}",
             t, final_block_start, start_seq);
 
-  std::vector<backref_buf_entry_ref> backref_list;
+  std::vector<backref_entry_ref> backref_list;
   t.for_each_fresh_block([&](const CachedExtentRef &i) {
+    if (!i->is_valid()) {
+      return;
+    }
+
     bool is_inline = false;
     if (i->is_inline()) {
       is_inline = true;
@@ -1434,39 +1436,33 @@ void Cache::complete_commit(
     i->last_committed_crc = i->get_crc32c();
     i->on_initial_write();
 
-    if (i->is_valid()) {
-      i->state = CachedExtent::extent_state_t::CLEAN;
-      DEBUGT("add extent as fresh, inline={} -- {}",
-             t, is_inline, *i);
-      const auto t_src = t.get_src();
-      add_extent(i, &t_src);
-      if (cleaner) {
-	cleaner->mark_space_used(
+    i->state = CachedExtent::extent_state_t::CLEAN;
+    DEBUGT("add extent as fresh, inline={} -- {}",
+	   t, is_inline, *i);
+    const auto t_src = t.get_src();
+    add_extent(i, &t_src);
+    epm.mark_space_used(i->get_paddr(), i->get_length());
+    if (is_backref_mapped_extent_node(i)) {
+      DEBUGT("backref_list new {} len {}",
+	     t,
+	     i->get_paddr(),
+	     i->get_length());
+      backref_list.emplace_back(
+	std::make_unique<backref_entry_t>(
 	  i->get_paddr(),
-	  i->get_length());
-      }
-      if (is_backref_mapped_extent_node(i)) {
-	DEBUGT("backref_list new {} len {}",
-	       t,
-	       i->get_paddr(),
-	       i->get_length());
-	backref_list.emplace_back(
-	  std::make_unique<backref_buf_entry_t>(
-	    i->get_paddr(),
-	    i->is_logical()
-	    ? i->cast<LogicalCachedExtent>()->get_laddr()
-	    : (is_lba_node(i->get_type())
-	      ? i->cast<lba_manager::btree::LBANode>()->get_node_meta().begin
-	      : L_ADDR_NULL),
-	    i->get_length(),
-	    i->get_type(),
-	    start_seq));
-      } else if (is_backref_node(i->get_type())) {
-	add_backref_extent(i->get_paddr(), i->get_type());
-      } else {
-	ERRORT("{}", t, *i);
-	ceph_abort("not possible");
-      }
+	  i->is_logical()
+	  ? i->cast<LogicalCachedExtent>()->get_laddr()
+	  : (is_lba_node(i->get_type())
+	    ? i->cast<lba_manager::btree::LBANode>()->get_node_meta().begin
+	    : L_ADDR_NULL),
+	  i->get_length(),
+	  i->get_type(),
+	  start_seq));
+    } else if (is_backref_node(i->get_type())) {
+      add_backref_extent(i->get_paddr(), i->get_type());
+    } else {
+      ERRORT("{}", t, *i);
+      ceph_abort("not possible");
     }
   });
 
@@ -1489,18 +1485,12 @@ void Cache::complete_commit(
     }
   }
 
-  if (cleaner) {
-    for (auto &i: t.retired_set) {
-      cleaner->mark_space_free(
-	i->get_paddr(),
-	i->get_length());
-    }
-    for (auto &i: t.existing_block_list) {
-      if (i->is_valid()) {
-	cleaner->mark_space_used(
-	  i->get_paddr(),
-	  i->get_length());
-      }
+  for (auto &i: t.retired_set) {
+    epm.mark_space_free(i->get_paddr(), i->get_length());
+  }
+  for (auto &i: t.existing_block_list) {
+    if (i->is_valid()) {
+      epm.mark_space_used(i->get_paddr(), i->get_length());
     }
   }
 
@@ -1521,7 +1511,7 @@ void Cache::complete_commit(
 	     i->get_paddr(),
 	     i->get_length());
       backref_list.emplace_back(
-	std::make_unique<backref_buf_entry_t>(
+	std::make_unique<backref_entry_t>(
 	  i->get_paddr(),
 	  L_ADDR_NULL,
 	  i->get_length(),
@@ -1554,7 +1544,7 @@ void Cache::complete_commit(
 	     i->get_paddr(),
 	     i->get_length());
       backref_list.emplace_back(
-        std::make_unique<backref_buf_entry_t>(
+        std::make_unique<backref_entry_t>(
 	  i->get_paddr(),
 	  i->cast<LogicalCachedExtent>()->get_laddr(),
 	  i->get_length(),
@@ -1580,7 +1570,7 @@ void Cache::init()
   }
   root = new RootBlock();
   root->init(CachedExtent::extent_state_t::CLEAN,
-             P_ADDR_NULL,
+             P_ADDR_ROOT,
              PLACEMENT_HINT_NULL,
              NULL_GENERATION);
   INFO("init root -- {}", *root);
@@ -1623,7 +1613,7 @@ Cache::close_ertr::future<> Cache::close()
     intrusive_ptr_release(ptr);
   }
   backref_extents.clear();
-  backref_buffer.reset();
+  backref_entryrefs_by_seq.clear();
   assert(stats.dirty_bytes == 0);
   lru.clear();
   return close_ertr::now();
@@ -1643,6 +1633,32 @@ Cache::replay_delta(
   assert(alloc_tail != JOURNAL_SEQ_NULL);
   ceph_assert(modify_time != NULL_TIME);
 
+  // FIXME: This is specific to the segmented implementation
+  /* The journal may validly contain deltas for extents in
+   * since released segments.  We can detect those cases by
+   * checking whether the segment in question currently has a
+   * sequence number > the current journal segment seq. We can
+   * safetly skip these deltas because the extent must already
+   * have been rewritten.
+   */
+  if (segment_provider != nullptr &&
+      delta.paddr != P_ADDR_NULL &&
+      delta.paddr.get_addr_type() == paddr_types_t::SEGMENT) {
+    auto& seg_addr = delta.paddr.as_seg_paddr();
+    auto& seg_info = segment_provider->get_seg_info(seg_addr.get_segment_id());
+    auto delta_paddr_segment_seq = seg_info.seq;
+    auto delta_paddr_segment_type = seg_info.type;
+    if (delta_paddr_segment_seq != delta.ext_seq ||
+        delta_paddr_segment_type != delta.seg_type) {
+      DEBUG("delta is obsolete, delta_paddr_segment_seq={},"
+            " delta_paddr_segment_type={} -- {}",
+            segment_seq_printer_t{delta_paddr_segment_seq},
+            delta_paddr_segment_type,
+            delta);
+      return replay_delta_ertr::make_ready_future<bool>(false);
+    }
+  }
+
   if (delta.type == extent_types_t::JOURNAL_TAIL) {
     // this delta should have been dealt with during segment cleaner mounting
     return replay_delta_ertr::make_ready_future<bool>(false);
@@ -1658,7 +1674,7 @@ Cache::replay_delta(
 
     alloc_delta_t alloc_delta;
     decode(alloc_delta, delta.bl);
-    std::vector<backref_buf_entry_ref> backref_list;
+    std::vector<backref_entry_ref> backref_list;
     for (auto &alloc_blk : alloc_delta.alloc_blk_ranges) {
       if (alloc_blk.paddr.is_relative()) {
 	assert(alloc_blk.paddr.is_record_relative());
@@ -1667,7 +1683,7 @@ Cache::replay_delta(
       DEBUG("replay alloc_blk {}~{} {}, journal_seq: {}",
 	alloc_blk.paddr, alloc_blk.len, alloc_blk.laddr, journal_seq);
       backref_list.emplace_back(
-	std::make_unique<backref_buf_entry_t>(
+	std::make_unique<backref_entry_t>(
 	  alloc_blk.paddr,
 	  alloc_blk.laddr,
 	  alloc_blk.len,
@@ -1744,9 +1760,18 @@ Cache::replay_delta(
       DEBUG("replay extent delta at {} {} ... -- {}, prv_extent={}",
             journal_seq, record_base, delta, *extent);
 
-      assert(extent->version == delta.pversion);
+      if (extent->last_committed_crc != delta.prev_crc) {
+        // FIXME: we can't rely on crc to detect whether is delta is
+        // out-of-date.
+        ERROR("identified delta crc {} doesn't match the extent at {} {}, "
+              "probably is out-dated -- {}",
+              delta, journal_seq, record_base, *extent);
+        ceph_assert(epm.get_journal_type() == journal_type_t::RANDOM_BLOCK);
+        remove_extent(extent);
+        return replay_delta_ertr::make_ready_future<bool>(false);
+      }
 
-      assert(extent->last_committed_crc == delta.prev_crc);
+      assert(extent->version == delta.pversion);
       extent->apply_delta_and_adjust_crc(record_base, delta.bl);
       extent->set_modify_time(modify_time);
       assert(extent->last_committed_crc == delta.final_crc);

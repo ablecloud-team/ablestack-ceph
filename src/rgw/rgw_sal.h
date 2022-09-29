@@ -16,23 +16,19 @@
 #pragma once
 
 #include "rgw_sal_fwd.h"
+#include "rgw_lua.h"
 #include "rgw_user.h"
 #include "rgw_notify_event_type.h"
 #include "common/tracer.h"
 #include "rgw_datalog_notify.h"
 #include "include/random.h"
 
+class RGWRESTMgr;
 class RGWAccessListFilter;
 class RGWLC;
-class RGWObjManifest;
-struct RGWZoneGroup;
-struct RGWZoneParams;
-class RGWRealm;
-struct RGWCtl;
 struct rgw_user_bucket;
 class RGWUsageBatch;
 class RGWCoroutinesManagerRegistry;
-class RGWListRawObjsCtx;
 class RGWBucketSyncPolicyHandler;
 using RGWBucketSyncPolicyHandlerRef = std::shared_ptr<RGWBucketSyncPolicyHandler>;
 class RGWDataSyncStatusManager;
@@ -319,6 +315,10 @@ class Store {
     virtual std::string zone_unique_id(uint64_t unique_num) = 0;
     /** Get a unique Swift transaction ID specific to this zone */
     virtual std::string zone_unique_trans_id(const uint64_t unique_num) = 0;
+    /** Lookup a zonegroup by ID */
+    virtual int get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zonegroup) = 0;
+    /** List all zones in all zone groups by ID */
+    virtual int list_all_zones(const DoutPrefixProvider* dpp, std::list<std::string>& zone_ids) = 0;
     /** Get statistics about the cluster represented by this Store */
     virtual int cluster_stat(RGWClusterStat& stats) = 0;
     /** Get a @a Lifecycle object. Used to manage/run lifecycle transitions */
@@ -396,7 +396,7 @@ class Store {
     /** Get the ID of the current host */
     virtual std::string get_host_id() = 0;
     /** Get a Lua script manager for running lua scripts */
-    virtual std::unique_ptr<LuaScriptManager> get_lua_script_manager() = 0;
+    virtual std::unique_ptr<LuaManager> get_lua_manager() = 0;
     /** Get an IAM Role by name etc. */
     virtual std::unique_ptr<RGWRole> get_role(std::string name,
 					      std::string tenant,
@@ -452,6 +452,8 @@ class Store {
     virtual const std::string& get_luarocks_path() const = 0;
     /** Set the location of where lua packages are installed */
     virtual void set_luarocks_path(const std::string& path) = 0;
+    /** Register admin APIs unique to this store */
+    virtual void register_admin_apis(RGWRESTMgr* mgr) = 0;
 };
 
 /**
@@ -520,11 +522,11 @@ class User {
     /** Set the cached attributes fro this User */
     virtual void set_attrs(Attrs& _attrs) = 0;
     /** Check if a User is empty */
-    virtual bool empty() = 0;
+    virtual bool empty() const = 0;
     /** Check if a User pointer is empty */
-    static bool empty(User* u) { return (!u || u->empty()); }
+    static bool empty(const User* u) { return (!u || u->empty()); }
     /** Check if a User unique_pointer is empty */
-    static bool empty(std::unique_ptr<User>& u) { return (!u || u->empty()); }
+    static bool empty(const std::unique_ptr<User>& u) { return (!u || u->empty()); }
     /** Read the User attributes from the backing Store */
     virtual int read_attrs(const DoutPrefixProvider* dpp, optional_yield y) = 0;
     /** Set the attributes in attrs, leaving any other existing attrs set, and
@@ -553,6 +555,8 @@ class User {
     virtual int store_user(const DoutPrefixProvider* dpp, optional_yield y, bool exclusive, RGWUserInfo* old_info = nullptr) = 0;
     /** Remove this User from the backing store */
     virtual int remove_user(const DoutPrefixProvider* dpp, optional_yield y) = 0;
+    /** Verify multi-factor authentication for this user */
+    virtual int verify_mfa(const std::string& mfa_str, bool* verified, const DoutPrefixProvider* dpp, optional_yield y) = 0;
 
     /* dang temporary; will be removed when User is complete */
     virtual RGWUserInfo& get_info() = 0;
@@ -1079,9 +1083,9 @@ class Object {
 				    bool must_exist, optional_yield y) = 0;
 
     /** Check to see if the given object pointer is uninitialized */
-    static bool empty(Object* o) { return (!o || o->empty()); }
+    static bool empty(const Object* o) { return (!o || o->empty()); }
     /** Check to see if the given object unique pointer is uninitialized */
-    static bool empty(std::unique_ptr<Object> o) { return (!o || o->empty()); }
+    static bool empty(const std::unique_ptr<Object>& o) { return (!o || o->empty()); }
     /** Get a unique copy of this object */
     virtual std::unique_ptr<Object> clone() = 0;
 
@@ -1464,6 +1468,12 @@ public:
   virtual int get_zone_count() const = 0;
   /** Get the placement tier associated with the rule */
   virtual int get_placement_tier(const rgw_placement_rule& rule, std::unique_ptr<PlacementTier>* tier) = 0;
+  /** Get a zone by ID */
+  virtual int get_zone_by_id(const std::string& id, std::unique_ptr<Zone>* zone) = 0;
+  /** Get a zone by Name */
+  virtual int get_zone_by_name(const std::string& name, std::unique_ptr<Zone>* zone) = 0;
+  /** List zones in zone group by ID */
+  virtual int list_zones(std::list<std::string>& zone_ids) = 0;
   /** Clone a copy of this zonegroup. */
   virtual std::unique_ptr<ZoneGroup> clone() = 0;
 };
@@ -1482,10 +1492,8 @@ class Zone {
     virtual std::unique_ptr<Zone> clone() = 0;
     /** Get info about the zonegroup containing this zone */
     virtual ZoneGroup& get_zonegroup() = 0;
-    /** Get info about a zonegroup by ID */
-    virtual int get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zonegroup) = 0;
     /** Get the ID of this zone */
-    virtual const rgw_zone_id& get_id() = 0;
+    virtual const std::string& get_id() = 0;
     /** Get the name of this zone */
     virtual const std::string& get_name() const = 0;
     /** True if this zone is writable */
@@ -1504,23 +1512,31 @@ class Zone {
     virtual const std::string& get_realm_id() = 0;
     /** Get the tier type for the zone */
     virtual const std::string_view get_tier_type() = 0;
+    /** Get a handler for zone sync policy. */
+    virtual RGWBucketSyncPolicyHandlerRef get_sync_policy_handler() = 0;
 };
 
 /**
- * @brief Abstraction of a manager for Lua scripts
+ * @brief Abstraction of a manager for Lua scripts and packages
  *
- * RGW can load and process Lua scripts.  This will handle loading/storing scripts.
+ * RGW can load and process Lua scripts.  This will handle loading/storing scripts; adding, deleting, and listing packages
  */
-class LuaScriptManager {
+class LuaManager {
 public:
-  virtual ~LuaScriptManager() = default;
+  virtual ~LuaManager() = default;
 
   /** Get a script named with the given key from the backing store */
-  virtual int get(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script) = 0;
+  virtual int get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script) = 0;
   /** Put a script named with the given key to the backing store */
-  virtual int put(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script) = 0;
+  virtual int put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script) = 0;
   /** Delete a script named with the given key from the backing store */
-  virtual int del(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key) = 0;
+  virtual int del_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key) = 0;
+  /** Add a lua package */
+  virtual int add_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name) = 0;
+  /** Remove a lua package */
+  virtual int remove_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name) = 0;
+  /** List lua packages */
+  virtual int list_packages(const DoutPrefixProvider* dpp, optional_yield y, rgw::lua::packages_t& packages) = 0;
 };
 
 /** @} namespace rgw::sal in group RGWSAL */
@@ -1536,26 +1552,59 @@ public:
  */
 class StoreManager {
 public:
+  struct Config {
+    /** Name of store to create */
+    std::string store_name;
+    /** Name of filter to create or "none" */
+    std::string filter_name;
+  };
+
   StoreManager() {}
   /** Get a full store by service name */
-  static rgw::sal::Store* get_storage(const DoutPrefixProvider* dpp, CephContext* cct, const std::string svc, const std::string filter, bool use_gc_thread, bool use_lc_thread, bool quota_threads,
-                               bool run_sync_thread, bool run_reshard_thread, bool use_cache = true, bool use_gc = true) {
-    rgw::sal::Store* store = init_storage_provider(dpp, cct, svc, filter, use_gc_thread, use_lc_thread,
-        quota_threads, run_sync_thread, run_reshard_thread, use_cache, use_gc);
+  static rgw::sal::Store* get_storage(const DoutPrefixProvider* dpp,
+				      CephContext* cct,
+				      const Config& cfg,
+				      bool use_gc_thread,
+				      bool use_lc_thread,
+				      bool quota_threads,
+				      bool run_sync_thread,
+				      bool run_reshard_thread,
+				      bool use_cache = true,
+				      bool use_gc = true) {
+    rgw::sal::Store* store = init_storage_provider(dpp, cct, cfg, use_gc_thread,
+						   use_lc_thread,
+						   quota_threads,
+						   run_sync_thread,
+						   run_reshard_thread,
+						   use_cache, use_gc);
     return store;
   }
   /** Get a stripped down store by service name */
-  static rgw::sal::Store* get_raw_storage(const DoutPrefixProvider* dpp, CephContext* cct, const std::string svc, const std::string filter) {
-    rgw::sal::Store* store = init_raw_storage_provider(dpp, cct, svc, filter);
+  static rgw::sal::Store* get_raw_storage(const DoutPrefixProvider* dpp,
+					  CephContext* cct, const Config& cfg) {
+    rgw::sal::Store* store = init_raw_storage_provider(dpp, cct, cfg);
     return store;
   }
   /** Initialize a new full Store */
-  static rgw::sal::Store* init_storage_provider(const DoutPrefixProvider* dpp, CephContext* cct, const std::string svc, const std::string filter, bool use_gc_thread, bool use_lc_thread, bool quota_threads, bool run_sync_thread, bool run_reshard_thread, bool use_metadata_cache, bool use_gc);
+  static rgw::sal::Store* init_storage_provider(const DoutPrefixProvider* dpp,
+						CephContext* cct,
+						const Config& cfg,
+						bool use_gc_thread,
+						bool use_lc_thread,
+						bool quota_threads,
+						bool run_sync_thread,
+						bool run_reshard_thread,
+						bool use_metadata_cache,
+						bool use_gc);
   /** Initialize a new raw Store */
-  static rgw::sal::Store* init_raw_storage_provider(const DoutPrefixProvider* dpp, CephContext* cct, const std::string svc, const std::string filter);
+  static rgw::sal::Store* init_raw_storage_provider(const DoutPrefixProvider* dpp,
+						    CephContext* cct,
+						    const Config& cfg);
   /** Close a Store when it's no longer needed */
   static void close_storage(rgw::sal::Store* store);
 
+  /** Get the config for stores/filters */
+  static Config get_config(bool admin, CephContext* cct);
 };
 
 /** @} */

@@ -79,6 +79,10 @@ public:
   virtual int get_zone_count() const override
     { return next->get_zone_count(); }
   virtual int get_placement_tier(const rgw_placement_rule& rule, std::unique_ptr<PlacementTier>* tier) override;
+  virtual int get_zone_by_id(const std::string& id, std::unique_ptr<Zone>* zone) override;
+  virtual int get_zone_by_name(const std::string& name, std::unique_ptr<Zone>* zone) override;
+  virtual int list_zones(std::list<std::string>& zone_ids) override
+    { return next->list_zones(zone_ids); }
   virtual std::unique_ptr<ZoneGroup> clone() override {
     std::unique_ptr<ZoneGroup> nzg = next->clone();
     return std::make_unique<FilterZoneGroup>(std::move(nzg));
@@ -105,8 +109,7 @@ public:
   virtual ZoneGroup& get_zonegroup() override {
       return *group.get();
   }
-  virtual int get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zonegroup) override;
-  virtual const rgw_zone_id& get_id() override {
+  virtual const std::string& get_id() override {
       return next->get_id();
   }
   virtual const std::string& get_name() const override {
@@ -135,6 +138,9 @@ public:
   }
   virtual const std::string_view get_tier_type() override {
       return next->get_tier_type();
+  }
+  virtual RGWBucketSyncPolicyHandlerRef get_sync_policy_handler() override {
+    return next->get_sync_policy_handler();
   }
 };
 
@@ -186,6 +192,10 @@ public:
   virtual Zone* get_zone() override { return zone.get(); }
   virtual std::string zone_unique_id(uint64_t unique_num) override;
   virtual std::string zone_unique_trans_id(const uint64_t unique_num) override;
+  virtual int get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zonegroup) override;
+  virtual int list_all_zones(const DoutPrefixProvider* dpp, std::list<std::string>& zone_ids) override {
+    return next->list_all_zones(dpp, zone_ids);
+  }
   virtual int cluster_stat(RGWClusterStat& stats) override;
   virtual std::unique_ptr<Lifecycle> get_lifecycle(void) override;
   virtual std::unique_ptr<Completions> get_completions(void) override;
@@ -251,7 +261,7 @@ public:
 			  std::string& metadata_key, optional_yield y) override;
   virtual const RGWSyncModuleInstanceRef& get_sync_module() override;
   virtual std::string get_host_id() override { return next->get_host_id(); }
-  virtual std::unique_ptr<LuaScriptManager> get_lua_script_manager() override;
+  virtual std::unique_ptr<LuaManager> get_lua_manager() override;
   virtual std::unique_ptr<RGWRole> get_role(std::string name,
 					    std::string tenant,
 					    std::string path="",
@@ -297,6 +307,9 @@ public:
 
   virtual const std::string& get_luarocks_path() const override;
   virtual void set_luarocks_path(const std::string& path) override;
+  virtual void  register_admin_apis(RGWRESTMgr* mgr)override {
+      return next->register_admin_apis(mgr);
+  }
 };
 
 class FilterUser : public User {
@@ -347,7 +360,7 @@ public:
   }
   virtual Attrs& get_attrs() override { return next->get_attrs(); }
   virtual void set_attrs(Attrs& _attrs) override { next->set_attrs(_attrs); }
-  virtual bool empty() override { return next->empty(); }
+  virtual bool empty() const override { return next->empty(); }
   virtual int read_attrs(const DoutPrefixProvider* dpp, optional_yield y) override;
   virtual int merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs&
 				    new_attrs, optional_yield y) override;
@@ -369,6 +382,8 @@ public:
   virtual int store_user(const DoutPrefixProvider* dpp, optional_yield y, bool
 			 exclusive, RGWUserInfo* old_info = nullptr) override;
   virtual int remove_user(const DoutPrefixProvider* dpp, optional_yield y) override;
+  virtual int verify_mfa(const std::string& mfa_str, bool* verified,
+			 const DoutPrefixProvider* dpp, optional_yield y) override;
 
   RGWUserInfo& get_info() override { return next->get_info(); }
   virtual void print(std::ostream& out) const override { return next->print(out); }
@@ -858,18 +873,20 @@ public:
                        optional_yield y) override;
 };
 
-class FilterLuaScriptManager : public LuaScriptManager {
+class FilterLuaManager : public LuaManager {
 protected:
-  std::unique_ptr<LuaScriptManager> next;
+  std::unique_ptr<LuaManager> next;
 
 public:
-  FilterLuaScriptManager(std::unique_ptr<LuaScriptManager> _next) : next(std::move(_next)) {}
-  virtual ~FilterLuaScriptManager() = default;
+  FilterLuaManager(std::unique_ptr<LuaManager> _next) : next(std::move(_next)) {}
+  virtual ~FilterLuaManager() = default;
 
-  virtual int get(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script) override;
-  virtual int put(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script) override;
-  virtual int del(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key) override;
+  virtual int get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script) override;
+  virtual int put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script) override;
+  virtual int del_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key) override;
+  virtual int add_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name) override;
+  virtual int remove_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name) override;
+  virtual int list_packages(const DoutPrefixProvider* dpp, optional_yield y, rgw::lua::packages_t& packages) override;
 };
-
 
 } } // namespace rgw::sal

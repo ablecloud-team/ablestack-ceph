@@ -30,7 +30,10 @@ else
   CEPH_CONF_PATH="$PWD"
 fi
 conf_fn="$CEPH_CONF_PATH/ceph.conf"
-CEPHADM_DIR_PATH="$CEPH_CONF_PATH/../src/cephadm"
+
+if [ -z "$CEPHADM" ]; then
+  CEPHADM="${CEPH_BIN}/cephadm"
+fi
 
 MYUID=$(id -u)
 MYNAME=$(id -nu)
@@ -75,7 +78,7 @@ maybe_kill() {
 
 do_killcephadm() {
     FSID=$($CEPH_BIN/ceph -c $conf_fn fsid)
-    sudo $CEPHADM_DIR_PATH/cephadm rm-cluster --fsid $FSID --force
+    sudo $CEPHADM rm-cluster --fsid $FSID --force
 }
 
 do_umountall() {
@@ -189,13 +192,13 @@ if [ $stop_all -eq 1 ]; then
         fi
     fi
 
-    daemons="$(sudo $CEPHADM_DIR_PATH/cephadm ls 2> /dev/null)"
+    daemons="$(sudo $CEPHADM ls 2> /dev/null)"
     if [ $? -eq 0 -a "$daemons" != "[]" ]; then
         do_killcephadm
     fi
 
     # killing processes
-    to_kill="$ceph_osd ceph-mon ceph-mds ceph-mgr radosgw lt-radosgw apache2 ganesha.nfsd"
+    to_kill="$ceph_osd ceph-mon ceph-mds ceph-mgr radosgw lt-radosgw apache2 ganesha.nfsd cephfs-top"
     since_kill=0
     for step in 0 1 1 2 3 5 8; do
         sleep $step

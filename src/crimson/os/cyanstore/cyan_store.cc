@@ -334,8 +334,9 @@ CyanStore::omap_get_header(CollectionRef ch,
     o->omap_header);
 }
 
-seastar::future<> CyanStore::do_transaction(CollectionRef ch,
-                                            ceph::os::Transaction&& t)
+seastar::future<> CyanStore::do_transaction_no_callbacks(
+  CollectionRef ch,
+  ceph::os::Transaction&& t)
 {
   using ceph::os::Transaction;
   int r = 0;
@@ -357,6 +358,7 @@ seastar::future<> CyanStore::do_transaction(CollectionRef ch,
       }
       break;
       case Transaction::OP_TOUCH:
+      case Transaction::OP_CREATE:
       {
         coll_t cid = i.get_cid(op->cid);
         ghobject_t oid = i.get_oid(op->oid);
@@ -521,14 +523,6 @@ seastar::future<> CyanStore::do_transaction(CollectionRef ch,
     logger().error("{}", str.str());
     ceph_assert(r == 0);
   }
-  for (auto i : {
-      t.get_on_applied(),
-      t.get_on_commit(),
-      t.get_on_applied_sync()}) {
-    if (i) {
-      i->complete(0);
-    }
-  }
   return seastar::now();
 }
 
@@ -687,7 +681,7 @@ int CyanStore::_omap_rmkeyrange(
 
   ObjectRef o = c->get_or_create_object(oid);
   for (auto i = o->omap.lower_bound(first);
-       i != o->omap.end() && i->first <= last;
+       i != o->omap.end() && i->first < last;
        o->omap.erase(i++));
   return 0;
 }

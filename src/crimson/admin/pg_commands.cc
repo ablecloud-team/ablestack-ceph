@@ -18,6 +18,7 @@
 using crimson::osd::OSD;
 using crimson::osd::PG;
 using namespace crimson::common;
+using ceph::common::cmd_getval;
 
 
 namespace crimson::admin::pg {
@@ -50,7 +51,7 @@ public:
         tell_result_t{-EINVAL, fmt::format("couldn't parse pgid '{}'", pgid_str)});
     }
     // am i the primary for this pg?
-    const auto osdmap = osd.get_shard_services().get_osdmap();
+    const auto osdmap = osd.get_shard_services().get_map();
     spg_t spg_id;
     if (!osdmap->get_primary_shard(pgid, &spg_id)) {
       return seastar::make_ready_future<tell_result_t>(tell_result_t{

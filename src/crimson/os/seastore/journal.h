@@ -17,14 +17,11 @@ class RBMDevice;
 
 class SegmentManagerGroup;
 class SegmentProvider;
-
-enum class journal_type_t {
-  SEGMENT_JOURNAL = 0,
-  CIRCULARBOUNDED_JOURNAL
-};
+class JournalTrimmer;
 
 class Journal {
 public:
+  virtual JournalTrimmer &get_trimmer() = 0;
   /**
    * initializes journal for mkfs writes -- must run prior to calls
    * to submit_record.
@@ -100,6 +97,9 @@ public:
   virtual replay_ret replay(
     delta_handler_t &&delta_handler) = 0;
 
+  virtual seastar::future<> finish_commit(
+    transaction_type_t type) = 0;
+
   virtual ~Journal() {}
 
   virtual journal_type_t get_type() = 0;
@@ -108,9 +108,12 @@ using JournalRef = std::unique_ptr<Journal>;
 
 namespace journal {
 
-JournalRef make_segmented(SegmentProvider &provider);
+JournalRef make_segmented(
+  SegmentProvider &provider,
+  JournalTrimmer &trimmer);
 
 JournalRef make_circularbounded(
+  JournalTrimmer &trimmer,
   crimson::os::seastore::random_block_device::RBMDevice* device,
   std::string path);
 

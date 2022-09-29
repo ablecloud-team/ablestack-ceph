@@ -12,6 +12,7 @@
  *
  */
 
+#include <bit>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -4600,7 +4601,7 @@ BlueStore::BlueStore(CephContext *cct,
     zoned_cleaner_thread(this),
 #endif
     min_alloc_size(_min_alloc_size),
-    min_alloc_size_order(ctz(_min_alloc_size)),
+    min_alloc_size_order(std::countr_zero(_min_alloc_size)),
     mempool_thread(this)
 {
   _init_logger();
@@ -5374,13 +5375,14 @@ int BlueStore::_write_bdev_label(CephContext *cct,
   z.zero();
   bl.append(std::move(z));
 
-  int fd = TEMP_FAILURE_RETRY(::open(path.c_str(), O_WRONLY|O_CLOEXEC));
+  int fd = TEMP_FAILURE_RETRY(::open(path.c_str(), O_WRONLY|O_CLOEXEC|O_DIRECT));
   if (fd < 0) {
     fd = -errno;
     derr << __func__ << " failed to open " << path << ": " << cpp_strerror(fd)
 	 << dendl;
     return fd;
   }
+  bl.rebuild_aligned_size_and_memory(BDEV_LABEL_BLOCK_SIZE, BDEV_LABEL_BLOCK_SIZE, IOV_MAX);
   int r = bl.write_fd(fd);
   if (r < 0) {
     derr << __func__ << " failed to write to " << path
@@ -5427,7 +5429,7 @@ int BlueStore::_read_bdev_label(CephContext* cct, const string &path,
     decode(expected_crc, p);
   }
   catch (ceph::buffer::error& e) {
-    dout(2) << __func__ << " unable to decode label at offset " << p.get_off()
+    derr << __func__ << " unable to decode label at offset " << p.get_off()
 	 << ": " << e.what()
 	 << dendl;
     return -ENOENT;
@@ -5530,7 +5532,7 @@ int BlueStore::_open_bdev(bool create)
   // initialize global block parameters
   block_size = bdev->get_block_size();
   block_mask = ~(block_size - 1);
-  block_size_order = ctz(block_size);
+  block_size_order = std::countr_zero(block_size);
   ceph_assert(block_size == 1u << block_size_order);
   _set_max_defer_interval();
   // and set cache_size based on device type
@@ -7077,7 +7079,7 @@ int BlueStore::mkfs()
   _validate_bdev();
 
   // make sure min_alloc_size is power of 2 aligned.
-  if (!isp2(min_alloc_size)) {
+  if (!std::has_single_bit(min_alloc_size)) {
     derr << __func__ << " min_alloc_size 0x"
 	 << std::hex << min_alloc_size << std::dec
 	 << " is not power of 2 aligned!"
@@ -12300,7 +12302,7 @@ int BlueStore::_open_super_meta()
       uint64_t val;
       decode(val, p);
       min_alloc_size = val;
-      min_alloc_size_order = ctz(val);
+      min_alloc_size_order = std::countr_zero(val);
       min_alloc_size_mask  = min_alloc_size - 1;
 
       ceph_assert(min_alloc_size == 1u << min_alloc_size_order);
@@ -15586,7 +15588,7 @@ int BlueStore::_do_alloc_write(
     if (wi.compressed) {
       final_length = wi.compressed_bl.length();
       csum_length = final_length;
-      unsigned csum_order = ctz(csum_length);
+      unsigned csum_order = std::countr_zero(csum_length);
       l = &wi.compressed_bl;
       dblob.set_compressed(wi.blob_length, wi.compressed_len);
       if (csum != Checksummer::CSUM_NONE) {
@@ -15610,7 +15612,7 @@ int BlueStore::_do_alloc_write(
                 << block_size_order << dendl;
 	csum_order = block_size_order;
       } else {
-        csum_order = std::min(wctx->csum_order, ctz(l->length()));
+        csum_order = std::min<unsigned>(wctx->csum_order, std::countr_zero(l->length()));
       }
       // try to align blob with max_blob_size to improve
       // its reuse ratio, e.g. in case of reverse write
@@ -15943,7 +15945,7 @@ void BlueStore::_choose_write_options(
 
     if (o->onode.expected_write_size) {
       wctx->csum_order = std::max(min_alloc_size_order,
-			          (uint8_t)ctz(o->onode.expected_write_size));
+			          (uint8_t)std::countr_zero(o->onode.expected_write_size));
     } else {
       wctx->csum_order = min_alloc_size_order;
     }
@@ -19006,7 +19008,7 @@ int BlueStore::reconstruct_allocations(SimpleBitmap *sbmap, read_alloc_stats_t &
 //-----------------------------------------------------------------------------------
 static void copy_simple_bitmap_to_allocator(SimpleBitmap* sbmap, Allocator* dest_alloc, uint64_t alloc_size)
 {
-  int alloc_size_shift = ctz(alloc_size);
+  int alloc_size_shift = std::countr_zero(alloc_size);
   uint64_t offset = 0;
   extent_t ext    = sbmap->get_next_clr_extent(offset);
   while (ext.length != 0) {

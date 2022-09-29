@@ -105,7 +105,11 @@ public:
   }
 
   device_type_t get_device_type() const final {
-    return device_type_t::RANDOM_BLOCK;
+    return device_type_t::RANDOM_BLOCK_SSD;
+  }
+
+  backend_type_t get_backend_type() const final {
+    return backend_type_t::RANDOM_BLOCK;
   }
 
   const seastore_meta_t &get_meta() const final {
@@ -115,7 +119,7 @@ public:
   secondary_device_set_t& get_secondary_devices() final {
     return devices;
   }
-  std::size_t get_size() const { return size; }
+  std::size_t get_available_size() const { return size; }
   seastore_off_t get_block_size() const { return block_size; }
 
   virtual read_ertr::future<> read(
@@ -154,7 +158,9 @@ public:
 class TestMemory : public RBMDevice {
 public:
 
-  TestMemory(size_t size) : buf(nullptr), size(size) {}
+  TestMemory(size_t size) : buf(nullptr) {
+    RBMDevice::size = size;
+  }
   ~TestMemory() {
     if (buf) {
       ::munmap(buf, size);
@@ -167,7 +173,15 @@ public:
   }
 
   mount_ret mount() final {
-    return mount_ertr::now();
+    return open("", seastar::open_flags::rw
+    ).safe_then([]() {
+      return mount_ertr::now();
+    }).handle_error(
+      mount_ertr::pass_further{},
+      crimson::ct_error::assert_all{
+	"Invalid error mount"
+      }
+    );
   }
 
   open_ertr::future<> open(
@@ -192,6 +206,5 @@ public:
     uint16_t stream = 0) final;
 
   char *buf;
-  size_t size;
 };
 }

@@ -1148,6 +1148,24 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_nfs_frontends
+  type: str
+  level: basic
+  desc: RGW frontends configuration when running as librgw/nfs
+  long_desc: A comma-delimited list of frontends configuration. Each configuration
+    contains the type of the frontend followed by an optional space delimited set
+    of key=value config parameters.
+  fmt_desc: Configures the HTTP frontend(s). The configuration for multiple
+    frontends can be provided in a comma-delimited list. Each frontend
+    configuration may include a list of options separated by spaces,
+    where each option is in the form "key=value" or "key". See
+    `HTTP Frontends`_ for more on supported options.
+  default: rgw-nfs
+  services:
+  - rgw
+  with_legacy: true
+  see_also:
+  - rgw_frontends
 - name: rgw_rados_pool_autoscale_bias
   type: float
   level: advanced
@@ -2395,6 +2413,13 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_sync_data_full_inject_err_probability
+  type: float
+  level: dev
+  default: 0
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_sync_trace_history_size
   type: size
   level: advanced
@@ -3448,7 +3473,7 @@ options:
   type: str
   level: advanced
   desc: experimental Option to set backend store type
-  long_desc: defaults to rados. Other valid values are dbstore and motr (both experimental).
+  long_desc: defaults to rados. Other valid values are dbstore, motr, and daos (All experimental).
   default: rados
   services:
   - rgw
@@ -3456,6 +3481,7 @@ options:
   - rados
   - dbstore
   - motr
+  - daos
 - name: rgw_filter
   type: str
   level: advanced
@@ -3568,3 +3594,25 @@ options:
   - rgw
   - osd
   with_legacy: true
+- name: rgw_allow_notification_secrets_in_cleartext
+  type: bool
+  level: advanced
+  desc: Allows sending secrets (e.g. passwords) over non encrypted HTTP messages.
+  long_desc: When bucket notification endpoint require secrets (e.g. passwords),
+    we allow the topic creation only over HTTPS messages. 
+    This parameter can be set to "true" to bypass this check.
+    Use this only if radosgw is on a trusted private network, and the message 
+    broker cannot be configured without password authentication. Otherwise, this will 
+    leak the credentials of your message broker and compromise its security.
+  default: false
+  services:
+  - rgw
+  see_also:
+  - rgw_trust_forwarded_https
+- name: daos_pool
+  type: str
+  level: advanced
+  desc: DAOS Pool to use
+  default: tank
+  services:
+  - rgw

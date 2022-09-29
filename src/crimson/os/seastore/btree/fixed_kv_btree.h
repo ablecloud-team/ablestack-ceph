@@ -836,7 +836,8 @@ public:
        * against the real final address.
        */
       n_fixed_kv_extent->resolve_relative_addrs(
-        make_record_relative_paddr(0) - n_fixed_kv_extent->get_paddr());
+        make_record_relative_paddr(0).block_relative_to(
+          n_fixed_kv_extent->get_paddr()));
       
       SUBTRACET(
         seastore_fixedkv_tree,
@@ -1419,6 +1420,7 @@ private:
 
       root.set_location(nroot->get_paddr());
       root.set_depth(iter.get_depth());
+      ceph_assert(root.get_depth() <= MAX_FIXEDKVBTREE_DEPTH);
       get_tree_stats<self_type>(c.trans).depth = iter.get_depth();
       get_tree_stats<self_type>(c.trans).extents_num_delta++;
       root_dirty = true;

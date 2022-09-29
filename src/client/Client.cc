@@ -211,6 +211,7 @@ Client::CommandHook::CommandHook(Client *client) :
 int Client::CommandHook::call(
   std::string_view command,
   const cmdmap_t& cmdmap,
+  const bufferlist&,
   Formatter *f,
   std::ostream& errss,
   bufferlist& out)
@@ -1889,7 +1890,8 @@ int Client::make_request(MetaRequest *request,
 			 const UserPerm& perms,
 			 InodeRef *ptarget, bool *pcreated,
 			 mds_rank_t use_mds,
-			 bufferlist *pdirbl)
+			 bufferlist *pdirbl,
+			 size_t feature_needed)
 {
   int r = 0;
 
@@ -1973,6 +1975,11 @@ int Client::make_request(MetaRequest *request,
       session = mds_sessions.at(mds);
     }
 
+    if (feature_needed != ULONG_MAX && !session->mds_features.test(feature_needed)) {
+      request->abort(-CEPHFS_EOPNOTSUPP);
+      break;
+    }
+
     // send request.
     send_request(request, session.get());
 
@@ -1989,7 +1996,7 @@ int Client::make_request(MetaRequest *request,
     request->caller_cond = nullptr;
 
     // did we get a reply?
-    if (request->reply) 
+    if (request->reply)
       break;
   }
 
@@ -4583,7 +4590,10 @@ public:
   explicit C_Client_Remount(Client *c) : client(c) {}
   void finish(int r) override {
     ceph_assert(r == 0);
-    client->_do_remount(true);
+    auto result = client->_do_remount(true);
+    if (result.second) {
+      ceph_abort();
+    }
   }
 };
 
@@ -6664,6 +6674,17 @@ void Client::_unmount(bool abort)
 
   mref_writer.update_state(CLIENT_UNMOUNTED);
 
+  /*
+   * Stop the remount_queue before clearing the mountpoint memory
+   * to avoid possible use-after-free bug.
+   */
+  if (remount_cb) {
+    ldout(cct, 10) << "unmount stopping remount finisher" << dendl;
+    remount_finisher.wait_for_empty();
+    remount_finisher.stop();
+    remount_cb = nullptr;
+  }
+
   ldout(cct, 2) << "unmounted." << dendl;
 }
 
@@ -7652,10 +7673,14 @@ int Client::_getvxattr(
   req->set_string2(xattr_name);
 
   bufferlist bl;
-  int res = make_request(req, perms, nullptr, nullptr, rank, &bl);
+  int res = make_request(req, perms, nullptr, nullptr, rank, &bl,
+                         CEPHFS_FEATURE_OP_GETVXATTR);
   ldout(cct, 10) << __func__ << " result=" << res << dendl;
 
   if (res < 0) {
+    if (res == -CEPHFS_EOPNOTSUPP) {
+      return -CEPHFS_ENODATA;
+    }
     return res;
   }
 
@@ -10191,7 +10216,6 @@ int64_t Client::_read(Fh *f, int64_t offset, uint64_t size, bufferlist *bl)
 
   int want, have = 0;
   bool movepos = false;
-  std::unique_ptr<C_SaferCond> onuninline;
   int64_t rc = 0;
   const auto& conf = cct->_conf;
   Inode *in = f->inode.get();
@@ -10234,31 +10258,26 @@ retry:
     have &= ~(CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO);
 
   if (in->inline_version < CEPH_INLINE_NONE) {
-    if (!(have & CEPH_CAP_FILE_CACHE)) {
-      onuninline.reset(new C_SaferCond("Client::_read_uninline_data flock"));
-      uninline_data(in, onuninline.get());
-    } else {
-      uint32_t len = in->inline_data.length();
-      uint64_t endoff = offset + size;
-      if (endoff > in->size)
-        endoff = in->size;
+    uint32_t len = in->inline_data.length();
+    uint64_t endoff = offset + size;
+    if (endoff > in->size)
+      endoff = in->size;
 
-      if (offset < len) {
-        if (endoff <= len) {
-          bl->substr_of(in->inline_data, offset, endoff - offset);
-        } else {
-          bl->substr_of(in->inline_data, offset, len - offset);
-          bl->append_zero(endoff - len);
-        }
-        rc = endoff - offset;
-      } else if ((uint64_t)offset < endoff) {
-        bl->append_zero(endoff - offset);
-        rc = endoff - offset;
+    if (offset < len) {
+      if (endoff <= len) {
+        bl->substr_of(in->inline_data, offset, endoff - offset);
       } else {
-        rc = 0;
+        bl->substr_of(in->inline_data, offset, len - offset);
+        bl->append_zero(endoff - len);
       }
-      goto success;
+      rc = endoff - offset;
+    } else if ((uint64_t)offset < endoff) {
+      bl->append_zero(endoff - offset);
+      rc = endoff - offset;
+    } else {
+      rc = 0;
     }
+    goto success;
   }
 
   if (!conf->client_debug_force_sync_read &&
@@ -10316,19 +10335,6 @@ success:
 
 done:
   // done!
-  
-  if (onuninline) {
-    client_lock.unlock();
-    int ret = onuninline->wait();
-    client_lock.lock();
-    if (ret >= 0 || ret == -CEPHFS_ECANCELED) {
-      in->inline_data.clear();
-      in->inline_version = CEPH_INLINE_NONE;
-      in->mark_caps_dirty(CEPH_CAP_FILE_WR);
-      check_caps(in, 0);
-    } else
-      rc = ret;
-  }
   if (have) {
     put_cap_ref(in, CEPH_CAP_FILE_RD);
   }
@@ -11214,7 +11220,7 @@ int Client::statfs(const char *path, struct statvfs *stbuf,
   // quota but we can see a parent of it that does have a quota, we'll
   // respect that one instead.
   ceph_assert(root != nullptr);
-  InodeRef quota_root = root->quota.is_enable() ? root : get_quota_root(root.get(), perms);
+  InodeRef quota_root = root->quota.is_enabled(QUOTA_MAX_BYTES) ? root : get_quota_root(root.get(), perms, QUOTA_MAX_BYTES);
 
   // get_quota_root should always give us something if client quotas are
   // enabled
@@ -12838,7 +12844,7 @@ int Client::_setxattr(Inode *in, const char *name, const void *value,
   int ret = _do_setxattr(in, name, value, size, flags, perms);
   if (ret >= 0 && check_realm) {
     // check if snaprealm was created for quota inode
-    if (in->quota.is_enable() &&
+    if (in->quota.is_enabled() &&
 	!(in->snaprealm && in->snaprealm->ino == in->ino))
       ret = -CEPHFS_EOPNOTSUPP;
   }
@@ -13067,7 +13073,7 @@ int Client::_vxattrcb_fscrypt_file_set(Inode *in, const void *val, size_t size,
 
 bool Client::_vxattrcb_quota_exists(Inode *in)
 {
-  return in->quota.is_enable() &&
+  return in->quota.is_enabled() &&
    (in->snapid != CEPH_NOSNAP ||
     (in->snaprealm && in->snaprealm->ino == in->ino));
 }
@@ -14076,9 +14082,9 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
   }
   if (cct->_conf.get_val<bool>("client_quota") && fromdir != todir) {
     Inode *fromdir_root =
-      fromdir->quota.is_enable() ? fromdir : get_quota_root(fromdir, perm);
+      fromdir->quota.is_enabled(QUOTA_MAX_FILES) ? fromdir : get_quota_root(fromdir, perm, QUOTA_MAX_FILES);
     Inode *todir_root =
-      todir->quota.is_enable() ? todir : get_quota_root(todir, perm);
+      todir->quota.is_enabled(QUOTA_MAX_FILES) ? todir : get_quota_root(todir, perm, QUOTA_MAX_FILES);
     if (fromdir_root != todir_root) {
       return -CEPHFS_EXDEV;
     }
@@ -15461,7 +15467,7 @@ bool Client::ms_handle_refused(Connection *con)
   return false;
 }
 
-Inode *Client::get_quota_root(Inode *in, const UserPerm& perms)
+Inode *Client::get_quota_root(Inode *in, const UserPerm& perms, quota_max_t type)
 {
   Inode *quota_in = root_ancestor;
   SnapRealm *realm = in->snaprealm;
@@ -15476,7 +15482,7 @@ Inode *Client::get_quota_root(Inode *in, const UserPerm& perms)
       if (p == inode_map.end())
 	break;
 
-      if (p->second->quota.is_enable()) {
+      if (p->second->quota.is_enabled(type)) {
 	quota_in = p->second;
 	break;
       }

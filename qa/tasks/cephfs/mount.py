@@ -41,7 +41,6 @@ class CephFSMount(object):
         :param cephfs_mntpt: Path to directory inside Ceph FS that will be
                              mounted as root
         """
-        self.mounted = False
         self.ctx = ctx
         self.test_dir = test_dir
 
@@ -169,8 +168,35 @@ class CephFSMount(object):
                      get_file(self.client_remote, self.client_keyring_path,
                               sudo=True).decode())
 
+    def is_blocked(self):
+        self.fs = Filesystem(self.ctx, name=self.cephfs_name)
+
+        output = self.fs.mon_manager.raw_cluster_cmd(args='osd blocklist ls')
+        return self.addr in output
+
+    def is_stuck(self):
+        """
+        Check if mount is stuck/in a hanged state.
+        """
+        if not self.is_mounted():
+            return False
+
+        retval = self.client_remote.run(args=f'sudo stat {self.hostfs_mntpt}',
+                                        omit_sudo=False, wait=False).returncode
+        if retval == 0:
+            return False
+
+        time.sleep(10)
+        proc = self.client_remote.run(args='ps -ef', stdout=StringIO())
+        # if proc was running even after 10 seconds, it has to be stuck.
+        if f'stat {self.hostfs_mntpt}' in proc.stdout.getvalue():
+            log.critical('client mounted at self.hostfs_mntpt is stuck!')
+            return True
+        return False
+
     def is_mounted(self):
-        return self.mounted
+        return self.hostfs_mntpt in \
+            self.client_remote.read_file('/proc/self/mounts',stdout=StringIO())
 
     def setupfs(self, name=None):
         if name is None and self.fs is not None:
@@ -453,6 +479,19 @@ class CephFSMount(object):
         self.mount(**kwargs)
         self.wait_until_mounted()
 
+    def _run_umount_lf(self):
+        log.debug(f'Force/lazy unmounting on client.{self.client_id}')
+
+        try:
+            proc = self.client_remote.run(
+                args=f'sudo umount --lazy --force {self.hostfs_mntpt}',
+                timeout=UMOUNT_TIMEOUT, omit_sudo=False)
+        except CommandFailedError:
+            if self.is_mounted():
+                raise
+
+        return proc
+
     def umount(self):
         raise NotImplementedError()
 
@@ -518,7 +557,7 @@ class CephFSMount(object):
         exception: wait accepted too which can be True or False.
         """
         self.umount_wait()
-        assert not self.mounted
+        assert not self.is_mounted()
 
         mntopts = kwargs.pop('mntopts', [])
         check_status = kwargs.pop('check_status', True)

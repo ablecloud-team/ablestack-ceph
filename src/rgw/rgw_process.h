@@ -18,14 +18,8 @@
 
 #include <atomic>
 
-#if !defined(dout_subsys)
-#define dout_subsys ceph_subsys_rgw
-#define def_dout_subsys
-#endif
-
 #define dout_context g_ceph_context
 
-extern void signal_shutdown();
 
 namespace rgw::dmclock {
   class Scheduler;
@@ -63,6 +57,7 @@ protected:
   int sock_fd;
   std::string uri_prefix;
   rgw::lua::Background* lua_background;
+  std::unique_ptr<rgw::sal::LuaManager> lua_manager;
 
   struct RGWWQ : public DoutPrefixProvider, public ThreadPool::WorkQueue<RGWRequest> {
     RGWProcess* process;
@@ -115,6 +110,7 @@ public:
       sock_fd(-1),
       uri_prefix(pe->uri_prefix),
       lua_background(pe->lua_background),
+      lua_manager(store->get_lua_manager()),
       req_wq(this,
 	     ceph::make_timespan(g_conf()->rgw_op_thread_timeout),
 	     ceph::make_timespan(g_conf()->rgw_op_thread_suicide_timeout),
@@ -134,6 +130,7 @@ public:
                                rgw_auth_registry_ptr_t auth_registry) {
     this->store = store;
     this->auth_registry = std::move(auth_registry);
+    lua_manager = store->get_lua_manager();
     m_tp.unpause();
   }
 
@@ -183,8 +180,9 @@ extern int process_request(rgw::sal::Store* store,
                            std::string* user,
                            ceph::coarse_real_clock::duration* latency,
                            std::shared_ptr<RateLimiter> ratelimit,
-                           int* http_ret = nullptr,
-                           rgw::lua::Background* lua_background = nullptr);
+                           rgw::lua::Background* lua_background,
+                           std::unique_ptr<rgw::sal::LuaManager>& lua_manager,
+                           int* http_ret = nullptr);
 
 extern int rgw_process_authenticated(RGWHandler_REST* handler,
                                      RGWOp*& op,
@@ -194,10 +192,6 @@ extern int rgw_process_authenticated(RGWHandler_REST* handler,
                                      rgw::sal::Store* store,
                                      bool skip_retarget = false);
 
-#if defined(def_dout_subsys)
-#undef def_dout_subsys
-#undef dout_subsys
-#endif
 #undef dout_context
 
 #endif /* RGW_PROCESS_H */

@@ -2007,7 +2007,7 @@ void MDCache::broadcast_quota_to_client(CInode *in, client_t exclude_ct, bool qu
     return;
 
   const auto& pi = in->get_projected_inode();
-  if (!pi->quota.is_enable() && !quota_change)
+  if (!pi->quota.is_enabled() && !quota_change)
     return;
 
   // creaete snaprealm for quota inode (quota was set before mimic)
@@ -9652,9 +9652,14 @@ MDRequestRef MDCache::request_start_internal(int op)
   MDRequestRef mdr =
       mds->op_tracker.create_request<MDRequestImpl,MDRequestImpl::Params*>(&params);
 
-  ceph_assert(active_requests.count(mdr->reqid) == 0);
+  if (active_requests.count(mdr->reqid)) {
+    auto& _mdr = active_requests[mdr->reqid];
+    dout(0) << __func__ << " existing " << *_mdr << " op " << _mdr->internal_op << dendl;
+    dout(0) << __func__ << " new " << *mdr << " op " << op << dendl;
+    ceph_abort();
+  }
   active_requests[mdr->reqid] = mdr;
-  dout(7) << "request_start_internal " << *mdr << " op " << op << dendl;
+  dout(7) << __func__ << " " << *mdr << " op " << op << dendl;
   return mdr;
 }
 

@@ -12,7 +12,7 @@ from typing import Callable, Dict, List, Optional
 
 with mock.patch('builtins.open', create=True):
     from importlib.machinery import SourceFileLoader
-    cd = SourceFileLoader('cephadm', 'cephadm').load_module()
+    cd = SourceFileLoader('cephadm', 'cephadm.py').load_module()
 
 
 def mock_docker():
@@ -126,9 +126,10 @@ def with_cephadm_ctx(
          mock.patch('cephadm.call', return_value=('', '', 0)), \
          mock.patch('cephadm.call_timeout', return_value=0), \
          mock.patch('cephadm.find_executable', return_value='foo'), \
-         mock.patch('cephadm.is_available', return_value=True), \
          mock.patch('cephadm.get_container_info', return_value=None), \
+         mock.patch('cephadm.is_available', return_value=True), \
          mock.patch('cephadm.json_loads_retry', return_value={'epoch' : 1}), \
+         mock.patch('cephadm.logger'), \
          mock.patch('socket.gethostname', return_value=hostname):
         ctx: cd.CephadmContext = cd.cephadm_init_ctx(cmd)
         ctx.container_engine = container_engine

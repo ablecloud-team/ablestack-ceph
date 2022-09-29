@@ -70,6 +70,8 @@ export class TableComponent implements AfterContentChecked, OnInit, OnChanges, O
   timeAgoTpl: TemplateRef<any>;
   @ViewChild('rowDetailsTpl', { static: true })
   rowDetailsTpl: TemplateRef<any>;
+  @ViewChild('rowSelectionTpl', { static: true })
+  rowSelectionTpl: TemplateRef<any>;
 
   // This is the array with the items to be shown.
   @Input()
@@ -101,6 +103,8 @@ export class TableComponent implements AfterContentChecked, OnInit, OnChanges, O
   // Page size to show. Set to 0 to show unlimited number of rows.
   @Input()
   limit? = 10;
+  @Input()
+  maxLimit? = 9999;
   // Has the row details?
   @Input()
   hasDetails = false;
@@ -430,9 +434,10 @@ export class TableComponent implements AfterContentChecked, OnInit, OnChanges, O
         resizeable: false,
         sortable: false,
         draggable: false,
-        checkboxable: true,
+        checkboxable: false,
         canAutoResize: false,
         cellClass: 'cd-datatable-checkbox',
+        cellTemplate: this.rowSelectionTpl,
         width: 30
       });
     }
@@ -630,7 +635,13 @@ export class TableComponent implements AfterContentChecked, OnInit, OnChanges, O
   setLimit(e: any) {
     const value = Number(e.target.value);
     if (value > 0) {
-      this.userConfig.limit = value;
+      if (this.maxLimit && value > this.maxLimit) {
+        this.userConfig.limit = this.maxLimit;
+        // change input field to maxLimit
+        e.srcElement.value = this.maxLimit;
+      } else {
+        this.userConfig.limit = value;
+      }
     }
     if (this.serverSide) {
       this.reloadData();

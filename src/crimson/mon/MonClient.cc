@@ -140,9 +140,7 @@ seastar::future<> Connection::renew_tickets()
     logger().info("{}: retrieving new tickets", __func__);
     return do_auth(request_t::general).then([](const auth_result_t r) {
       if (r == auth_result_t::failure)  {
-        throw std::system_error(
-	  make_error_code(
-	    crimson::net::error::negotiation_failure));
+        logger().info("renew_tickets: ignoring failed auth reply");
       }
     });
   } else {
@@ -174,8 +172,7 @@ seastar::future<> Connection::renew_rotating_keyring()
   last_rotating_renew_sent = now;
   return do_auth(request_t::rotating).then([](const auth_result_t r) {
     if (r == auth_result_t::failure)  {
-      throw std::system_error(make_error_code(
-        crimson::net::error::negotiation_failure));
+      logger().info("renew_rotating_keyring: ignoring failed auth reply");
     }
   });
 }
@@ -414,8 +411,8 @@ crimson::net::ConnectionRef Connection::get_conn() {
   return conn;
 }
 
-Client::mon_command_t::mon_command_t(ceph::ref_t<MMonCommand> req)
-  : req(req)
+Client::mon_command_t::mon_command_t(MURef<MMonCommand> req)
+  : req(std::move(req))
 {}
 
 Client::Client(crimson::net::Messenger& messenger,
@@ -1078,7 +1075,7 @@ Client::run_command(std::string&& cmd,
   m->set_tid(tid);
   m->cmd = {std::move(cmd)};
   m->set_data(std::move(bl));
-  auto& command = mon_commands.emplace_back(ceph::make_message<MMonCommand>(*m));
+  auto& command = mon_commands.emplace_back(crimson::make_message<MMonCommand>(*m));
   return send_message(std::move(m)).then([&result=command.result] {
     return result.get_future();
   });

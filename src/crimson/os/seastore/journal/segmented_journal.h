@@ -24,8 +24,14 @@ namespace crimson::os::seastore::journal {
  */
 class SegmentedJournal : public Journal {
 public:
-  SegmentedJournal(SegmentProvider &segment_provider);
+  SegmentedJournal(
+      SegmentProvider &segment_provider,
+      JournalTrimmer &trimmer);
   ~SegmentedJournal() {}
+
+  JournalTrimmer &get_trimmer() final {
+    return trimmer;
+  }
 
   open_for_mkfs_ret open_for_mkfs() final;
 
@@ -46,7 +52,10 @@ public:
   }
 
   journal_type_t get_type() final {
-    return journal_type_t::SEGMENT_JOURNAL;
+    return journal_type_t::SEGMENTED;
+  }
+  seastar::future<> finish_commit(transaction_type_t type) {
+    return seastar::now();
   }
 
 private:
@@ -55,11 +64,11 @@ private:
     OrderingHandle &handle
   );
 
-  SegmentProvider& segment_provider;
   SegmentSeqAllocatorRef segment_seq_allocator;
   SegmentAllocator journal_segment_allocator;
   RecordSubmitter record_submitter;
   SegmentManagerGroup &sm_group;
+  JournalTrimmer &trimmer;
   WritePipeline* write_pipeline = nullptr;
 
   /// return ordered vector of segments to replay

@@ -425,6 +425,9 @@ class TunedProfileStore():
             self.profiles[k] = TunedProfileSpec.from_json(v)
             self.profiles[k]._last_updated = datetime_to_str(datetime_now())
 
+    def exists(self, profile_name: str) -> bool:
+        return profile_name in self.profiles
+
     def save(self) -> None:
         profiles_json = {k: v.to_json() for k, v in self.profiles.items()}
         self.mgr.set_store('tuned_profiles', json.dumps(profiles_json))
@@ -936,6 +939,15 @@ class HostCache():
             h for h in self.mgr.inventory.all_specs() if '_no_schedule' not in h.labels
         ]
 
+    def get_draining_hosts(self) -> List[HostSpec]:
+        """
+        Returns all hosts that have _no_schedule label and therefore should have
+        no daemons placed on them, but are potentially still reachable
+        """
+        return [
+            h for h in self.mgr.inventory.all_specs() if '_no_schedule' in h.labels
+        ]
+
     def get_unreachable_hosts(self) -> List[HostSpec]:
         """
         Return all hosts that are offline or in maintenance mode.
@@ -1224,6 +1236,7 @@ class HostCache():
             'reconfig': 3,
             'redeploy': 4,
             'stop': 5,
+            'rotate-key': 6,
         }
         existing_action = self.scheduled_daemon_actions.get(host, {}).get(daemon_name, None)
         if existing_action and priorities[existing_action] > priorities[action]:

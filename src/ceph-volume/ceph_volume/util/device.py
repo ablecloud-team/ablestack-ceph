@@ -85,6 +85,7 @@ class Device(object):
         'lsm_data',
     ]
     pretty_report_sys_fields = [
+        'actuators',
         'human_readable_size',
         'model',
         'removable',
@@ -111,7 +112,10 @@ class Device(object):
             if "dm-" not in real_path:
                 self.path = real_path
         if not sys_info.devices:
-            sys_info.devices = disk.get_devices()
+            if self.path:
+                sys_info.devices = disk.get_devices(device=self.path)
+            else:
+                sys_info.devices = disk.get_devices()
         if sys_info.devices.get(self.path, {}):
             self.device_nodes = sys_info.devices[self.path]['device_nodes']
         self.sys_api = sys_info.devices.get(self.path, {})
@@ -127,9 +131,9 @@ class Device(object):
         self.blkid_api = None
         self._exists = None
         self._is_lvm_member = None
+        self.ceph_device = False
         self._parse()
         self.lsm_data = self.fetch_lsm(with_lsm)
-        self.ceph_device = None
 
         self.available_lvm, self.rejected_reasons_lvm = self._check_lvm_reject_reasons()
         self.available_raw, self.rejected_reasons_raw = self._check_raw_reject_reasons()
@@ -216,6 +220,7 @@ class Device(object):
             self.lv_name = lv.name
             self.ceph_device = lvm.is_ceph_device(lv)
         else:
+            self.lvs = []
             if self.lsblk_all:
                 for dev in self.lsblk_all:
                     if dev['NAME'] == os.path.basename(self.path):
@@ -230,7 +235,6 @@ class Device(object):
                 valid_types.append('loop')
             if device_type in valid_types:
                 self._set_lvm_membership()
-            self.ceph_device = disk.has_bluestore_label(self.path)
 
         self.ceph_disk = CephDiskDevice(self)
 
@@ -343,6 +347,8 @@ class Device(object):
                     self.vg_name = vgs[0]
                     self._is_lvm_member = True
                     self.lvs.extend(lvm.get_device_lvs(path))
+                if self.lvs:
+                    self.ceph_device = any([True if lv.tags.get('ceph.osd_id') else False for lv in self.lvs])
 
     def _get_partitions(self):
         """

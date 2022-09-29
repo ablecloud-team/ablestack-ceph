@@ -167,9 +167,9 @@ rgw_raw_obj rgw_obj_select::get_raw_obj(rgw::sal::RadosStore* store) const
   return raw_obj;
 }
 
-void RGWObjVersionTracker::prepare_op_for_read(ObjectReadOperation *op)
+void RGWObjVersionTracker::prepare_op_for_read(ObjectReadOperation* op)
 {
-  obj_version *check_objv = version_for_check();
+  obj_version* check_objv = version_for_check();
 
   if (check_objv) {
     cls_version_check(*op, *check_objv, VER_COND_EQ);
@@ -180,8 +180,8 @@ void RGWObjVersionTracker::prepare_op_for_read(ObjectReadOperation *op)
 
 void RGWObjVersionTracker::prepare_op_for_write(ObjectWriteOperation *op)
 {
-  obj_version *check_objv = version_for_check();
-  obj_version *modify_version = version_for_write();
+  obj_version* check_objv = version_for_check();
+  obj_version* modify_version = version_for_write();
 
   if (check_objv) {
     cls_version_check(*op, *check_objv, VER_COND_EQ);
@@ -263,10 +263,10 @@ void RGWObjectCtx::invalidate(const rgw_obj& obj) {
   }
 }
 
-void RGWObjVersionTracker::generate_new_write_ver(CephContext *cct)
+void RGWObjVersionTracker::generate_new_write_ver(CephContext* cct)
 {
+  static constexpr auto TAG_LEN = 24;
   write_version.ver = 1;
-#define TAG_LEN 24
 
   write_version.tag.clear();
   append_rand_alpha(cct, write_version.tag, write_version.tag, TAG_LEN);
@@ -1038,6 +1038,12 @@ bool RGWIndexCompletionManager::handle_completion(completion_t cb, complete_op_d
 
 void RGWRados::finalize()
 {
+  /* Before joining any sync threads, drain outstanding requests &
+   * mark the async_processor as going_down() */
+  if (svc.rados) {
+    svc.rados->stop_processor();
+  }
+
   if (run_sync_thread) {
     std::lock_guard l{meta_sync_thread_lock};
     meta_sync_processor_thread->stop();
@@ -1826,12 +1832,12 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
   rgw_obj_index_key prev_marker;
   for (uint16_t attempt = 1; /* empty */; ++attempt) {
-    ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+    ldpp_dout(dpp, 20) << __func__ <<
       ": starting attempt " << attempt << dendl;
 
     if (attempt > 1 && !(prev_marker < cur_marker)) {
       // we've failed to make forward progress
-      ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+      ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
 	" marker failed to make forward progress; attempt=" << attempt <<
 	", prev_marker=" << prev_marker <<
 	", cur_marker=" << cur_marker << dendl;
@@ -1866,7 +1872,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
       rgw_obj_index_key index_key = entry.key;
       rgw_obj_key obj(index_key);
 
-      ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+      ldpp_dout(dpp, 20) << __func__ <<
 	": considering entry " << entry.key << dendl;
 
       /* note that parse_raw_oid() here will not set the correct
@@ -1877,14 +1883,14 @@ int RGWRados::Bucket::List::list_objects_ordered(
        */
       bool valid = rgw_obj_key::parse_raw_oid(index_key.name, &obj);
       if (!valid) {
-        ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+        ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
 	  " could not parse object name: " << obj.name << dendl;
         continue;
       }
 
       bool matched_ns = (obj.ns == params.ns);
       if (!params.list_versions && !entry.is_visible()) {
-        ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+        ldpp_dout(dpp, 10) << __func__ <<
 	  ": skipping not visible entry \"" << entry.key << "\"" << dendl;
         continue;
       }
@@ -1893,14 +1899,14 @@ int RGWRados::Bucket::List::list_objects_ordered(
         if (!params.ns.empty()) {
           /* we've iterated past the namespace we're searching -- done now */
           truncated = false;
-	  ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+	  ldpp_dout(dpp, 10) << __func__ <<
 	    ": finished due to getting past requested namespace \"" <<
 	    params.ns << "\"" << dendl;
           goto done;
         }
 
         /* we're skipping past namespaced objects */
-	ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	ldpp_dout(dpp, 20) << __func__ <<
 	  ": skipping past namespaced objects, including \"" << entry.key <<
 	  "\"" << dendl;
         continue;
@@ -1908,7 +1914,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
       if (cur_end_marker_valid && cur_end_marker <= index_key) {
         truncated = false;
-	ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+	ldpp_dout(dpp, 10) << __func__ <<
 	  ": finished due to gitting end marker of \"" << cur_end_marker <<
 	  "\" with \"" << entry.key << "\"" << dendl;
         goto done;
@@ -1921,7 +1927,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
       if (params.access_list_filter &&
 	  ! params.access_list_filter->filter(obj.name, index_key.name)) {
-	ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	ldpp_dout(dpp, 20) << __func__ <<
 	  ": skipping past namespaced objects, including \"" << entry.key <<
 	  "\"" << dendl;
         continue;
@@ -1929,7 +1935,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
       if (params.prefix.size() &&
 	  0 != obj.name.compare(0, params.prefix.size(), params.prefix)) {
-	ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	ldpp_dout(dpp, 20) << __func__ <<
 	  ": skipping object \"" << entry.key <<
 	  "\" that doesn't match prefix \"" << params.prefix << "\"" << dendl;
         continue;
@@ -1947,7 +1953,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	    // prefix
 	    if (delim_pos !=
 		int(obj.name.length() - params.delim.length())) {
-	      ldpp_dout(dpp, 0) << "WARNING: " << __PRETTY_FUNCTION__ <<
+	      ldpp_dout(dpp, 0) << "WARNING: " << __func__ <<
 		" found delimiter in place other than the end of "
 		"the prefix; obj.name=" << obj.name <<
 		", prefix=" << params.prefix << dendl;
@@ -1955,7 +1961,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	    if (common_prefixes) {
 	      if (count >= max) {
 		truncated = true;
-		ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+		ldpp_dout(dpp, 10) << __func__ <<
 		  ": stopping early with common prefix \"" << entry.key <<
 		  "\" because requested number (" << max <<
 		  ") reached (cls filtered)" << dendl;
@@ -1966,7 +1972,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	      count++;
 	    }
 
-	    ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	    ldpp_dout(dpp, 20) << __func__ <<
 	      ": finished entry with common prefix \"" << entry.key <<
 	      "\" so continuing loop (cls filtered)" << dendl;
 	    continue;
@@ -1985,7 +1991,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 		common_prefixes->find(prefix_key) == common_prefixes->end()) {
 	      if (count >= max) {
 		truncated = true;
-		ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+		ldpp_dout(dpp, 10) << __func__ <<
 		  ": stopping early with common prefix \"" << entry.key <<
 		  "\" because requested number (" << max <<
 		  ") reached (not cls filtered)" << dendl;
@@ -1997,7 +2003,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	      count++;
 	    }
 
-	    ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+	    ldpp_dout(dpp, 20) << __func__ <<
 	      ": finished entry with common prefix \"" << entry.key <<
 	      "\" so continuing loop (not cls filtered)" << dendl;
 	    continue;
@@ -2007,14 +2013,14 @@ int RGWRados::Bucket::List::list_objects_ordered(
 
       if (count >= max) {
         truncated = true;
-	ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+	ldpp_dout(dpp, 10) << __func__ <<
 	  ": stopping early with entry \"" << entry.key <<
 	  "\" because requested number (" << max <<
 	  ") reached" << dendl;
         goto done;
       }
 
-      ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+      ldpp_dout(dpp, 20) << __func__ <<
 	": adding entry " << entry.key << " to result" << dendl;
 
       result->emplace_back(std::move(entry));
@@ -2033,19 +2039,19 @@ int RGWRados::Bucket::List::list_objects_ordered(
 	  cur_marker.name.substr(0, marker_delim_pos);
         skip_after_delim.append(after_delim_s);
 
-        ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+        ldpp_dout(dpp, 20) << __func__ <<
 	  ": skip_after_delim=" << skip_after_delim << dendl;
 
         if (skip_after_delim > cur_marker.name) {
           cur_marker = skip_after_delim;
-          ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+          ldpp_dout(dpp, 20) << __func__ <<
 	    ": setting cur_marker=" << cur_marker.name <<
 	    "[" << cur_marker.instance << "]" << dendl;
         }
       }
     } // if older osd didn't do delimiter filtering
 
-    ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+    ldpp_dout(dpp, 10) << __func__ <<
       ": end of outer loop, truncated=" << truncated <<
       ", count=" << count << ", attempt=" << attempt << dendl;
 
@@ -2053,7 +2059,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
       // if we finished listing, or if we're returning at least half the
       // requested entries, that's enough; S3 and swift protocols allow
       // returning fewer than max entries
-      ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+      ldpp_dout(dpp, 10) << __func__ <<
 	": exiting attempt loop because we reached end (" << truncated <<
 	") or we're returning half the requested entries (" << count <<
 	" of " << max << ")" << dendl;
@@ -2061,7 +2067,7 @@ int RGWRados::Bucket::List::list_objects_ordered(
     } else if (attempt > SOFT_MAX_ATTEMPTS && count >= 1) {
       // if we've made at least 8 attempts and we have some, but very
       // few, results, return with what we have
-      ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+      ldpp_dout(dpp, 10) << __func__ <<
 	": exiting attempt loop because we made " << attempt <<
 	" attempts and we're returning " << count << " entries" << dendl;
       break;
@@ -2158,7 +2164,7 @@ int RGWRados::Bucket::List::list_objects_unordered(const DoutPrefixProvider *dpp
 					     &cur_marker,
                                              y);
     if (r < 0) {
-      ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+      ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
 	" cls_bucket_list_unordered returned " << r << " for " <<
 	target->get_bucket_info().bucket << dendl;
       return r;
@@ -2185,20 +2191,20 @@ int RGWRados::Bucket::List::list_objects_unordered(const DoutPrefixProvider *dpp
        */
       bool valid = rgw_obj_key::parse_raw_oid(index_key.name, &obj);
       if (!valid) {
-        ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+        ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
 	  " could not parse object name: " << obj.name << dendl;
         continue;
       }
 
       if (!params.list_versions && !entry.is_visible()) {
-        ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+        ldpp_dout(dpp, 20) << __func__ <<
 	  ": skippping \"" << index_key <<
 	  "\" because not listing versions and entry not visibile" << dendl;
         continue;
       }
 
       if (params.enforce_ns && obj.ns != params.ns) {
-        ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+        ldpp_dout(dpp, 20) << __func__ <<
 	  ": skippping \"" << index_key <<
 	  "\" because namespace does not match" << dendl;
         continue;
@@ -2207,7 +2213,7 @@ int RGWRados::Bucket::List::list_objects_unordered(const DoutPrefixProvider *dpp
       if (cur_end_marker_valid && cur_end_marker <= index_key) {
 	// we're not guaranteed items will come in order, so we have
 	// to loop through all
-        ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+        ldpp_dout(dpp, 20) << __func__ <<
 	  ": skippping \"" << index_key <<
 	  "\" because after end_marker" << dendl;
 	continue;
@@ -2215,7 +2221,7 @@ int RGWRados::Bucket::List::list_objects_unordered(const DoutPrefixProvider *dpp
 
       if (params.access_list_filter &&
 	  !params.access_list_filter->filter(obj.name, index_key.name)) {
-        ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+        ldpp_dout(dpp, 20) << __func__ <<
 	  ": skippping \"" << index_key <<
 	  "\" because doesn't match filter" << dendl;
         continue;
@@ -2223,7 +2229,7 @@ int RGWRados::Bucket::List::list_objects_unordered(const DoutPrefixProvider *dpp
 
       if (params.prefix.size() &&
 	  (0 != obj.name.compare(0, params.prefix.size(), params.prefix))) {
-        ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+        ldpp_dout(dpp, 20) << __func__ <<
 	  ": skippping \"" << index_key <<
 	  "\" because doesn't match prefix" << dendl;
 	continue;
@@ -2401,19 +2407,25 @@ std::string RGWRados::get_cluster_fsid(const DoutPrefixProvider *dpp, optional_y
   return svc.rados->cluster_fsid();
 }
 
-int RGWRados::get_obj_head_ioctx(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const rgw_obj& obj, librados::IoCtx *ioctx)
+int RGWRados::get_obj_head_ioctx(const DoutPrefixProvider *dpp,
+				 const RGWBucketInfo& bucket_info,
+				 const rgw_obj& obj,
+				 librados::IoCtx *ioctx)
 {
-  string oid, key;
+  std::string oid, key;
   get_obj_bucket_and_oid_loc(obj, oid, key);
 
   rgw_pool pool;
   if (!get_obj_data_pool(bucket_info.placement_rule, obj, &pool)) {
-    ldpp_dout(dpp, 0) << "ERROR: cannot get data pool for obj=" << obj << ", probably misconfiguration" << dendl;
+    ldpp_dout(dpp, 0) << "ERROR: cannot get data pool for obj=" << obj <<
+      ", probably misconfiguration" << dendl;
     return -EIO;
   }
 
   int r = open_pool_ctx(dpp, pool, *ioctx, false);
   if (r < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: unable to open data-pool=" << pool.to_str() <<
+      " for obj=" << obj << " with error-code=" << r << dendl;
     return r;
   }
 
@@ -8564,7 +8576,7 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
 					  &index_pool, &shard_oids,
 					  nullptr);
   if (r < 0) {
-    ldpp_dout(dpp, 0) << __PRETTY_FUNCTION__ <<
+    ldpp_dout(dpp, 0) << __func__ <<
       ": open_bucket_index for " << bucket_info.bucket << " failed" << dendl;
     return r;
   }
@@ -8584,7 +8596,7 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
     num_entries_per_shard = num_entries;
   }
 
-  ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+  ldpp_dout(dpp, 10) << __func__ <<
     ": request from each of " << shard_count <<
     " shard(s) for " << num_entries_per_shard << " entries to get " <<
     num_entries << " total entries" << dendl;
@@ -8597,7 +8609,7 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
 			    list_versions, shard_oids, shard_list_results,
 			    cct->_conf->rgw_bucket_index_max_aio)();
   if (r < 0) {
-    ldpp_dout(dpp, 0) << __PRETTY_FUNCTION__ <<
+    ldpp_dout(dpp, 0) << __func__ <<
       ": CLSRGWIssueBucketList for " << bucket_info.bucket <<
       " failed" << dendl;
     return r;
@@ -8645,14 +8657,12 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
 
   // add the next unique candidate, or return false if we reach the end
   auto next_candidate = [] (CephContext *cct, ShardTracker& t,
-                            std::map<std::string, size_t>& candidates,
+                            std::multimap<std::string, size_t>& candidates,
                             size_t tracker_idx) {
-    while (!t.at_end()) {
-      if (candidates.emplace(t.entry_name(), tracker_idx).second) {
-        return;
-      }
-      t.advance(); // skip duplicate common prefixes
+    if (!t.at_end()) {
+      candidates.emplace(t.entry_name(), tracker_idx);
     }
+    return;
   };
 
   // one tracker per shard requested (may not be all shards)
@@ -8674,8 +8684,10 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
   // (key=candidate, value=index into results_trackers); as we consume
   // entries from shards, we replace them with the next entries in the
   // shards until we run out
-  std::map<std::string, size_t> candidates;
+  std::multimap<std::string, size_t> candidates;
   size_t tracker_idx = 0;
+  std::vector<size_t> vidx;
+  vidx.reserve(shard_list_results.size());
   for (auto& t : results_trackers) {
     // it's important that the values in the map refer to the index
     // into the results_trackers vector, which may not be the same
@@ -8699,7 +8711,7 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
     const std::string& name = tracker.entry_name();
     rgw_bucket_dir_entry& dirent = tracker.dir_entry();
 
-    ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ << ": currently processing " <<
+    ldpp_dout(dpp, 20) << __func__ << ": currently processing " <<
       dirent.key << " from shard " << tracker.shard_idx << dendl;
 
     const bool force_check =
@@ -8721,7 +8733,7 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
       r = check_disk_state(dpp, sub_ctx, bucket_info, dirent, dirent,
 			   updates[tracker.oid_name], y);
       if (r < 0 && r != -ENOENT) {
-	ldpp_dout(dpp, 0) << __PRETTY_FUNCTION__ <<
+	ldpp_dout(dpp, 0) << __func__ <<
 	  ": check_disk_state for \"" << dirent.key <<
 	  "\" failed with r=" << r << dendl;
 	return r;
@@ -8732,7 +8744,7 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
 
     // at this point either r >= 0 or r == -ENOENT
     if (r >= 0) { // i.e., if r != -ENOENT
-      ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ << ": got " <<
+      ldpp_dout(dpp, 10) << __func__ << ": got " <<
 	dirent.key << dendl;
 
       auto [it, inserted] = m.insert_or_assign(name, std::move(dirent));
@@ -8740,31 +8752,42 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
       if (inserted) {
 	++count;
       } else {
-	ldpp_dout(dpp, 0) << "WARNING: " << __PRETTY_FUNCTION__ <<
+	ldpp_dout(dpp, 0) << "WARNING: " << __func__ <<
 	  " reassigned map value at \"" << name <<
 	  "\", which should not happen" << dendl;
       }
     } else {
-      ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ << ": skipping " <<
+      ldpp_dout(dpp, 10) << __func__ << ": skipping " <<
 	dirent.key.name << "[" << dirent.key.instance << "]" << dendl;
       last_entry_visited = &tracker.dir_entry();
     }
 
     // refresh the candidates map
-    candidates.erase(candidates.begin());
-    tracker.advance();
-
-    next_candidate(cct, tracker, candidates, tracker_idx);
-
-    if (tracker.at_end() && tracker.is_truncated()) {
+    vidx.clear();
+    bool need_to_stop = false;
+    auto range = candidates.equal_range(name);
+    for (auto i = range.first; i != range.second; ++i) {
+      vidx.push_back(i->second);
+    } 
+    candidates.erase(range.first, range.second);
+    for (auto idx : vidx) {
+      auto& tracker_match = results_trackers.at(idx);
+      tracker_match.advance();
+      next_candidate(cct, tracker_match, candidates, idx);
+      if (tracker_match.at_end() && tracker_match.is_truncated()) {
+        need_to_stop = true;
+        break;
+      }
+    }
+    if (need_to_stop) {
       // once we exhaust one shard that is truncated, we need to stop,
       // as we cannot be certain that one of the next entries needs to
       // come from that shard; S3 and swift protocols allow returning
       // fewer than what was requested
-      ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+      ldpp_dout(dpp, 10) << __func__ <<
 	": stopped accumulating results at count=" << count <<
 	", dirent=\"" << dirent.key <<
-	"\", because its shard is untruncated and exhaused" << dendl;
+	"\", because its shard is truncated and exhausted" << dendl;
       break;
     }
   } // while we haven't provided requested # of result entries
@@ -8795,28 +8818,28 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
     }
   }
 
-  ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+  ldpp_dout(dpp, 20) << __func__ <<
     ": returning, count=" << count << ", is_truncated=" << *is_truncated <<
     dendl;
 
   if (*is_truncated && count < num_entries) {
-    ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ <<
+    ldpp_dout(dpp, 10) << __func__ <<
       ": requested " << num_entries << " entries but returning " <<
       count << ", which is truncated" << dendl;
   }
 
   if (last_entry_visited != nullptr && last_entry) {
     *last_entry = last_entry_visited->key;
-    ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+    ldpp_dout(dpp, 20) << __func__ <<
       ": returning, last_entry=" << *last_entry << dendl;
   } else {
-    ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__ <<
+    ldpp_dout(dpp, 20) << __func__ <<
       ": returning, last_entry NOT SET" << dendl;
   }
 
   ldout_bitx(bitx, dpp, 10) << "EXITING " << __func__ << dendl_bitx;
   return 0;
-}
+} // RGWRados::cls_bucket_list_ordered
 
 
 // A helper function to retrieve the hash source from an incomplete
@@ -9211,6 +9234,11 @@ int RGWRados::check_disk_state(const DoutPrefixProvider *dpp,
   std::string loc;
 
   std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(list_state.key);
+  MultipartMetaFilter multipart_meta_filter;
+  string temp_key;
+  if (multipart_meta_filter.filter(list_state.key.name, temp_key)) {
+    obj->set_in_extra_data(true);
+  }
 
   string oid;
   get_obj_bucket_and_oid_loc(obj->get_obj(), oid, loc);
@@ -9252,6 +9280,7 @@ int RGWRados::check_disk_state(const DoutPrefixProvider *dpp,
   string content_type;
   string storage_class;
   ACLOwner owner;
+  bool appendable = false;
 
   object.meta.size = astate->size;
   object.meta.accounted_size = astate->accounted_size;
@@ -9275,6 +9304,10 @@ int RGWRados::check_disk_state(const DoutPrefixProvider *dpp,
     if (r < 0) {
       ldpp_dout(dpp, 0) << "WARNING: could not decode policy for object: " << obj << dendl;
     }
+  }
+  iter = astate->attrset.find(RGW_ATTR_APPEND_PART_NUM);
+  if (iter != astate->attrset.end()) {
+    appendable = true;
   }
 
   if (manifest) {
@@ -9300,6 +9333,7 @@ int RGWRados::check_disk_state(const DoutPrefixProvider *dpp,
   object.meta.storage_class = storage_class;
   object.meta.owner = owner.get_id().to_str();
   object.meta.owner_display_name = owner.get_display_name();
+  object.meta.appendable = appendable;
 
   // encode suggested updates
 
@@ -9308,13 +9342,14 @@ int RGWRados::check_disk_state(const DoutPrefixProvider *dpp,
   list_state.meta.mtime = object.meta.mtime;
   list_state.meta.category = main_category;
   list_state.meta.etag = etag;
+  list_state.meta.appendable = appendable;
   list_state.meta.content_type = content_type;
   list_state.meta.storage_class = storage_class;
 
   librados::IoCtx head_obj_ctx; // initialize to data pool so we can get pool id
-  int ret = get_obj_head_ioctx(dpp, bucket_info, obj->get_obj(), &head_obj_ctx);
-  if (ret < 0) {
-    ldpp_dout(dpp, 0) << __PRETTY_FUNCTION__ <<
+  r = get_obj_head_ioctx(dpp, bucket_info, obj->get_obj(), &head_obj_ctx);
+  if (r < 0) {
+    ldpp_dout(dpp, 0) << __func__ <<
       " WARNING: unable to find head object data pool for \"" <<
       obj << "\", not updating version pool/epoch" << dendl;
   } else {

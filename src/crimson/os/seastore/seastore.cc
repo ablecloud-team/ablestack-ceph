@@ -117,31 +117,16 @@ SeaStore::SeaStore(
   const std::string& root,
   MDStoreRef mdstore,
   DeviceRef dev,
-  TransactionManagerRef tm,
-  CollectionManagerRef cm,
-  OnodeManagerRef om)
+  bool is_test)
   : root(root),
     mdstore(std::move(mdstore)),
     device(std::move(dev)),
-    transaction_manager(std::move(tm)),
-    collection_manager(std::move(cm)),
-    onode_manager(std::move(om)),
     max_object_size(
-      get_conf<uint64_t>("seastore_default_max_object_size"))
+      get_conf<uint64_t>("seastore_default_max_object_size")),
+    is_test(is_test)
 {
   register_metrics();
 }
-
-SeaStore::SeaStore(
-  const std::string& root,
-  DeviceRef dev,
-  TransactionManagerRef tm,
-  CollectionManagerRef cm,
-  OnodeManagerRef om)
-  : SeaStore(
-    root,
-    std::make_unique<FileMDStore>(root),
-    std::move(dev), std::move(tm), std::move(cm), std::move(om)) {}
 
 SeaStore::~SeaStore() = default;
 
@@ -185,10 +170,8 @@ seastar::future<> SeaStore::stop()
 
 SeaStore::mount_ertr::future<> SeaStore::mount()
 {
-  secondaries.clear();
   return device->mount(
   ).safe_then([this] {
-    transaction_manager->add_device(device.get(), true);
     auto sec_devices = device->get_secondary_devices();
     return crimson::do_for_each(sec_devices, [this](auto& device_entry) {
       device_id_t id = device_entry.first;
@@ -196,18 +179,18 @@ SeaStore::mount_ertr::future<> SeaStore::mount()
       device_type_t dtype = device_entry.second.dtype;
       std::ostringstream oss;
       oss << root << "/block." << dtype << "." << std::to_string(id);
-      return Device::make_device(oss.str()
+      return Device::make_device(oss.str(), dtype
       ).then([this, magic](DeviceRef sec_dev) {
         return sec_dev->mount(
         ).safe_then([this, sec_dev=std::move(sec_dev), magic]() mutable {
           boost::ignore_unused(magic);  // avoid clang warning;
           assert(sec_dev->get_magic() == magic);
-          transaction_manager->add_device(sec_dev.get(), false);
           secondaries.emplace_back(std::move(sec_dev));
         });
       });
     });
   }).safe_then([this] {
+    init_managers();
     return transaction_manager->mount();
   }).handle_error(
     crimson::ct_error::assert_all{
@@ -218,8 +201,13 @@ SeaStore::mount_ertr::future<> SeaStore::mount()
 
 seastar::future<> SeaStore::umount()
 {
-  return transaction_manager->close(
-  ).safe_then([this] {
+  return [this] {
+    if (transaction_manager) {
+      return transaction_manager->close();
+    } else {
+      return TransactionManager::close_ertr::now();
+    }
+  }().safe_then([this] {
     return crimson::do_for_each(
       secondaries,
       [](auto& sec_dev) -> SegmentManager::close_ertr::future<>
@@ -228,6 +216,11 @@ seastar::future<> SeaStore::umount()
     });
   }).safe_then([this] {
     return device->close();
+  }).safe_then([this] {
+    secondaries.clear();
+    transaction_manager.reset();
+    collection_manager.reset();
+    onode_manager.reset();
   }).handle_error(
     crimson::ct_error::assert_all{
       "Invalid error in SeaStore::umount"
@@ -290,7 +283,7 @@ SeaStore::mkfs_ertr::future<> SeaStore::mkfs(uuid_d new_osd_fsid)
                 auto id = std::stoi(entry_name.substr(dtype_end + 1));
                 std::ostringstream oss;
                 oss << root << "/" << entry_name;
-                return Device::make_device(oss.str()
+                return Device::make_device(oss.str(), dtype
                 ).then([this, &sds, id, dtype, new_osd_fsid](DeviceRef sec_dev) {
                   magic_t magic = (magic_t)std::rand();
                   sds.emplace(
@@ -322,29 +315,23 @@ SeaStore::mkfs_ertr::future<> SeaStore::mkfs(uuid_d new_osd_fsid)
               true,
               device_spec_t{
                 (magic_t)std::rand(),
-                device_type_t::SEGMENTED,
+                device_type_t::SSD,
                 0},
               seastore_meta_t{new_osd_fsid},
               sds}
           );
         }).safe_then([this] {
-          return crimson::do_for_each(secondaries, [this](auto& sec_dev) {
-            return sec_dev->mount().safe_then([this, &sec_dev] {
-              transaction_manager->add_device(sec_dev.get(), false);
-              return seastar::now();
-            });
+          return crimson::do_for_each(secondaries, [](auto& sec_dev) {
+            return sec_dev->mount();
           });
         });
       }).safe_then([this] {
         return device->mount();
       }).safe_then([this] {
-        transaction_manager->add_device(device.get(), true);
+        init_managers();
         return transaction_manager->mkfs();
       }).safe_then([this] {
-        for (auto& sec_dev : secondaries) {
-          transaction_manager->add_device(sec_dev.get(), false);
-        }
-        transaction_manager->add_device(device.get(), true);
+        init_managers();
         return transaction_manager->mount();
       }).safe_then([this] {
         return repeat_eagain([this] {
@@ -1117,7 +1104,7 @@ void SeaStore::on_error(ceph::os::Transaction &t) {
   abort();
 }
 
-seastar::future<> SeaStore::do_transaction(
+seastar::future<> SeaStore::do_transaction_no_callbacks(
   CollectionRef _ch,
   ceph::os::Transaction&& _t)
 {
@@ -1154,16 +1141,6 @@ seastar::future<> SeaStore::do_transaction(
         }).si_then([this, &ctx] {
           return transaction_manager->submit_transaction(*ctx.transaction);
         });
-      }).safe_then([&ctx]() {
-        for (auto i : {
-            ctx.ext_transaction.get_on_applied(),
-            ctx.ext_transaction.get_on_commit(),
-            ctx.ext_transaction.get_on_applied_sync()}) {
-          if (i) {
-            i->complete(0);
-          }
-        }
-        return seastar::now();
       });
     });
 }
@@ -1357,6 +1334,7 @@ SeaStore::tm_ret SeaStore::_do_transaction_step(
           op->op == Transaction::OP_OMAP_SETHEADER) {
         ceph_abort_msg("unexpected enoent error");
       }
+      return seastar::now();
     }),
     crimson::ct_error::assert_all{
       "Invalid error in SeaStore::do_transaction_step"
@@ -1871,27 +1849,54 @@ uuid_d SeaStore::get_fsid() const
   return device->get_meta().seastore_id;
 }
 
+void SeaStore::init_managers()
+{
+  transaction_manager.reset();
+  collection_manager.reset();
+  onode_manager.reset();
+
+  std::vector<Device*> sec_devices;
+  for (auto &dev : secondaries) {
+    sec_devices.emplace_back(dev.get());
+  }
+  transaction_manager = make_transaction_manager(
+      device.get(), sec_devices, is_test);
+  collection_manager = std::make_unique<collection_manager::FlatCollectionManager>(
+      *transaction_manager);
+  onode_manager = std::make_unique<crimson::os::seastore::onode::FLTreeOnodeManager>(
+      *transaction_manager);
+}
+
 seastar::future<std::unique_ptr<SeaStore>> make_seastore(
   const std::string &device,
   const ConfigValues &config)
 {
   return Device::make_device(
-    device
+    device, device_type_t::SSD
   ).then([&device](DeviceRef device_obj) {
 #ifndef NDEBUG
-    auto tm = make_transaction_manager(
-        tm_make_config_t::get_test_segmented_journal());
+    bool is_test = true;
 #else
-    auto tm = make_transaction_manager(tm_make_config_t::get_default());
+    bool is_test = false;
 #endif
-    auto cm = std::make_unique<collection_manager::FlatCollectionManager>(*tm);
+    auto mdstore = std::make_unique<FileMDStore>(device);
     return std::make_unique<SeaStore>(
       device,
+      std::move(mdstore),
       std::move(device_obj),
-      std::move(tm),
-      std::move(cm),
-      std::make_unique<crimson::os::seastore::onode::FLTreeOnodeManager>(*tm));
+      is_test);
   });
+}
+
+std::unique_ptr<SeaStore> make_test_seastore(
+  DeviceRef device,
+  SeaStore::MDStoreRef mdstore)
+{
+  return std::make_unique<SeaStore>(
+    "",
+    std::move(mdstore),
+    std::move(device),
+    true);
 }
 
 }

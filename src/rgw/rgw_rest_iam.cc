@@ -53,7 +53,7 @@ RGWOp *RGWHandler_REST_IAM::op_post()
     if (action.compare("GetRole") == 0)
       return new RGWGetRole;
     if (action.compare("UpdateAssumeRolePolicy") == 0)
-      return new RGWModifyRole(this->bl_post_body);
+      return new RGWModifyRoleTrustPolicy(this->bl_post_body);
     if (action.compare("ListRoles") == 0)
       return new RGWListRoles;
     if (action.compare("PutRolePolicy") == 0)
@@ -86,6 +86,8 @@ RGWOp *RGWHandler_REST_IAM::op_post()
       return new RGWListRoleTags;
     if (action.compare("UntagRole") == 0)
       return new RGWUntagRole(this->bl_post_body);
+    if (action.compare("UpdateRole") == 0)
+      return new RGWUpdateRole(this->bl_post_body);
   }
 
   return nullptr;
@@ -97,7 +99,7 @@ int RGWHandler_REST_IAM::init(rgw::sal::Store* store,
 {
   s->dialect = "iam";
 
-  if (int ret = RGWHandler_REST_IAM::init_from_header(s, RGW_FORMAT_XML, true); ret < 0) {
+  if (int ret = RGWHandler_REST_IAM::init_from_header(s, RGWFormat::XML, true); ret < 0) {
     ldpp_dout(s, 10) << "init_from_header returned err=" << ret <<  dendl;
     return ret;
   }
@@ -111,7 +113,7 @@ int RGWHandler_REST_IAM::authorize(const DoutPrefixProvider* dpp, optional_yield
 }
 
 int RGWHandler_REST_IAM::init_from_header(req_state* s,
-                                          int default_formatter,
+                                          RGWFormat default_formatter,
                                           bool configurable_format)
 {
   string req;

@@ -1,3 +1,4 @@
+import ipaddress
 import hashlib
 import json
 import logging
@@ -580,8 +581,8 @@ class CephadmServe:
 
         if service_type == 'agent':
             try:
-                assert self.mgr.cherrypy_thread
-                assert self.mgr.cherrypy_thread.ssl_certs.get_root_cert()
+                assert self.mgr.http_server.agent
+                assert self.mgr.http_server.agent.ssl_certs.get_root_cert()
             except Exception:
                 self.log.info(
                     'Delaying applying agent spec until cephadm endpoint root cert created')
@@ -608,14 +609,19 @@ class CephadmServe:
 
         def matches_network(host):
             # type: (str) -> bool
-            # make sure we have 1 or more IPs for any of those networks on that
-            # host
-            for network in public_networks:
-                if len(self.mgr.cache.networks[host].get(network, [])) > 0:
-                    return True
+            # make sure the host has at least one network that belongs to some configured public network(s)
+            for pn in public_networks:
+                public_network = ipaddress.ip_network(pn)
+                for hn in self.mgr.cache.networks[host]:
+                    host_network = ipaddress.ip_network(hn)
+                    if host_network.overlaps(public_network):
+                        return True
+
+            host_networks = ','.join(self.mgr.cache.networks[host])
+            pub_networks = ','.join(public_networks)
             self.log.info(
-                f"Filtered out host {host}: does not belong to mon public_network"
-                f" ({','.join(public_networks)})"
+                f"Filtered out host {host}: does not belong to mon public_network(s): "
+                f" {pub_networks}, host network(s): {host_networks}"
             )
             return False
 
@@ -627,6 +633,7 @@ class CephadmServe:
             hosts=self.mgr.cache.get_non_draining_hosts() if spec.service_name(
             ) == 'agent' else self.mgr.cache.get_schedulable_hosts(),
             unreachable_hosts=self.mgr.cache.get_unreachable_hosts(),
+            draining_hosts=self.mgr.cache.get_draining_hosts(),
             daemons=daemons,
             networks=self.mgr.cache.networks,
             filter_new_host=(
@@ -931,11 +938,13 @@ class CephadmServe:
                     if self.mgr.cache.rm_scheduled_daemon_action(dd.hostname, dd.name()):
                         self.mgr.cache.save_host(dd.hostname)
                 except OrchestratorError as e:
+                    self.log.exception(e)
                     self.mgr.events.from_orch_error(e)
                     if dd.daemon_type in daemons_post:
                         del daemons_post[dd.daemon_type]
                     # continue...
                 except Exception as e:
+                    self.log.exception(e)
                     self.mgr.events.for_daemon_from_exception(dd.name(), e)
                     if dd.daemon_type in daemons_post:
                         del daemons_post[dd.daemon_type]
@@ -1005,6 +1014,7 @@ class CephadmServe:
                     spec=ServiceSpec('mon', placement=pspec),
                     hosts=self.mgr.cache.get_schedulable_hosts(),
                     unreachable_hosts=self.mgr.cache.get_unreachable_hosts(),
+                    draining_hosts=self.mgr.cache.get_draining_hosts(),
                     daemons=[],
                     networks=self.mgr.cache.networks,
                 )
@@ -1035,6 +1045,7 @@ class CephadmServe:
                     spec=ServiceSpec('mon', placement=ks.placement),
                     hosts=self.mgr.cache.get_schedulable_hosts(),
                     unreachable_hosts=self.mgr.cache.get_unreachable_hosts(),
+                    draining_hosts=self.mgr.cache.get_draining_hosts(),
                     daemons=[],
                     networks=self.mgr.cache.networks,
                 )
@@ -1057,6 +1068,8 @@ class CephadmServe:
                             client_files: Dict[str, Dict[str, Tuple[int, int, int, bytes, str]]],
                             host: str) -> None:
         updated_files = False
+        if host in self.mgr.offline_hosts:
+            return
         old_files = self.mgr.cache.get_host_client_files(host).copy()
         for path, m in client_files.get(host, {}).items():
             mode, uid, gid, content, digest = m
@@ -1309,6 +1322,9 @@ class CephadmServe:
         if not self.mgr.container_init:
             final_args += ['--no-container-init']
 
+        if not self.mgr.cgroups_split:
+            final_args += ['--no-cgroups-split']
+
         # subcommand
         final_args.append(command)
 
@@ -1416,4 +1432,4 @@ class CephadmServe:
         # Use tee (from coreutils) to create a copy of cephadm on the target machine
         self.log.info(f"Deploying cephadm binary to {host}")
         await self.mgr.ssh._write_remote_file(host, self.mgr.cephadm_binary_path,
-                                              self.mgr._cephadm.encode('utf-8'), addr=addr)
+                                              self.mgr._cephadm, addr=addr)

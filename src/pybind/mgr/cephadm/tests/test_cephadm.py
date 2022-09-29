@@ -17,7 +17,7 @@ except ImportError:
 
 from ceph.deployment.service_spec import ServiceSpec, PlacementSpec, RGWSpec, \
     NFSServiceSpec, IscsiServiceSpec, HostPlacementSpec, CustomContainerSpec, MDSSpec, \
-    CustomConfig
+    CustomConfig, PrometheusSpec
 from ceph.deployment.drive_selection.selector import DriveSelection
 from ceph.deployment.inventory import Devices, Device
 from ceph.utils import datetime_to_str, datetime_now
@@ -472,7 +472,7 @@ class TestCephadm(object):
                         '--extra-container-args=--cpus=2',
                         '--extra-container-args=--quiet'
                     ],
-                    stdin='{"config": "", "keyring": ""}',
+                    stdin='{"config": "", "keyring": "[client.crash.test]\\nkey = None\\n"}',
                     image='',
                 )
 
@@ -494,7 +494,7 @@ class TestCephadm(object):
         ]
         conf_outs = [json.dumps(c.to_json()) for c in configs]
         stdin_str = '{' + \
-            f'"config": "", "keyring": "", "custom_config_files": [{conf_outs[0]}, {conf_outs[1]}]' + '}'
+            f'"config": "", "keyring": "[client.crash.test]\\nkey = None\\n", "custom_config_files": [{conf_outs[0]}, {conf_outs[1]}]' + '}'
         with with_host(cephadm_module, 'test'):
             with with_service(cephadm_module, ServiceSpec(service_type='crash', custom_configs=configs), CephadmOrchestrator.apply_crash):
                 _run_cephadm.assert_called_with(
@@ -1508,6 +1508,64 @@ class TestCephadm(object):
             with with_service(cephadm_module, spec, meth, 'test'):
                 pass
 
+    @pytest.mark.parametrize(
+        "spec, raise_exception, msg",
+        [
+            # Valid retention_time values (valid units: 'y', 'w', 'd', 'h', 'm', 's')
+            (PrometheusSpec(retention_time='1y'), False, ''),
+            (PrometheusSpec(retention_time=' 10w '), False, ''),
+            (PrometheusSpec(retention_time=' 1348d'), False, ''),
+            (PrometheusSpec(retention_time='2000h '), False, ''),
+            (PrometheusSpec(retention_time='173847m'), False, ''),
+            (PrometheusSpec(retention_time='200s'), False, ''),
+            (PrometheusSpec(retention_time='  '), False, ''),  # default value will be used
+
+            # Invalid retention_time values
+            (PrometheusSpec(retention_time='100k'), True, '^Invalid retention time'),     # invalid unit
+            (PrometheusSpec(retention_time='10'), True, '^Invalid retention time'),       # no unit
+            (PrometheusSpec(retention_time='100.00y'), True, '^Invalid retention time'),  # invalid value and valid unit
+            (PrometheusSpec(retention_time='100.00k'), True, '^Invalid retention time'),  # invalid value and invalid unit
+            (PrometheusSpec(retention_time='---'), True, '^Invalid retention time'),      # invalid value
+
+            # Valid retention_size values (valid units: 'B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB')
+            (PrometheusSpec(retention_size='123456789B'), False, ''),
+            (PrometheusSpec(retention_size=' 200KB'), False, ''),
+            (PrometheusSpec(retention_size='99999MB '), False, ''),
+            (PrometheusSpec(retention_size=' 10GB '), False, ''),
+            (PrometheusSpec(retention_size='100TB'), False, ''),
+            (PrometheusSpec(retention_size='500PB'), False, ''),
+            (PrometheusSpec(retention_size='200EB'), False, ''),
+            (PrometheusSpec(retention_size='  '), False, ''),  # default value will be used
+
+            # Invalid retention_size values
+            (PrometheusSpec(retention_size='100b'), True, '^Invalid retention size'),      # invalid unit (case sensitive)
+            (PrometheusSpec(retention_size='333kb'), True, '^Invalid retention size'),     # invalid unit (case sensitive)
+            (PrometheusSpec(retention_size='2000'), True, '^Invalid retention size'),      # no unit
+            (PrometheusSpec(retention_size='200.00PB'), True, '^Invalid retention size'),  # invalid value and valid unit
+            (PrometheusSpec(retention_size='400.B'), True, '^Invalid retention size'),     # invalid value and invalid unit
+            (PrometheusSpec(retention_size='10.000s'), True, '^Invalid retention size'),   # invalid value and invalid unit
+            (PrometheusSpec(retention_size='...'), True, '^Invalid retention size'),       # invalid value
+
+            # valid retention_size and valid retention_time
+            (PrometheusSpec(retention_time='1y', retention_size='100GB'), False, ''),
+            # invalid retention_time and valid retention_size
+            (PrometheusSpec(retention_time='1j', retention_size='100GB'), True, '^Invalid retention time'),
+            # valid retention_time and invalid retention_size
+            (PrometheusSpec(retention_time='1y', retention_size='100gb'), True, '^Invalid retention size'),
+            # valid retention_time and invalid retention_size
+            (PrometheusSpec(retention_time='1y', retention_size='100gb'), True, '^Invalid retention size'),
+            # invalid retention_time and invalid retention_size
+            (PrometheusSpec(retention_time='1i', retention_size='100gb'), True, '^Invalid retention time'),
+        ])
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    def test_apply_prometheus(self, spec: PrometheusSpec, raise_exception: bool, msg: str, cephadm_module: CephadmOrchestrator):
+        with with_host(cephadm_module, 'test'):
+            if not raise_exception:
+                cephadm_module._apply(spec)
+            else:
+                with pytest.raises(OrchestratorError, match=msg):
+                    cephadm_module._apply(spec)
+
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
     def test_mds_config_purge(self, cephadm_module: CephadmOrchestrator):
         spec = MDSSpec('mds', service_id='fsname', config={'test': 'foo'})
@@ -1938,3 +1996,119 @@ Traceback (most recent call last):
         with with_host(cephadm_module, 'test1', refresh_hosts=False, rm_with_force=True):
             with with_host(cephadm_module, 'test2', refresh_hosts=False, rm_with_force=False):
                 cephadm_module.inventory.add_label('test2', '_admin')
+
+    @pytest.mark.parametrize("facts, settings, expected_value",
+                             [
+                                 # All options are available on all hosts
+                                 (
+                                     {
+                                         "host1":
+                                         {
+                                             "sysctl_options":
+                                             {
+                                                 'opt1': 'val1',
+                                                 'opt2': 'val2',
+                                             }
+                                         },
+                                         "host2":
+                                         {
+                                             "sysctl_options":
+                                             {
+                                                 'opt1': '',
+                                                 'opt2': '',
+                                             }
+                                         },
+                                     },
+                                     {'opt1', 'opt2'},  # settings
+                                     {'host1': [], 'host2': []}  # expected_value
+                                 ),
+                                 # opt1 is missing on host 1, opt2 is missing on host2
+                                 ({
+                                     "host1":
+                                     {
+                                         "sysctl_options":
+                                         {
+                                             'opt2': '',
+                                             'optX': '',
+                                         }
+                                     },
+                                     "host2":
+                                     {
+                                         "sysctl_options":
+                                         {
+                                             'opt1': '',
+                                             'opt3': '',
+                                             'opt4': '',
+                                         }
+                                     },
+                                 },
+                                     {'opt1', 'opt2'},  # settings
+                                     {'host1': ['opt1'], 'host2': ['opt2']}  # expected_value
+                                 ),
+                                 # All options are missing on all hosts
+                                 ({
+                                     "host1":
+                                     {
+                                         "sysctl_options":
+                                         {
+                                         }
+                                     },
+                                     "host2":
+                                     {
+                                         "sysctl_options":
+                                         {
+                                         }
+                                     },
+                                 },
+                                     {'opt1', 'opt2'},  # settings
+                                     {'host1': ['opt1', 'opt2'], 'host2': [
+                                         'opt1', 'opt2']}  # expected_value
+                                 ),
+                             ]
+                             )
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    def test_tuned_profiles_settings_validation(self, facts, settings, expected_value, cephadm_module):
+        with with_host(cephadm_module, 'test'):
+            spec = mock.Mock()
+            spec.settings = sorted(settings)
+            spec.placement.filter_matching_hostspecs = mock.Mock()
+            spec.placement.filter_matching_hostspecs.return_value = ['host1', 'host2']
+            cephadm_module.cache.facts = facts
+            assert cephadm_module._validate_tunedprofile_settings(spec) == expected_value
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    def test_tuned_profiles_validation(self, cephadm_module):
+        with with_host(cephadm_module, 'test'):
+
+            with pytest.raises(OrchestratorError, match="^Invalid placement specification.+"):
+                spec = mock.Mock()
+                spec.settings = {'a': 'b'}
+                spec.placement = PlacementSpec(hosts=[])
+                cephadm_module._validate_tuned_profile_spec(spec)
+
+            with pytest.raises(OrchestratorError, match="Invalid spec: settings section cannot be empty."):
+                spec = mock.Mock()
+                spec.settings = {}
+                spec.placement = PlacementSpec(hosts=['host1', 'host2'])
+                cephadm_module._validate_tuned_profile_spec(spec)
+
+            with pytest.raises(OrchestratorError, match="^Placement 'count' field is no supported .+"):
+                spec = mock.Mock()
+                spec.settings = {'a': 'b'}
+                spec.placement = PlacementSpec(count=1)
+                cephadm_module._validate_tuned_profile_spec(spec)
+
+            with pytest.raises(OrchestratorError, match="^Placement 'count_per_host' field is no supported .+"):
+                spec = mock.Mock()
+                spec.settings = {'a': 'b'}
+                spec.placement = PlacementSpec(count_per_host=1, label='foo')
+                cephadm_module._validate_tuned_profile_spec(spec)
+
+            with pytest.raises(OrchestratorError, match="^Found invalid host"):
+                spec = mock.Mock()
+                spec.settings = {'a': 'b'}
+                spec.placement = PlacementSpec(hosts=['host1', 'host2'])
+                cephadm_module.inventory = mock.Mock()
+                cephadm_module.inventory.all_specs = mock.Mock(
+                    return_value=[mock.Mock().hostname, mock.Mock().hostname])
+                cephadm_module._validate_tuned_profile_spec(spec)

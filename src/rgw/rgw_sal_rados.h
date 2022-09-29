@@ -85,26 +85,29 @@ public:
     return group.zones.size();
   }
   virtual int get_placement_tier(const rgw_placement_rule& rule, std::unique_ptr<PlacementTier>* tier);
-  const RGWZoneGroup& get_group() const { return group; }
+  virtual int get_zone_by_id(const std::string& id, std::unique_ptr<Zone>* zone) override;
+  virtual int get_zone_by_name(const std::string& name, std::unique_ptr<Zone>* zone) override;
+  virtual int list_zones(std::list<std::string>& zone_ids) override;
   virtual std::unique_ptr<ZoneGroup> clone() override {
     return std::make_unique<RadosZoneGroup>(store, group);
   }
+  const RGWZoneGroup& get_group() const { return group; }
 };
 
 class RadosZone : public StoreZone {
   protected:
     RadosStore* store;
     std::unique_ptr<ZoneGroup> group;
+    RGWZone rgw_zone;
+    bool local_zone{false};
   public:
-    RadosZone(RadosStore* _store, std::unique_ptr<ZoneGroup> _zg) : store(_store), group(std::move(_zg)) {}
+    RadosZone(RadosStore* _store, std::unique_ptr<ZoneGroup> _zg) : store(_store), group(std::move(_zg)), local_zone(true) {}
+    RadosZone(RadosStore* _store, std::unique_ptr<ZoneGroup> _zg, RGWZone& z) : store(_store), group(std::move(_zg)), rgw_zone(z) {}
     ~RadosZone() = default;
 
-    virtual std::unique_ptr<Zone> clone() override {
-      return std::make_unique<RadosZone>(store, group->clone());
-    }
+    virtual std::unique_ptr<Zone> clone() override;
     virtual ZoneGroup& get_zonegroup() override { return *(group.get()); }
-    virtual int get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zonegroup) override;
-    virtual const rgw_zone_id& get_id() override;
+    virtual const std::string& get_id() override;
     virtual const std::string& get_name() const override;
     virtual bool is_writeable() override;
     virtual bool get_redirect_endpoint(std::string* endpoint) override;
@@ -113,7 +116,8 @@ class RadosZone : public StoreZone {
     virtual const RGWAccessKey& get_system_key() override;
     virtual const std::string& get_realm_name() override;
     virtual const std::string& get_realm_id() override;
-	virtual const std::string_view get_tier_type() override;
+    virtual const std::string_view get_tier_type() override;
+    virtual RGWBucketSyncPolicyHandlerRef get_sync_policy_handler() override;
 };
 
 class RadosStore : public StoreStore {
@@ -155,6 +159,8 @@ class RadosStore : public StoreStore {
     virtual Zone* get_zone() { return zone.get(); }
     virtual std::string zone_unique_id(uint64_t unique_num) override;
     virtual std::string zone_unique_trans_id(const uint64_t unique_num) override;
+    virtual int get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zonegroup) override;
+    virtual int list_all_zones(const DoutPrefixProvider* dpp, std::list<std::string>& zone_ids) override;
     virtual int cluster_stat(RGWClusterStat& stats) override;
     virtual std::unique_ptr<Lifecycle> get_lifecycle(void) override;
     virtual std::unique_ptr<Completions> get_completions(void) override;
@@ -195,7 +201,7 @@ class RadosStore : public StoreStore {
     virtual int meta_remove(const DoutPrefixProvider* dpp, std::string& metadata_key, optional_yield y) override;
     virtual const RGWSyncModuleInstanceRef& get_sync_module() { return rados->get_sync_module(); }
     virtual std::string get_host_id() { return rados->host_id; }
-    virtual std::unique_ptr<LuaScriptManager> get_lua_script_manager() override;
+    virtual std::unique_ptr<LuaManager> get_lua_manager() override;
     virtual std::unique_ptr<RGWRole> get_role(std::string name,
 					      std::string tenant,
 					      std::string path="",
@@ -242,6 +248,7 @@ class RadosStore : public StoreStore {
     virtual void set_luarocks_path(const std::string& path) override {
       luarocks_path = path;
     }
+    virtual void register_admin_apis(RGWRESTMgr* mgr) override;
 
     /* Unique to RadosStore */
     int get_obj_head_ioctx(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const rgw_obj& obj,
@@ -271,7 +278,6 @@ class RadosUser : public StoreUser {
     RadosUser(RadosStore *_st, const RGWUserInfo& _i) : StoreUser(_i), store(_st) { }
     RadosUser(RadosStore *_st) : store(_st) { }
     RadosUser(RadosUser& _o) = default;
-    RadosUser() {}
 
     virtual std::unique_ptr<User> clone() override {
       return std::unique_ptr<User>(new RadosUser(*this));
@@ -311,6 +317,7 @@ class RadosUser : public StoreUser {
     virtual int load_user(const DoutPrefixProvider* dpp, optional_yield y) override;
     virtual int store_user(const DoutPrefixProvider* dpp, optional_yield y, bool exclusive, RGWUserInfo* old_info = nullptr) override;
     virtual int remove_user(const DoutPrefixProvider* dpp, optional_yield y) override;
+    virtual int verify_mfa(const std::string& mfa_str, bool* verified, const DoutPrefixProvider* dpp, optional_yield y) override;
 
     friend class RadosBucket;
 };
@@ -353,8 +360,6 @@ class RadosObject : public StoreObject {
       virtual int delete_obj(const DoutPrefixProvider* dpp, optional_yield y) override;
     };
 
-    RadosObject() = default;
-
     RadosObject(RadosStore *_st, const rgw_obj_key& _k)
       : StoreObject(_k),
 	store(_st),
@@ -379,6 +384,10 @@ class RadosObject : public StoreObject {
 
     virtual ~RadosObject();
 
+    virtual void invalidate() override {
+      StoreObject::invalidate();
+      rados_ctx->invalidate(get_obj());
+    }
     virtual int delete_object(const DoutPrefixProvider* dpp,
 			      optional_yield y, bool prevent_versioning) override;
     virtual int delete_obj_aio(const DoutPrefixProvider* dpp, RGWObjState* astate, Completions* aio,
@@ -878,17 +887,20 @@ public:
                        optional_yield y) override;
 };
 
-class RadosLuaScriptManager : public StoreLuaScriptManager {
-  RadosStore* store;
+class RadosLuaManager : public StoreLuaManager {
+  RadosStore* const store;
   rgw_pool pool;
 
 public:
-  RadosLuaScriptManager(RadosStore* _s);
-  virtual ~RadosLuaScriptManager() = default;
+  RadosLuaManager(RadosStore* _s);
+  virtual ~RadosLuaManager() = default;
 
-  virtual int get(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script) override;
-  virtual int put(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script) override;
-  virtual int del(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key) override;
+  virtual int get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script);
+  virtual int put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script);
+  virtual int del_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key);
+  virtual int add_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name);
+  virtual int remove_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name);
+  virtual int list_packages(const DoutPrefixProvider* dpp, optional_yield y, rgw::lua::packages_t& packages);
 };
 
 class RadosOIDCProvider : public RGWOIDCProvider {

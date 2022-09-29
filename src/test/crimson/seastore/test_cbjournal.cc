@@ -6,11 +6,12 @@
 #include <random>
 
 #include "crimson/common/log.h"
-#include "crimson/os/seastore/seastore_types.h"
+#include "crimson/os/seastore/async_cleaner.h"
 #include "crimson/os/seastore/journal.h"
 #include "crimson/os/seastore/journal/circular_bounded_journal.h"
 #include "crimson/os/seastore/random_block_manager.h"
 #include "crimson/os/seastore/random_block_manager/rbm_device.h"
+#include "crimson/os/seastore/seastore_types.h"
 #include "test/crimson/seastore/transaction_manager_test_state.h"
 
 using namespace crimson;
@@ -119,11 +120,8 @@ struct entry_validator_t {
   }
 };
 
-struct cbjournal_test_t : public seastar_test_suite_t
+struct cbjournal_test_t : public seastar_test_suite_t, JournalTrimmer
 {
-  segment_manager::EphemeralSegmentManagerRef segment_manager; // Need to be deleted, just for Cache
-  ExtentPlacementManagerRef epm;
-  Cache cache;
   std::vector<entry_validator_t> entries;
   std::unique_ptr<CircularBoundedJournal> cbj;
   random_block_device::RBMDevice *device;
@@ -133,13 +131,9 @@ struct cbjournal_test_t : public seastar_test_suite_t
   CircularBoundedJournal::mkfs_config_t config;
   WritePipeline pipeline;
 
-  cbjournal_test_t() :
-      segment_manager(segment_manager::create_test_ephemeral()),
-      epm(new ExtentPlacementManager(true)),
-      cache(*epm)
-  {
+  cbjournal_test_t() {
     device = new random_block_device::TestMemory(CBTEST_DEFAULT_TEST_SIZE + CBTEST_DEFAULT_BLOCK_SIZE);
-    cbj.reset(new CircularBoundedJournal(device, std::string()));
+    cbj.reset(new CircularBoundedJournal(*this, device, std::string()));
     device_id_t d_id = 1 << (std::numeric_limits<device_id_t>::digits - 1);
     config.block_size = CBTEST_DEFAULT_BLOCK_SIZE;
     config.total_size = CBTEST_DEFAULT_TEST_SIZE;
@@ -147,6 +141,27 @@ struct cbjournal_test_t : public seastar_test_suite_t
     block_size = CBTEST_DEFAULT_BLOCK_SIZE;
     cbj->set_write_pipeline(&pipeline);
   }
+
+  /*
+   * JournalTrimmer interfaces
+   */
+  journal_seq_t get_journal_head() const {
+    return JOURNAL_SEQ_NULL;
+  }
+
+  journal_seq_t get_dirty_tail() const final {
+    return JOURNAL_SEQ_NULL;
+  }
+
+  journal_seq_t get_alloc_tail() const final {
+    return JOURNAL_SEQ_NULL;
+  }
+
+  void set_journal_head(journal_seq_t head) final {}
+
+  void update_journal_tails(
+    journal_seq_t dirty_tail,
+    journal_seq_t alloc_tail) final {}
 
   seastar::future<> set_up_fut() final {
     return seastar::now();
@@ -211,12 +226,12 @@ struct cbjournal_test_t : public seastar_test_suite_t
   }
 
   auto replay() {
-    cbj->replay(
+    return cbj->replay(
       [this](const auto &offsets,
-             const auto &e,
-             auto &dirty_seq,
-             auto &alloc_seq,
-             auto last_modified) {
+	     const auto &e,
+	     auto &dirty_seq,
+	     auto &alloc_seq,
+	     auto last_modified) {
       bool found = false;
       for (auto &i : entries) {
 	paddr_t base = offsets.write_result.start_seq.offset; 
@@ -233,11 +248,19 @@ struct cbjournal_test_t : public seastar_test_suite_t
   }
 
   auto mkfs() {
-    return cbj->mkfs(config).unsafe_get0();
+    return device->mount(
+    ).safe_then([this]() {
+      return cbj->mkfs(config
+      ).safe_then([]() {
+	return seastar::now();
+      });
+    }).unsafe_get0();
   }
   void open() {
-    cbj->open_device_read_header().unsafe_get0();
-    cbj->open_for_mkfs().unsafe_get0();
+    return cbj->open_for_mkfs(
+    ).safe_then([](auto q) {
+      return seastar::now();
+    }).unsafe_get0();
   }
   auto get_available_size() {
     return cbj->get_available_size();
@@ -248,20 +271,31 @@ struct cbjournal_test_t : public seastar_test_suite_t
   auto get_block_size() {
     return device->get_block_size();
   }
+  auto get_written_to_rbm_addr() {
+    return cbj->get_rbm_addr(cbj->get_written_to());
+  }
   auto get_written_to() {
     return cbj->get_written_to();
   }
   auto get_journal_tail() {
-    return cbj->get_journal_tail();
+    return cbj->get_dirty_tail();
   }
   auto get_used_size() {
     return cbj->get_used_size();
   }
   void update_journal_tail(rbm_abs_addr addr, uint32_t len) {
-    cbj->update_journal_tail(addr + len).unsafe_get0();
+    paddr_t paddr =
+      convert_abs_addr_to_paddr(
+	  addr + len,
+	  cbj->get_device_id());
+    journal_seq_t seq = {0, paddr};
+    cbj->update_journal_tail(
+      seq,
+      seq
+    ).get0();
   }
-  void set_written_to(rbm_abs_addr addr) {
-    cbj->set_written_to(addr);
+  void set_written_to(journal_seq_t seq) {
+    cbj->set_written_to(seq);
   }
 };
 
@@ -403,7 +437,7 @@ TEST_F(cbjournal_test_t, update_header)
     cbj->close().unsafe_get0();
     replay();
 
-    ASSERT_EQ(update_header.journal_tail, update_header.journal_tail);
+    ASSERT_EQ(update_header.dirty_tail.offset, update_header.dirty_tail.offset);
     ASSERT_EQ(header.block_size, update_header.block_size);
     ASSERT_EQ(header.size, update_header.size);
   });
@@ -466,7 +500,11 @@ TEST_F(cbjournal_test_t, replay_after_reset)
     }
     auto old_written_to = get_written_to();
     auto old_used_size = get_used_size();
-    set_written_to(4096);
+    set_written_to(
+      journal_seq_t{0,
+	convert_abs_addr_to_paddr(
+	  4096,
+	  cbj->get_device_id())});
     cbj->close().unsafe_get0();
     replay();
     ASSERT_EQ(old_written_to, get_written_to());

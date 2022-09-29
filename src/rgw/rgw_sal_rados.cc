@@ -16,9 +16,11 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <system_error>
+#include <filesystem>
 #include <unistd.h>
 #include <sstream>
 #include <boost/algorithm/string.hpp>
+#include <boost/process.hpp>
 
 #include "common/Clock.h"
 #include "common/errno.h"
@@ -37,9 +39,18 @@
 #include "rgw_service.h"
 #include "rgw_lc.h"
 #include "rgw_lc_tier.h"
+#include "rgw_rest_admin.h"
+#include "rgw_rest_bucket.h"
+#include "rgw_rest_metadata.h"
+#include "rgw_rest_log.h"
+#include "rgw_rest_config.h"
+#include "rgw_rest_ratelimit.h"
+#include "rgw_rest_realm.h"
+#include "rgw_rest_user.h"
 #include "services/svc_sys_obj.h"
 #include "services/svc_meta.h"
 #include "services/svc_meta_be_sobj.h"
+#include "services/svc_cls.h"
 #include "services/svc_zone.h"
 #include "services/svc_tier_rados.h"
 #include "services/svc_quota.h"
@@ -352,6 +363,37 @@ int RadosUser::remove_user(const DoutPrefixProvider* dpp, optional_yield y)
 {
     return store->ctl()->user->remove_info(dpp, info, y,
 					  RGWUserCtl::RemoveParams().set_objv_tracker(&objv_tracker));
+}
+
+int RadosUser::verify_mfa(const std::string& mfa_str, bool* verified,
+			  const DoutPrefixProvider* dpp, optional_yield y)
+{
+  vector<string> params;
+  get_str_vec(mfa_str, " ", params);
+
+  if (params.size() != 2) {
+    ldpp_dout(dpp, 5) << "NOTICE: invalid mfa string provided: " << mfa_str << dendl;
+    return -EINVAL;
+  }
+
+  string& serial = params[0];
+  string& pin = params[1];
+
+  auto i = info.mfa_ids.find(serial);
+  if (i == info.mfa_ids.end()) {
+    ldpp_dout(dpp, 5) << "NOTICE: user does not have mfa device with serial=" << serial << dendl;
+    return -EACCES;
+  }
+
+  int ret = store->svc()->cls->mfa.check_mfa(dpp, info.user_id, serial, pin, y);
+  if (ret < 0) {
+    ldpp_dout(dpp, 20) << "NOTICE: failed to check MFA, serial=" << serial << dendl;
+    return -EACCES;
+  }
+
+  *verified = true;
+
+  return 0;
 }
 
 RadosBucket::~RadosBucket() {}
@@ -1181,6 +1223,28 @@ std::string RadosStore::zone_unique_trans_id(const uint64_t unique_num)
   return svc()->zone_utils->unique_trans_id(unique_num);
 }
 
+int RadosStore::get_zonegroup(const std::string& id,
+			      std::unique_ptr<ZoneGroup>* zonegroup)
+{
+  ZoneGroup* zg;
+  RGWZoneGroup rzg;
+  int r = svc()->zone->get_zonegroup(id, rzg);
+  if (r < 0)
+    return r;
+
+  zg = new RadosZoneGroup(this, rzg);
+  if (!zg)
+    return -ENOMEM;
+
+  zonegroup->reset(zg);
+  return 0;
+}
+
+int RadosStore::list_all_zones(const DoutPrefixProvider* dpp, std::list<std::string>& zone_ids)
+{
+  return svc()->zone->list_zones(dpp, zone_ids);
+}
+
 int RadosStore::cluster_stat(RGWClusterStat& stats)
 {
   rados_cluster_stat_t rados_stats;
@@ -1364,9 +1428,22 @@ void RadosStore::finalize(void)
     rados->finalize();
 }
 
-std::unique_ptr<LuaScriptManager> RadosStore::get_lua_script_manager()
+void RadosStore::register_admin_apis(RGWRESTMgr* mgr)
 {
-  return std::make_unique<RadosLuaScriptManager>(this);
+  mgr->register_resource("user", new RGWRESTMgr_User);
+  mgr->register_resource("bucket", new RGWRESTMgr_Bucket);
+  /*Registering resource for /admin/metadata */
+  mgr->register_resource("metadata", new RGWRESTMgr_Metadata);
+  mgr->register_resource("log", new RGWRESTMgr_Log);
+  /* XXX These may become global when cbodley is done with his zone work */
+  mgr->register_resource("config", new RGWRESTMgr_Config);
+  mgr->register_resource("realm", new RGWRESTMgr_Realm);
+  mgr->register_resource("ratelimit", new RGWRESTMgr_Ratelimit);
+}
+
+std::unique_ptr<LuaManager> RadosStore::get_lua_manager()
+{
+  return std::make_unique<RadosLuaManager>(this);
 }
 
 std::unique_ptr<RGWRole> RadosStore::get_role(std::string name,
@@ -2941,40 +3018,81 @@ int RadosZoneGroup::get_placement_tier(const rgw_placement_rule& rule,
   return 0;
 }
 
-int RadosZone::get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zonegroup)
+int RadosZoneGroup::get_zone_by_id(const std::string& id, std::unique_ptr<Zone>* zone)
 {
-  ZoneGroup* zg;
-  RGWZoneGroup rzg;
-  int r = store->svc()->zone->get_zonegroup(id, rzg);
-  if (r < 0)
-    return r;
+  RGWZone* rz = store->svc()->zone->find_zone(id);
+  if (!rz)
+    return -ENOENT;
 
-  zg = new RadosZoneGroup(store, rzg);
-  if (!zg)
-    return -ENOMEM;
-
-  zonegroup->reset(zg);
+  Zone* z = new RadosZone(store, clone(), *rz);
+  zone->reset(z);
   return 0;
 }
 
-const rgw_zone_id& RadosZone::get_id()
+int RadosZoneGroup::get_zone_by_name(const std::string& name, std::unique_ptr<Zone>* zone)
 {
-  return store->svc()->zone->zone_id();
+  rgw_zone_id id;
+  int ret = store->svc()->zone->find_zone_id_by_name(name, &id);
+  if (ret < 0)
+    return ret;
+
+  RGWZone* rz = store->svc()->zone->find_zone(id.id);
+  if (!rz)
+    return -ENOENT;
+
+  Zone* z = new RadosZone(store, clone(), *rz);
+  zone->reset(z);
+  return 0;
+}
+
+int RadosZoneGroup::list_zones(std::list<std::string>& zone_ids)
+{
+  for (const auto& entry : group.zones)
+    {
+      zone_ids.push_back(entry.second.id);
+    }
+  return 0;
+}
+
+std::unique_ptr<Zone> RadosZone::clone()
+{
+  if (local_zone)
+    return std::make_unique<RadosZone>(store, group->clone());
+
+  return std::make_unique<RadosZone>(store, group->clone(), rgw_zone);
+}
+
+const std::string& RadosZone::get_id()
+{
+  if (local_zone)
+    return store->svc()->zone->zone_id().id;
+
+  return rgw_zone.id;
 }
 
 const std::string& RadosZone::get_name() const
 {
-  return store->svc()->zone->zone_name();
+  if (local_zone)
+    return store->svc()->zone->zone_name();
+
+  return rgw_zone.name;
 }
 
 bool RadosZone::is_writeable()
 {
-  return store->svc()->zone->zone_is_writeable();
+  if (local_zone)
+    return store->svc()->zone->zone_is_writeable();
+
+  return !rgw_zone.read_only;
 }
 
 bool RadosZone::get_redirect_endpoint(std::string* endpoint)
 {
-  return store->svc()->zone->get_redirect_zone_endpoint(endpoint);
+  if (local_zone)
+    return store->svc()->zone->get_redirect_zone_endpoint(endpoint);
+
+  endpoint = &rgw_zone.redirect_zone;
+  return true;
 }
 
 bool RadosZone::has_zonegroup_api(const std::string& api) const
@@ -3004,16 +3122,28 @@ const std::string& RadosZone::get_realm_id()
 
 const std::string_view RadosZone::get_tier_type()
 {
-  return store->svc()->zone->get_zone().tier_type;
+  if (local_zone)
+    return store->svc()->zone->get_zone().tier_type;
+
+  return rgw_zone.id;
 }
 
-RadosLuaScriptManager::RadosLuaScriptManager(RadosStore* _s) : store(_s)
+RGWBucketSyncPolicyHandlerRef RadosZone::get_sync_policy_handler()
 {
-  pool = store->svc()->zone->get_zone_params().log_pool;
+  return store->svc()->zone->get_sync_policy_handler(get_id());
 }
 
-int RadosLuaScriptManager::get(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script)
+RadosLuaManager::RadosLuaManager(RadosStore* _s) : 
+  store(_s),
+  pool((store->svc() && store->svc()->zone) ? store->svc()->zone->get_zone_params().log_pool : rgw_pool())
+{ }
+
+int RadosLuaManager::get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script)
 {
+  if (pool.empty()) {
+    ldpp_dout(dpp, 10) << "WARNING: missing pool when reading lua script " << dendl;
+    return 0;
+  }
   bufferlist bl;
 
   int r = rgw_get_system_obj(store->svc()->sysobj, pool, key, bl, nullptr, nullptr, y, dpp);
@@ -3031,8 +3161,12 @@ int RadosLuaScriptManager::get(const DoutPrefixProvider* dpp, optional_yield y, 
   return 0;
 }
 
-int RadosLuaScriptManager::put(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script)
+int RadosLuaManager::put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script)
 {
+  if (pool.empty()) {
+    ldpp_dout(dpp, 10) << "WARNING: missing pool when writing lua script " << dendl;
+    return 0;
+  }
   bufferlist bl;
   ceph::encode(script, bl);
 
@@ -3044,8 +3178,12 @@ int RadosLuaScriptManager::put(const DoutPrefixProvider* dpp, optional_yield y, 
   return 0;
 }
 
-int RadosLuaScriptManager::del(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key)
+int RadosLuaManager::del_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key)
 {
+  if (pool.empty()) {
+    ldpp_dout(dpp, 10) << "WARNING: missing pool when deleting lua script " << dendl;
+    return 0;
+  }
   int r = rgw_delete_system_obj(dpp, store->svc()->sysobj, pool, key, nullptr, y);
   if (r < 0 && r != -ENOENT) {
     return r;
@@ -3053,6 +3191,83 @@ int RadosLuaScriptManager::del(const DoutPrefixProvider* dpp, optional_yield y, 
 
   return 0;
 }
+
+#ifdef WITH_RADOSGW_LUA_PACKAGES
+const std::string PACKAGE_LIST_OBJECT_NAME = "lua_package_allowlist";
+
+int RadosLuaManager::add_package(const DoutPrefixProvider *dpp, optional_yield y, const std::string& package_name)
+{
+  // add package to list
+  const bufferlist empty_bl;
+  std::map<std::string, bufferlist> new_package{{package_name, empty_bl}};
+  librados::ObjectWriteOperation op;
+  op.omap_set(new_package);
+  auto ret = rgw_rados_operate(dpp, *(store->getRados()->get_lc_pool_ctx()),
+      PACKAGE_LIST_OBJECT_NAME, &op, y);
+
+  if (ret < 0) {
+    return ret;
+  }
+  return 0;
+}
+
+int RadosLuaManager::remove_package(const DoutPrefixProvider *dpp, optional_yield y, const std::string& package_name)
+{
+  librados::ObjectWriteOperation op;
+  size_t pos = package_name.find(" ");
+  if (pos != package_name.npos) {
+    // remove specfic version of the the package
+    op.omap_rm_keys(std::set<std::string>({package_name}));
+    auto ret = rgw_rados_operate(dpp, *(store->getRados()->get_lc_pool_ctx()),
+        PACKAGE_LIST_OBJECT_NAME, &op, y);
+    if (ret < 0) {
+        return ret;
+    }
+    return 0;
+  }
+  // otherwise, remove any existing versions of the package
+  rgw::lua::packages_t packages;
+  auto ret = list_packages(dpp, y, packages);
+  if (ret < 0 && ret != -ENOENT) {
+    return ret;
+  }
+  for(const auto& package : packages) {
+    const std::string package_no_version = package.substr(0, package.find(" "));
+    if (package_no_version.compare(package_name) == 0) {
+        op.omap_rm_keys(std::set<std::string>({package}));
+        ret = rgw_rados_operate(dpp, *(store->getRados()->get_lc_pool_ctx()),
+            PACKAGE_LIST_OBJECT_NAME, &op, y);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+  }
+  return 0;
+}
+
+int RadosLuaManager::list_packages(const DoutPrefixProvider *dpp, optional_yield y, rgw::lua::packages_t& packages)
+{
+  constexpr auto max_chunk = 1024U;
+  std::string start_after;
+  bool more = true;
+  int rval;
+  while (more) {
+    librados::ObjectReadOperation op;
+    rgw::lua::packages_t packages_chunk;
+    op.omap_get_keys2(start_after, max_chunk, &packages_chunk, &more, &rval);
+    const auto ret = rgw_rados_operate(dpp, *(store->getRados()->get_lc_pool_ctx()),
+      PACKAGE_LIST_OBJECT_NAME, &op, nullptr, y);
+
+    if (ret < 0) {
+      return ret;
+    }
+
+    packages.merge(packages_chunk);
+  }
+
+  return 0;
+}
+#endif
 
 int RadosOIDCProvider::store_url(const DoutPrefixProvider *dpp, const std::string& url, bool exclusive, optional_yield y)
 {

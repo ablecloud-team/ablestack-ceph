@@ -13,20 +13,22 @@ SET_SUBSYS(seastore_journal);
 namespace crimson::os::seastore::journal {
 
 SegmentAllocator::SegmentAllocator(
-  segment_type_t type,
+  JournalTrimmer *trimmer,
   data_category_t category,
   reclaim_gen_t gen,
   SegmentProvider &sp,
   SegmentSeqAllocator &ssa)
   : print_name{fmt::format("{}_G{}", category, gen)},
-    type{type},
+    type{trimmer == nullptr ?
+         segment_type_t::OOL :
+         segment_type_t::JOURNAL},
     category{category},
     gen{gen},
     segment_provider{sp},
     sm_group{*sp.get_segment_manager_group()},
-    segment_seq_allocator(ssa)
+    segment_seq_allocator(ssa),
+    trimmer{trimmer}
 {
-  ceph_assert(type != segment_type_t::NULL_SEG);
   reset();
 }
 
@@ -57,8 +59,8 @@ SegmentAllocator::do_open(bool is_mkfs)
     journal_seq_t dirty_tail;
     journal_seq_t alloc_tail;
     if (type == segment_type_t::JOURNAL) {
-      dirty_tail = segment_provider.get_dirty_tail();
-      alloc_tail = segment_provider.get_alloc_tail();
+      dirty_tail = trimmer->get_dirty_tail();
+      alloc_tail = trimmer->get_alloc_tail();
       if (is_mkfs) {
         ceph_assert(dirty_tail == JOURNAL_SEQ_NULL);
         ceph_assert(alloc_tail == JOURNAL_SEQ_NULL);
@@ -106,7 +108,7 @@ SegmentAllocator::do_open(bool is_mkfs)
       paddr_t::make_seg_paddr(segment_id, written_to)};
     segment_provider.update_segment_avail_bytes(
         type, new_journal_seq.offset);
-    return sref->write(0, bl
+    return sref->write(0, std::move(bl)
     ).handle_error(
       open_ertr::pass_further{},
       crimson::ct_error::assert_all{
@@ -154,7 +156,7 @@ SegmentAllocator::roll()
 }
 
 SegmentAllocator::write_ret
-SegmentAllocator::write(ceph::bufferlist to_write)
+SegmentAllocator::write(ceph::bufferlist&& to_write)
 {
   LOG_PREFIX(SegmentAllocator::write);
   assert(can_write());
@@ -181,7 +183,7 @@ SegmentAllocator::write(ceph::bufferlist to_write)
       current_segment->get_segment_id(), written_to)
   );
   return current_segment->write(
-    write_start_offset, to_write
+    write_start_offset, std::move(to_write)
   ).handle_error(
     write_ertr::pass_further{},
     crimson::ct_error::assert_all{
@@ -217,7 +219,6 @@ SegmentAllocator::close_segment()
   // Note: make sure no one can access the current segment once closing
   auto seg_to_close = std::move(current_segment);
   auto close_segment_id = seg_to_close->get_segment_id();
-  segment_provider.close_segment(close_segment_id);
   auto close_seg_info = segment_provider.get_seg_info(close_segment_id);
   ceph_assert((close_seg_info.modify_time == NULL_TIME &&
                close_seg_info.num_extents == 0) ||
@@ -245,17 +246,25 @@ SegmentAllocator::close_segment()
   bl.append(bp);
 
   assert(bl.length() == sm_group.get_rounded_tail_length());
-  return seg_to_close->write(
-    sm_group.get_segment_size() - sm_group.get_rounded_tail_length(),
-    bl
-  ).safe_then([seg_to_close=std::move(seg_to_close)] {
-    return seg_to_close->close();
+
+  auto p_seg_to_close = seg_to_close.get();
+  return p_seg_to_close->advance_wp(
+    sm_group.get_segment_size() - sm_group.get_rounded_tail_length()
+  ).safe_then([this, FNAME, bl=std::move(bl), p_seg_to_close]() mutable {
+    DEBUG("Writing tail info to segment {}", p_seg_to_close->get_segment_id());
+    return p_seg_to_close->write(
+      sm_group.get_segment_size() - sm_group.get_rounded_tail_length(),
+      std::move(bl));
+  }).safe_then([p_seg_to_close] {
+    return p_seg_to_close->close();
+  }).safe_then([this, seg_to_close=std::move(seg_to_close)] {
+    segment_provider.close_segment(seg_to_close->get_segment_id());
   }).handle_error(
     close_segment_ertr::pass_further{},
-    crimson::ct_error::assert_all{
-      "Invalid error in SegmentAllocator::close_segment"
-    }
-  );
+    crimson::ct_error::assert_all {
+    "Invalid error in SegmentAllocator::close_segment"
+  });
+
 }
 
 RecordBatch::add_pending_ret
@@ -365,7 +374,7 @@ RecordBatch::submit_pending_fast(
   assert(size == new_size);
   auto bl = encode_records(group, committed_to, segment_nonce);
   assert(bl.length() == size.get_encoded_length());
-  return std::make_pair(bl, size);
+  return std::make_pair(std::move(bl), size);
 }
 
 RecordSubmitter::RecordSubmitter(
@@ -542,7 +551,7 @@ RecordSubmitter::submit(record_t&& record)
     DEBUG("{} fast submit {}, committed_to={}, outstanding_io={} ...",
           get_name(), sizes, committed_to, num_outstanding_io);
     account_submission(1, sizes);
-    return segment_allocator.write(to_write
+    return segment_allocator.write(std::move(to_write)
     ).safe_then([mdlength = sizes.get_mdlength()](auto write_result) {
       return record_locator_t{
         write_result.start_seq.offset.add_offset(mdlength),
@@ -749,7 +758,7 @@ void RecordSubmitter::flush_current_batch()
   DEBUG("{} {} records, {}, committed_to={}, outstanding_io={} ...",
         get_name(), num, sizes, committed_to, num_outstanding_io);
   account_submission(num, sizes);
-  std::ignore = segment_allocator.write(to_write
+  std::ignore = segment_allocator.write(std::move(to_write)
   ).safe_then([this, p_batch, FNAME, num, sizes=sizes](auto write_result) {
     TRACE("{} {} records, {}, write done with {}",
           get_name(), num, sizes, write_result);

@@ -48,6 +48,8 @@ std::ostream &operator<<(std::ostream &out, const device_id_printer_t &id)
     return out << "Dev(FAKE)";
   } else if (_id == DEVICE_ID_ZERO) {
     return out << "Dev(ZERO)";
+  } else if (_id == DEVICE_ID_ROOT) {
+    return out << "Dev(ROOT)";
   } else {
     return out << "Dev(" << (unsigned)_id << ")";
   }
@@ -57,8 +59,6 @@ std::ostream &operator<<(std::ostream &out, const segment_id_t &segment)
 {
   if (segment == NULL_SEG_ID) {
     return out << "Seg[NULL]";
-  } else if (segment == FAKE_SEG_ID) {
-    return out << "Seg[FAKE]";
   } else {
     return out << "Seg[" << device_id_printer_t{segment.device_id()}
                << "," << segment.device_segment_id()
@@ -94,40 +94,114 @@ std::ostream& operator<<(std::ostream& out, segment_seq_printer_t seq)
   if (seq.seq == NULL_SEG_SEQ) {
     return out << "sseq(NULL)";
   } else {
-    assert(seq.seq <= MAX_VALID_SEG_SEQ);
     return out << "sseq(" << seq.seq << ")";
   }
 }
 
 std::ostream &operator<<(std::ostream &out, const paddr_t &rhs)
 {
-  out << "paddr_t<";
+  auto id = rhs.get_device_id();
+  out << "paddr<";
   if (rhs == P_ADDR_NULL) {
     out << "NULL";
   } else if (rhs == P_ADDR_MIN) {
     out << "MIN";
   } else if (rhs == P_ADDR_ZERO) {
     out << "ZERO";
-  } else if (rhs.is_delayed()) {
-    out << "DELAYED_TEMP";
-  } else if (rhs.is_block_relative()) {
-    const seg_paddr_t& s = rhs.as_seg_paddr();
-    out << "BLOCK_REG, " << s.get_segment_off();
-  } else if (rhs.is_record_relative()) {
-    const seg_paddr_t& s = rhs.as_seg_paddr();
-    out << "RECORD_REG, " << s.get_segment_off();
-  } else if (rhs.get_addr_type() == addr_types_t::SEGMENT) {
-    const seg_paddr_t& s = rhs.as_seg_paddr();
+  } else if (has_seastore_off(id)) {
+    auto &s = rhs.as_res_paddr();
+    out << device_id_printer_t{id}
+        << ","
+        << seastore_off_printer_t{s.get_seastore_off()};
+  } else if (rhs.get_addr_type() == paddr_types_t::SEGMENT) {
+    auto &s = rhs.as_seg_paddr();
     out << s.get_segment_id()
-        << ", "
+        << ","
         << seastore_off_printer_t{s.get_segment_off()};
-  } else if (rhs.get_addr_type() == addr_types_t::RANDOM_BLOCK) {
-    const blk_paddr_t& s = rhs.as_blk_paddr();
-    out << s.get_block_off();
+  } else if (rhs.get_addr_type() == paddr_types_t::RANDOM_BLOCK) {
+    auto &s = rhs.as_blk_paddr();
+    out << device_id_printer_t{s.get_device_id()}
+        << ","
+        << s.get_block_off();
   } else {
     out << "INVALID!";
   }
   return out << ">";
+}
+
+journal_seq_t journal_seq_t::add_offset(
+      journal_type_t type,
+      seastore_off_t off,
+      seastore_off_t roll_start,
+      seastore_off_t roll_size) const
+{
+  assert(offset.is_absolute());
+  assert(off != MIN_SEG_OFF);
+  assert(roll_start >= 0);
+  assert(roll_size > 0);
+
+  segment_seq_t jseq = segment_seq;
+  seastore_off_t joff;
+  if (type == journal_type_t::SEGMENTED) {
+    joff = offset.as_seg_paddr().get_segment_off();
+  } else {
+    assert(type == journal_type_t::RANDOM_BLOCK);
+    auto boff = offset.as_blk_paddr().get_block_off();
+    assert(boff <= MAX_SEG_OFF);
+    joff = boff;
+  }
+  auto roll_end = roll_start + roll_size;
+  assert(joff >= roll_start);
+  assert(joff <= roll_end);
+
+  if (off >= 0) {
+    jseq += (off / roll_size);
+    joff += (off % roll_size);
+    if (joff >= roll_end) {
+      ++jseq;
+      joff -= roll_size;
+    }
+  } else {
+    auto mod = static_cast<segment_seq_t>((-off) / roll_size);
+    joff -= ((-off) % roll_size);
+    if (joff < roll_start) {
+      ++mod;
+      joff += roll_size;
+    }
+    if (jseq >= mod) {
+      jseq -= mod;
+    } else {
+      return JOURNAL_SEQ_MIN;
+    }
+  }
+  assert(joff >= roll_start);
+  assert(joff < roll_end);
+  return journal_seq_t{jseq, make_block_relative_paddr(joff)};
+}
+
+seastore_off_t journal_seq_t::relative_to(
+      journal_type_t type,
+      const journal_seq_t& r,
+      seastore_off_t roll_start,
+      seastore_off_t roll_size) const
+{
+  assert(offset.is_absolute());
+  assert(r.offset.is_absolute());
+  assert(roll_start >= 0);
+  assert(roll_size > 0);
+
+  int64_t ret = static_cast<int64_t>(segment_seq) - r.segment_seq;
+  ret *= roll_size;
+  if (type == journal_type_t::SEGMENTED) {
+    ret += (static_cast<int64_t>(offset.as_seg_paddr().get_segment_off()) -
+            static_cast<int64_t>(r.offset.as_seg_paddr().get_segment_off()));
+  } else {
+    assert(type == journal_type_t::RANDOM_BLOCK);
+    ret += (static_cast<int64_t>(offset.as_blk_paddr().get_block_off()) -
+            static_cast<int64_t>(r.offset.as_blk_paddr().get_block_off()));
+  }
+  assert(ret <= MAX_SEG_OFF && ret > MIN_SEG_OFF);
+  return static_cast<seastore_off_t>(ret);
 }
 
 std::ostream &operator<<(std::ostream &out, const journal_seq_t &seq)
@@ -323,12 +397,12 @@ std::ostream &operator<<(std::ostream &os, transaction_type_t type)
     return os << "MUTATE";
   case transaction_type_t::READ:
     return os << "READ";
-  case transaction_type_t::CLEANER_TRIM_DIRTY:
-    return os << "CLEANER_TRIM_DIRTY";
-  case transaction_type_t::CLEANER_TRIM_ALLOC:
-    return os << "CLEANER_TRIM_ALLOC";
-  case transaction_type_t::CLEANER_RECLAIM:
-    return os << "CLEANER_RECLAIM";
+  case transaction_type_t::TRIM_DIRTY:
+    return os << "TRIM_DIRTY";
+  case transaction_type_t::TRIM_ALLOC:
+    return os << "TRIM_ALLOC";
+  case transaction_type_t::CLEANER:
+    return os << "CLEANER";
   case transaction_type_t::MAX:
     return os << "TRANS_TYPE_NULL";
   default:
@@ -692,19 +766,22 @@ std::ostream& operator<<(std::ostream& out, placement_hint_t h)
 
 bool can_delay_allocation(device_type_t type) {
   // Some types of device may not support delayed allocation, for example PMEM.
-  return (type >= device_type_t::NONE &&
-          type <= device_type_t::RANDOM_BLOCK);
+  // All types of device currently support delayed allocation.
+  return true;
 }
 
 device_type_t string_to_device_type(std::string type) {
-  if (type == "segmented") {
-    return device_type_t::SEGMENTED;
+  if (type == "HDD") {
+    return device_type_t::HDD;
   }
-  if (type == "random_block") {
-    return device_type_t::RANDOM_BLOCK;
+  if (type == "SSD") {
+    return device_type_t::SSD;
   }
-  if (type == "pmem") {
-    return device_type_t::PMEM;
+  if (type == "ZNS") {
+    return device_type_t::ZNS;
+  }
+  if (type == "RANDOM_BLOCK_SSD") {
+    return device_type_t::RANDOM_BLOCK_SSD;
   }
   return device_type_t::NONE;
 }
@@ -714,14 +791,28 @@ std::ostream& operator<<(std::ostream& out, device_type_t t)
   switch (t) {
   case device_type_t::NONE:
     return out << "NONE";
-  case device_type_t::SEGMENTED:
-    return out << "SEGMENTED";
-  case device_type_t::RANDOM_BLOCK:
-    return out << "RANDOM_BLOCK";
-  case device_type_t::PMEM:
-    return out << "PMEM";
+  case device_type_t::HDD:
+    return out << "HDD";
+  case device_type_t::SSD:
+    return out << "SSD";
+  case device_type_t::ZNS:
+    return out << "ZNS";
+  case device_type_t::SEGMENTED_EPHEMERAL:
+    return out << "SEGMENTED_EPHEMERAL";
+  case device_type_t::RANDOM_BLOCK_SSD:
+    return out << "RANDOM_BLOCK_SSD";
+  case device_type_t::RANDOM_BLOCK_EPHEMERAL:
+    return out << "RANDOM_BLOCK_EPHEMERAL";
   default:
     return out << "INVALID_DEVICE_TYPE!";
+  }
+}
+
+std::ostream& operator<<(std::ostream& out, backend_type_t btype) {
+  if (btype == backend_type_t::SEGMENTED) {
+    return out << "SEGMENTED";
+  } else {
+    return out << "RANDOM_BLOCK";
   }
 }
 

@@ -38,6 +38,7 @@ void OSDOperationRegistry::do_stop()
 }
 
 OSDOperationRegistry::OSDOperationRegistry()
+  : OperationRegistryT(seastar::this_shard_id())
 {
   constexpr auto historic_reg_index =
     static_cast<size_t>(OperationTypeCode::historic_client_request);
@@ -94,6 +95,7 @@ void OSDOperationRegistry::put_historic(const ClientRequest& op)
     assert(fastest_historic_iter != std::end(historic_registry));
     const auto& fastest_historic_op =
       static_cast<const ClientRequest&>(*fastest_historic_iter);
+    historic_registry.erase(fastest_historic_iter);
     // clear a previously "leaked" op
     ClientRequest::ICRef(&fastest_historic_op, /* add_ref= */false);
     --num_slow_ops;

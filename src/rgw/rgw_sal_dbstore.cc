@@ -226,6 +226,12 @@ namespace rgw::sal {
     return ret;
   }
 
+  int DBUser::verify_mfa(const std::string& mfa_str, bool* verified, const DoutPrefixProvider *dpp, optional_yield y)
+  {
+    *verified = false;
+    return 0;
+  }
+
   int DBBucket::remove_bucket(const DoutPrefixProvider *dpp, bool delete_children, bool forward_to_master, req_info* req_info, optional_yield y)
   {
     int ret;
@@ -540,25 +546,14 @@ namespace rgw::sal {
     return *zonegroup;
   }
 
-  int DBZone::get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zg)
-  {
-    /* XXX: for now only one zonegroup supported */
-    ZoneGroup* group = new DBZoneGroup(store, std::make_unique<RGWZoneGroup>());
-    if (!group)
-      return -ENOMEM;
-
-    zg->reset(group);
-    return 0;
-  }
-
   const RGWZoneParams& DBZone::get_rgw_params()
   {
     return *zone_params;
   }
 
-  const rgw_zone_id& DBZone::get_id()
+  const std::string& DBZone::get_id()
   {
-    return cur_zone_id;
+    return zone_params->get_id();
   }
 
 
@@ -602,9 +597,14 @@ namespace rgw::sal {
     return realm->get_id();
   }
 
-  std::unique_ptr<LuaScriptManager> DBStore::get_lua_script_manager()
+  RGWBucketSyncPolicyHandlerRef DBZone::get_sync_policy_handler()
   {
-    return std::make_unique<DBLuaScriptManager>(this);
+    return nullptr;
+  }
+
+  std::unique_ptr<LuaManager> DBStore::get_lua_manager()
+  {
+    return std::make_unique<DBLuaManager>(this);
   }
 
   int DBObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjState **pstate, optional_yield y, bool follow_olh)
@@ -738,18 +738,6 @@ namespace rgw::sal {
     DB::Object op_target(store->getDB(),
         get_bucket()->get_info(), get_obj());
     return op_target.transition(dpp, placement_rule, mtime, olh_epoch);
-  }
-
-  int DBObject::transition_to_cloud(Bucket* bucket,
-			   rgw::sal::PlacementTier* tier,
-			   rgw_bucket_dir_entry& o,
-			   std::set<std::string>& cloud_targets,
-			   CephContext* cct,
-			   bool update_object,
-			   const DoutPrefixProvider* dpp,
-			   optional_yield y)
-  {
-    return 0;
   }
 
   bool DBObject::placement_rules_match(rgw_placement_rule& r1, rgw_placement_rule& r2)
@@ -1261,11 +1249,12 @@ namespace rgw::sal {
                 ptail_placement_rule(_ptail_placement_rule),
                 head_obj(std::move(_head_obj)),
                 upload_id(upload->get_upload_id()),
+                part_num(_part_num),
                 oid(head_obj->get_name() + "." + upload_id +
                     "." + std::to_string(part_num)),
                 meta_obj(((DBMultipartUpload*)upload)->get_meta_obj()),
                 op_target(_store->getDB(), head_obj->get_bucket()->get_info(), head_obj->get_obj(), upload_id),
-                parent_op(&op_target), part_num(_part_num),
+                parent_op(&op_target),
                 part_num_str(_part_num_str) {}
 
   int DBMultipartWriter::prepare(optional_yield y)
@@ -1757,6 +1746,24 @@ namespace rgw::sal {
     return "";
   }
 
+  int DBStore::get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zg)
+  {
+    /* XXX: for now only one zonegroup supported */
+    ZoneGroup* group = new DBZoneGroup(this, std::make_unique<RGWZoneGroup>());
+    if (!group)
+      return -ENOMEM;
+
+    zg->reset(group);
+    return 0;
+  }
+
+  int DBStore::list_all_zones(const DoutPrefixProvider* dpp,
+			      std::list<std::string>& zone_ids)
+  {
+    zone_ids.push_back(zone.get_id());
+    return 0;
+  }
+
   int DBStore::cluster_stat(RGWClusterStat& stats)
   {
     return 0;
@@ -1981,6 +1988,36 @@ namespace rgw::sal {
 
     return ret;
   }
+
+  int DBLuaManager::get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script)
+  {
+    return -ENOENT;
+  }
+
+  int DBLuaManager::put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script)
+  {
+    return -ENOENT;
+  }
+
+  int DBLuaManager::del_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key)
+  {
+    return -ENOENT;
+  }
+
+  int DBLuaManager::add_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name)
+  {
+    return -ENOENT;
+  }
+
+  int DBLuaManager::remove_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name)
+  {
+    return -ENOENT;
+  }
+
+  int DBLuaManager::list_packages(const DoutPrefixProvider* dpp, optional_yield y, rgw::lua::packages_t& packages)
+  {
+    return -ENOENT;
+  }
 } // namespace rgw::sal
 
 extern "C" {
@@ -1988,24 +2025,19 @@ extern "C" {
   void *newDBStore(CephContext *cct)
   {
     rgw::sal::DBStore *store = new rgw::sal::DBStore();
-    if (store) {
-      DBStoreManager *dbsm = new DBStoreManager(cct);
+    DBStoreManager *dbsm = new DBStoreManager(cct);
 
-      if (!dbsm ) {
-        delete store; store = nullptr;
-      }
-
-      DB *db = dbsm->getDB();
-      if (!db) {
-        delete dbsm;
-        delete store; store = nullptr;
-      }
-
-      store->setDBStoreManager(dbsm);
-      store->setDB(db);
-      db->set_store((rgw::sal::Store*)store);
-      db->set_context(cct);
+    DB *db = dbsm->getDB();
+    if (!db) {
+      delete dbsm;
+      delete store;
+      return nullptr;
     }
+
+    store->setDBStoreManager(dbsm);
+    store->setDB(db);
+    db->set_store((rgw::sal::Store*)store);
+    db->set_context(cct);
 
     return store;
   }

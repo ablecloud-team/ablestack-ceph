@@ -96,8 +96,6 @@ ENDOFKEY
 	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -y || true
 	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y g++-${new}
     fi
-
-    in_jenkins && echo "CI_DEBUG: End ensure_decent_gcc_on_ubuntu() in install-deps.sh"
 }
 
 function ensure_python3_sphinx_on_ubuntu {
@@ -195,31 +193,61 @@ function install_libzbd_on_ubuntu {
         libzbd-dev
 }
 
+motr_pkgs_url='https://github.com/Seagate/cortx-motr/releases/download/2.0.0-rgw'
+
+function install_cortx_motr_on_ubuntu {
+    if dpkg -l cortx-motr-dev &> /dev/null; then
+        return
+    fi
+    if [ "$(lsb_release -sc)" = "jammy" ]; then
+      install_pkg_on_ubuntu \
+        cortx-motr \
+        39f89fa1c6945040433a913f2687c4b4e6cbeb3f \
+        jammy \
+        check \
+	cortx-motr \
+	cortx-motr-dev
+    else
+        local deb_arch=$(dpkg --print-architecture)
+        local motr_pkg="cortx-motr_2.0.0.git3252d623_$deb_arch.deb"
+        local motr_dev_pkg="cortx-motr-dev_2.0.0.git3252d623_$deb_arch.deb"
+        $SUDO curl -sL -o/var/cache/apt/archives/$motr_pkg $motr_pkgs_url/$motr_pkg
+        $SUDO curl -sL -o/var/cache/apt/archives/$motr_dev_pkg $motr_pkgs_url/$motr_dev_pkg
+        # For some reason libfabric pkg is not available in arm64 version
+        # of Ubuntu 20.04 (Focal Fossa), so we borrow it from more recent
+        # versions for now.
+        if [[ "$deb_arch" == 'arm64' ]]; then
+            local lf_pkg='libfabric1_1.11.0-2_arm64.deb'
+            $SUDO curl -sL -o/var/cache/apt/archives/$lf_pkg http://ports.ubuntu.com/pool/universe/libf/libfabric/$lf_pkg
+            $SUDO apt-get install -y /var/cache/apt/archives/$lf_pkg
+        fi
+        $SUDO apt-get install -y /var/cache/apt/archives/{$motr_pkg,$motr_dev_pkg}
+        $SUDO apt-get install -y libisal-dev
+    fi
+}
+
 function version_lt {
     test $1 != $(echo -e "$1\n$2" | sort -rV | head -n 1)
 }
 
 function ensure_decent_gcc_on_rh {
     local old=$(gcc -dumpversion)
-    local expected=10.2
     local dts_ver=$1
-    if version_lt $old $expected; then
+    if version_lt $old $dts_ver; then
 	if test -t 1; then
 	    # interactive shell
 	    cat <<EOF
 Your GCC is too old. Please run following command to add DTS to your environment:
 
-scl enable devtoolset-8 bash
+scl enable gcc-toolset-$dts_ver bash
 
-Or add following line to the end of ~/.bashrc to add it permanently:
+Or add the following line to the end of ~/.bashrc and run "source ~/.bashrc" to add it permanently:
 
-source scl_source enable devtoolset-8
-
-see https://www.softwarecollections.org/en/scls/rhscl/devtoolset-7/ for more details.
+source scl_source enable gcc-toolset-$dts_ver
 EOF
 	else
 	    # non-interactive shell
-	    source /opt/rh/devtoolset-$dts_ver/enable
+	    source /opt/rh/gcc-toolset-$dts_ver/enable
 	fi
     fi
 }
@@ -296,7 +324,6 @@ else
     [ $WITH_ZBD ] && with_zbd=true || with_zbd=false
     [ $WITH_PMEM ] && with_pmem=true || with_pmem=false
     [ $WITH_RADOSGW_MOTR ] && with_rgw_motr=true || with_rgw_motr=false
-    motr_pkgs_url='https://github.com/Seagate/cortx-motr/releases/download/2.0.0-rgw'
     source /etc/os-release
     case "$ID" in
     debian|ubuntu|devuan|elementary|softiron)
@@ -314,6 +341,10 @@ else
                 ensure_decent_gcc_on_ubuntu 11 focal
                 [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu focal
                 $with_zbd && install_libzbd_on_ubuntu focal
+                ;;
+            *Jammy*)
+                [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu jammy
+                $SUDO apt-get install -y gcc
                 ;;
             *)
                 $SUDO apt-get install -y gcc
@@ -365,23 +396,8 @@ EOF
 	if [ "$control" != "debian/control" ] ; then rm $control; fi
 
         # for rgw motr backend build checks
-        if ! dpkg -l cortx-motr-dev &> /dev/null &&
-            { [[ $FOR_MAKE_CHECK ]] || $with_rgw_motr; }; then
-            deb_arch=$(dpkg --print-architecture)
-            motr_pkg="cortx-motr_2.0.0.git3252d623_$deb_arch.deb"
-            motr_dev_pkg="cortx-motr-dev_2.0.0.git3252d623_$deb_arch.deb"
-            $SUDO curl -sL -o/var/cache/apt/archives/$motr_pkg $motr_pkgs_url/$motr_pkg
-            $SUDO curl -sL -o/var/cache/apt/archives/$motr_dev_pkg $motr_pkgs_url/$motr_dev_pkg
-            # For some reason libfabric pkg is not available in arm64 version
-            # of Ubuntu 20.04 (Focal Fossa), so we borrow it from more recent
-            # versions for now.
-            if [[ "$deb_arch" == 'arm64' ]]; then
-                lf_pkg='libfabric1_1.11.0-2_arm64.deb'
-                $SUDO curl -sL -o/var/cache/apt/archives/$lf_pkg http://ports.ubuntu.com/pool/universe/libf/libfabric/$lf_pkg
-                $SUDO apt-get install -y /var/cache/apt/archives/$lf_pkg
-            fi
-            $SUDO apt-get install -y /var/cache/apt/archives/{$motr_pkg,$motr_dev_pkg}
-            $SUDO apt-get install -y libisal-dev
+        if $with_rgw_motr; then
+            install_cortx_motr_on_ubuntu
         fi
         ;;
     rocky|centos|fedora|rhel|ol|virtuozzo)
@@ -393,7 +409,7 @@ EOF
                 ;;
             rocky|centos|rhel|ol|virtuozzo)
                 MAJOR_VERSION="$(echo $VERSION_ID | cut -d. -f1)"
-                $SUDO dnf install -y dnf-utils
+                $SUDO dnf install -y dnf-utils selinux-policy-targeted
                 rpm --quiet --query epel-release || \
 		    $SUDO dnf -y install --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-$MAJOR_VERSION.noarch.rpm
                 $SUDO rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-$MAJOR_VERSION
@@ -401,28 +417,13 @@ EOF
 		if test $ID = centos -a $MAJOR_VERSION = 8 ; then
                     # Enable 'powertools' or 'PowerTools' repo
                     $SUDO dnf config-manager --set-enabled $(dnf repolist --all 2>/dev/null|gawk 'tolower($0) ~ /^powertools\s/{print $1}')
-		    case "$ARCH" in
-			x86_64)
-			    $SUDO dnf -y install centos-release-scl
-			    dts_ver=10
-			    ;;
-			aarch64)
-			    $SUDO dnf -y install centos-release-scl-rh
-			    $SUDO dnf config-manager --disable centos-sclo-rh
-			    $SUDO dnf config-manager --enable centos-sclo-rh-testing
-			    dts_ver=10
-			    ;;
-		    esac
+		    dts_ver=11
 		    # before EPEL8 and PowerTools provide all dependencies, we use sepia for the dependencies
                     $SUDO dnf config-manager --add-repo http://apt-mirror.front.sepia.ceph.com/lab-extras/8/
                     $SUDO dnf config-manager --setopt=apt-mirror.front.sepia.ceph.com_lab-extras_8_.gpgcheck=0 --save
                     $SUDO dnf -y module enable javapackages-tools
                 elif test $ID = rhel -a $MAJOR_VERSION = 8 ; then
-                    $SUDO dnf config-manager \
-			  --enable rhel-server-rhscl-8-rpms \
-			  --enable rhel-8-server-optional-rpms \
-			  --enable rhel-8-server-devtools-rpms
-                    dts_ver=10
+                    dts_ver=11
                     $SUDO dnf config-manager --set-enabled "codeready-builder-for-rhel-8-${ARCH}-rpms"
 		    $SUDO dnf config-manager --add-repo http://apt-mirror.front.sepia.ceph.com/lab-extras/8/
 		    $SUDO dnf config-manager --setopt=apt-mirror.front.sepia.ceph.com_lab-extras_8_.gpgcheck=0 --save
@@ -439,7 +440,7 @@ EOF
             ensure_decent_gcc_on_rh $dts_ver
 	fi
         IGNORE_YUM_BUILDEP_ERRORS="ValueError: SELinux policy is not managed or store cannot be accessed."
-        sed "/$IGNORE_YUM_BUILDEP_ERRORS/d" $DIR/yum-builddep.out | grep -qi "error:" && exit 1
+        sed "/$IGNORE_YUM_BUILDEP_ERRORS/d" $DIR/yum-builddep.out | grep -i "error:" && exit 1
         # for rgw motr backend build checks
         if ! rpm --quiet -q cortx-motr-devel &&
               { [[ $FOR_MAKE_CHECK ]] || $with_rgw_motr; }; then
@@ -516,6 +517,7 @@ function preload_wheels_for_tox() {
     if test "$require" && ! test -d wheelhouse ; then
         type python3 > /dev/null 2>&1 || continue
         activate_virtualenv $top_srcdir || exit 1
+        python3 -m pip install --upgrade pip
         populate_wheelhouse "wheel -w $wip_wheelhouse" $require $constraint || exit 1
         mv $wip_wheelhouse wheelhouse
         md5sum $require_files $constraint_files > $md5

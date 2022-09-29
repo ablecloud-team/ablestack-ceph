@@ -142,7 +142,8 @@ bool RGWLifecycleConfiguration::_add_rule(const LCRule& rule)
     transition_action action;
     action.days = elem.second.get_days();
     action.date = ceph::from_iso_8601(elem.second.get_date());
-    action.storage_class = elem.first;
+    action.storage_class
+      = rgw_placement_rule::get_canonical_storage_class(elem.first);
     op.noncur_transitions.emplace(elem.first, std::move(action));
   }
   std::string prefix;
@@ -561,38 +562,30 @@ static int remove_expired_obj(
   del_op->params.unmod_since = meta.mtime;
   del_op->params.marker_version_id = version_id;
 
-  rgw::sal::RadosStore *rados = dynamic_cast<rgw::sal::RadosStore*>(oc.store);
-  if (rados) {
-    // notification supported only for RADOS store for now
-    notify
-      = store->get_notification(dpp, obj.get(), nullptr, event_type,
-			      bucket.get(), lc_id,
-			      const_cast<std::string&>(oc.bucket->get_tenant()),
-			      lc_req_id, null_yield);
+  // notification supported only for RADOS store for now
+  notify = store->get_notification(dpp, obj.get(), nullptr, event_type,
+				   bucket.get(), lc_id,
+				   const_cast<std::string&>(oc.bucket->get_tenant()),
+				   lc_req_id, null_yield);
 
-    /* can eliminate cast when reservation is lifted into Notification */
-    auto notify_res = static_cast<rgw::sal::RadosNotification*>(notify.get())->get_reservation();
-
-    ret = rgw::notify::publish_reserve(dpp, event_type, notify_res, nullptr);
-    if ( ret < 0) {
-      ldpp_dout(dpp, 1)
-        << "ERROR: notify reservation failed, deferring delete of object k="
-        << o.key
-        << dendl;
-      return ret;
-    }
+  ret = notify->publish_reserve(dpp, nullptr);
+  if ( ret < 0) {
+    ldpp_dout(dpp, 1)
+      << "ERROR: notify reservation failed, deferring delete of object k="
+      << o.key
+      << dendl;
+    return ret;
   }
   ret =  del_op->delete_obj(dpp, null_yield);
   if (ret < 0) {
     ldpp_dout(dpp, 1) <<
       "ERROR: publishing notification failed, with error: " << ret << dendl;
-  } else if (rados) {
+  } else {
     // send request to notification manager
-    auto notify_res = static_cast<rgw::sal::RadosNotification*>(notify.get())->get_reservation();
-    (void) rgw::notify::publish_commit(
-      obj.get(), obj->get_obj_size(), ceph::real_clock::now(),
-      obj->get_attrs()[RGW_ATTR_ETAG].to_str(), version_id, event_type,
-      notify_res, dpp);
+    (void) notify->publish_commit(dpp, obj->get_obj_size(),
+				  ceph::real_clock::now(),
+				  obj->get_attrs()[RGW_ATTR_ETAG].to_str(),
+				  version_id);
   }
 
   return ret;
@@ -1331,14 +1324,6 @@ public:
         return 0;
       }
 
-      /* Allow transition for only RadosStore */
-      rgw::sal::RadosStore *rados = dynamic_cast<rgw::sal::RadosStore*>(oc.store);
-
-      if (!rados) {
-        ldpp_dout(oc.dpp, 10) << "Object(key:" << oc.o.key << ") is not on RadosStore. Skipping transition to cloud-s3 tier: " << target_placement.storage_class << dendl;
-        return -1;
-      }
-
       r = transition_obj_to_cloud(oc);
       if (r < 0) {
         ldpp_dout(oc.dpp, 0) << "ERROR: failed to transition obj(key:" << oc.o.key << ") to cloud (r=" << r << ")"
@@ -1798,7 +1783,7 @@ static inline vector<int> random_sequence(uint32_t n)
     });
   std::random_device rd;
   std::default_random_engine rng{rd()};
-  std::shuffle(v.begin(), v.end(), rd);
+  std::shuffle(v.begin(), v.end(), rng);
   return v;
 }
 
@@ -2480,20 +2465,23 @@ int RGWLC::set_bucket_config(rgw::sal::Bucket* bucket,
 }
 
 int RGWLC::remove_bucket_config(rgw::sal::Bucket* bucket,
-                                const rgw::sal::Attrs& bucket_attrs)
+                                const rgw::sal::Attrs& bucket_attrs,
+				bool merge_attrs)
 {
   rgw::sal::Attrs attrs = bucket_attrs;
-  attrs.erase(RGW_ATTR_LC);
-  int ret = bucket->merge_and_store_attrs(this, attrs, null_yield);
-
   rgw_bucket& b = bucket->get_key();
+  int ret{0};
 
-  if (ret < 0) {
-    ldpp_dout(this, 0) << "RGWLC::RGWDeleteLC() failed to set attrs on bucket="
-        << b.name << " returned err=" << ret << dendl;
-    return ret;
+  if (merge_attrs) {
+    attrs.erase(RGW_ATTR_LC);
+    ret = bucket->merge_and_store_attrs(this, attrs, null_yield);
+
+    if (ret < 0) {
+      ldpp_dout(this, 0) << "RGWLC::RGWDeleteLC() failed to set attrs on bucket="
+			 << b.name << " returned err=" << ret << dendl;
+      return ret;
+    }
   }
-
 
   ret = guard_lc_modify(this, store, sal_lc.get(), b, cookie,
 			[&](rgw::sal::Lifecycle* sal_lc, const string& oid,

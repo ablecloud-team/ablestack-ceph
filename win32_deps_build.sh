@@ -19,10 +19,6 @@ sslTag="OpenSSL_1_1_1c"
 sslDir="${depsToolsetDir}/openssl"
 sslSrcDir="${depsSrcDir}/openssl"
 
-curlTag="curl-7_66_0"
-curlSrcDir="${depsSrcDir}/curl"
-curlDir="${depsToolsetDir}/curl"
-
 # For now, we'll keep the version number within the file path when not using git.
 boostUrl="https://boostorg.jfrog.io/artifactory/main/release/1.79.0/source/boost_1_79_0.tar.gz"
 boostSrcDir="${depsSrcDir}/boost_1_79_0"
@@ -69,9 +65,10 @@ echo "Installing required packages."
 case "$OS" in
     ubuntu)
         sudo apt-get update
-        sudo apt-get -y install mingw-w64 cmake pkg-config \
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get -y install \
+            mingw-w64 cmake pkg-config \
             python3-dev python3-pip python3-yaml \
-                autoconf libtool ninja-build zip
+                autoconf libtool ninja-build wget zip
         sudo python3 -m pip install cython
         ;;
     suse)
@@ -126,21 +123,7 @@ CROSS_COMPILE="${MINGW_PREFIX}" ./Configure \
     mingw64 shared --prefix=$sslDir --libdir="$sslDir/lib"
 _make depend
 _make
-_make install
-
-echo "Building libcurl."
-cd $depsSrcDir
-if [[ ! -d $curlSrcDir ]]; then
-    git clone --branch $curlTag --depth 1 https://github.com/curl/curl
-    cd $curlSrcDir
-fi
-cd $curlSrcDir
-./buildconf
-./configure --prefix=$curlDir --with-ssl=$sslDir --with-zlib=$zlibDir \
-            --host=${MINGW_BASE} --libdir="$curlDir/lib"
-_make
-_make install
-
+_make install_sw
 
 echo "Building boost."
 cd $depsSrcDir
@@ -201,7 +184,7 @@ EOL
 ./b2 install --user-config=user-config.jam toolset=gcc-mingw32 \
     target-os=windows release \
     link=static,shared \
-    threadapi=pthread --prefix=$boostDir \
+    threadapi=win32 --prefix=$boostDir \
     address-model=64 architecture=x86 \
     binary-format=pe abi=ms -j $NUM_WORKERS \
     -sZLIB_INCLUDE=$zlibDir/include -sZLIB_LIBRARY_PATH=$zlibDir/lib \

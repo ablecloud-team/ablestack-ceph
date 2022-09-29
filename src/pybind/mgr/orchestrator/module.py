@@ -74,6 +74,7 @@ class ServiceAction(enum.Enum):
     restart = 'restart'
     redeploy = 'redeploy'
     reconfig = 'reconfig'
+    rotate_key = 'rotate-key'
 
 
 class DaemonAction(enum.Enum):
@@ -81,6 +82,7 @@ class DaemonAction(enum.Enum):
     stop = 'stop'
     restart = 'restart'
     reconfig = 'reconfig'
+    rotate_key = 'rotate-key'
 
 
 def to_format(what: Any, format: Format, many: bool, cls: Any) -> Any:
@@ -213,7 +215,13 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             desc='Orchestrator backend',
             enum_allowed=['cephadm', 'rook', 'test_orchestrator'],
             runtime=True,
-        )
+        ),
+        Option(
+            'fail_fs',
+            type='bool',
+            default=False,
+            desc='Fail filesystem for rapid multi-rank mds upgrade'
+        ),
     ]
     NATIVE_OPTIONS = []  # type: List[dict]
 
@@ -338,6 +346,9 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
 
     def _select_orchestrator(self) -> str:
         return cast(str, self.get_module_option("orchestrator"))
+
+    def _get_fail_fs_value(self) -> bool:
+        return bool(self.get_module_option("fail_fs"))
 
     @_cli_write_command('orch host add')
     def _add_host(self,
@@ -570,6 +581,15 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         if not force:
             raise OrchestratorError('must pass --force to PERMANENTLY ERASE DEVICE DATA')
         completion = self.zap_device(hostname, path)
+        raise_if_exception(completion)
+        return HandleCommandResult(stdout=completion.result_str())
+
+    @_cli_write_command('orch sd dump cert')
+    def _service_discovery_dump_cert(self) -> HandleCommandResult:
+        """
+        Returns service discovery server root certificate
+        """
+        completion = self.service_discovery_dump_cert()
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
@@ -999,7 +1019,7 @@ Usage:
 
     @_cli_write_command('orch daemon')
     def _daemon_action(self, action: DaemonAction, name: str) -> HandleCommandResult:
-        """Start, stop, restart, (redeploy,) or reconfig a specific daemon"""
+        """Start, stop, restart, redeploy, reconfig, or rotate-key for a specific daemon"""
         if '.' not in name:
             raise OrchestratorError('%s is not a valid daemon name' % name)
         completion = self.daemon_action(action.value, name)
@@ -1010,7 +1030,7 @@ Usage:
     def _daemon_action_redeploy(self,
                                 name: str,
                                 image: Optional[str] = None) -> HandleCommandResult:
-        """Redeploy a daemon (with a specifc image)"""
+        """Redeploy a daemon (with a specific image)"""
         if '.' not in name:
             raise OrchestratorError('%s is not a valid daemon name' % name)
         completion = self.daemon_action("redeploy", name, image=image)
@@ -1431,7 +1451,7 @@ Usage:
             tuned_profile_spec = TunedProfileSpec(
                 profile_name=profile_name, placement=placement_spec, settings=settings_dict)
             specs = [tuned_profile_spec]
-        completion = self.apply_tuned_profiles(specs)
+        completion = self.apply_tuned_profiles(specs, no_overwrite)
         res = raise_if_exception(completion)
         return HandleCommandResult(stdout=res)
 
@@ -1475,6 +1495,12 @@ Usage:
         self._set_backend('')
         assert self._select_orchestrator() is None
         self._set_backend(old_orch)
+        old_fs_fail_value = self._get_fail_fs_value()
+        self.set_module_option("fail_fs", True)
+        assert self._get_fail_fs_value() is True
+        self.set_module_option("fail_fs", False)
+        assert self._get_fail_fs_value() is False
+        self.set_module_option("fail_fs", old_fs_fail_value)
 
         e1 = self.remote('selftest', 'remote_from_orchestrator_cli_self_test', "ZeroDivisionError")
         try:

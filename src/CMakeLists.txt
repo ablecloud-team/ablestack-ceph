@@ -115,6 +115,16 @@ if(COMPILER_SUPPORTS_REDUNDANT_MOVE)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wredundant-move>)
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
+  if(WIN32)
+    # require >= gcc-10 for compiling the windows port
+    set(minimum_gcc_version 10)
+  else()
+    # require >= gcc-11 for compiling the whole tree
+    set(minimum_gcc_version 11)
+  endif()
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS minimum_gcc_version)
+    message(FATAL_ERROR "C++20 support requires a minimum GCC version of ${minimum_gcc_version}.")
+  endif()
   if(MINGW)
     # The MINGW headers are missing some "const" qualifiers.
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fpermissive>)
@@ -124,7 +134,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
   string(PREPEND CMAKE_CXX_FLAGS_DEBUG "-Og ")
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wstrict-null-sentinel>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Woverloaded-virtual>)
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-new-ttp-matching>)
   # cmake does not add '-pie' for executables even if
   # CMAKE_POSITION_INDEPENDENT_CODE is TRUE.
   if(EXE_LINKER_USE_PIE)
@@ -133,6 +142,9 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
     endif()
   endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12) # require >= clang-12
+    message(FATAL_ERROR "C++20 support requires a minimum Clang version of 12.")
+  endif()
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_EXPORTS_C_FLAG}")
   string(APPEND CMAKE_LINKER_FLAGS " -rdynamic -export-dynamic ${CMAKE_EXE_EXPORTS_C_FLAG}")
   string(PREPEND CMAKE_CXX_FLAGS_DEBUG "-g ")
@@ -606,6 +618,7 @@ endif(NOT WITH_SYSTEM_ROCKSDB)
 
 if(WITH_MGR)
   add_subdirectory(mgr)
+  add_subdirectory(exporter)
 endif()
 
 set(librados_config_srcs
@@ -915,6 +928,7 @@ endif()
 
 if (WITH_MGR)
   add_dependencies(vstart-base ceph-mgr)
+  add_dependencies(vstart-base ceph-exporter)
 endif()
 
 add_custom_target(vstart DEPENDS vstart-base)
@@ -925,7 +939,7 @@ if (WITH_CEPHFS)
   add_dependencies(vstart ceph-mds cephfs cython_cephfs)
 endif()
 if(WITH_RADOSGW)
-  add_dependencies(vstart radosgwd radosgw-admin)
+  add_dependencies(vstart radosgw radosgw-admin)
 endif()
 
 if(WITH_LTTNG)
@@ -938,6 +952,10 @@ endif()
 
 if(WITH_MGR)
   add_dependencies(vstart ceph-volume-venv-setup)
+endif()
+
+if(WITH_MGR)
+  add_dependencies(vstart cephadm)
 endif()
 
 # Everything you need to run CephFS tests

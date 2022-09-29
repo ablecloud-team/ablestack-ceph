@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import stat
+import time
 from ceph_volume import process
 from ceph_volume.api import lvm
 from ceph_volume.util.system import get_file_contents
@@ -134,8 +135,16 @@ def remove_partition(device):
 
     :param device: A ``Device()`` object
     """
-    udev_info = udevadm_property(device.path)
-    partition_number = udev_info.get('ID_PART_ENTRY_NUMBER')
+    # Sometimes there's a race condition that makes 'ID_PART_ENTRY_NUMBER' be not present
+    # in the output of `udevadm info --query=property`.
+    # Probably not ideal and not the best fix but this allows to get around that issue.
+    # The idea is to make it retry multiple times before actually failing.
+    for i in range(10):
+        udev_info = udevadm_property(device.path)
+        partition_number = udev_info.get('ID_PART_ENTRY_NUMBER')
+        if partition_number:
+            break
+        time.sleep(0.2)
     if not partition_number:
         raise RuntimeError('Unable to detect the partition number for device: %s' % device.path)
 
@@ -768,7 +777,7 @@ class AllowLoopDevices(object):
 allow_loop_devices = AllowLoopDevices()
 
 
-def get_block_devs_sysfs(_sys_block_path='/sys/block', _sys_dev_block_path='/sys/dev/block'):
+def get_block_devs_sysfs(_sys_block_path='/sys/block', _sys_dev_block_path='/sys/dev/block', device=''):
     def holder_inner_loop():
         for holder in holders:
             # /sys/block/sdy/holders/dm-8/dm/uuid
@@ -778,7 +787,10 @@ def get_block_devs_sysfs(_sys_block_path='/sys/block', _sys_dev_block_path='/sys
 
     # First, get devices that are _not_ partitions
     result = list()
-    dev_names = os.listdir(_sys_block_path)
+    if not device:
+        dev_names = os.listdir(_sys_block_path)
+    else:
+        dev_names = [device]
     for dev in dev_names:
         name = kname = os.path.join("/dev", dev)
         if not os.path.exists(name):
@@ -871,6 +883,13 @@ def get_devices(_sys_block_path='/sys/block', device=''):
             metadata['device_nodes'] = ','.join(device_slaves)
         else:
             metadata['device_nodes'] = devname
+
+        metadata['actuators'] = ""
+        if os.path.isdir(sysdir + "/queue/independent_access_ranges/"):
+            actuators = 0
+            while os.path.isdir(sysdir + "/queue/independent_access_ranges/" + str(actuators)):
+                actuators += 1
+            metadata['actuators'] = actuators
 
         metadata['scheduler_mode'] = ""
         scheduler = get_file_contents(sysdir + "/queue/scheduler")

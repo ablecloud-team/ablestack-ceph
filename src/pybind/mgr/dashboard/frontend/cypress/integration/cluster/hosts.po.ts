@@ -88,6 +88,7 @@ export class HostsPageHelper extends PageHelper {
     // Verify labels are added or removed from Labels column
     // First find row with hostname, then find labels in the row
     this.getTableCell(this.columnIndex.hostname, hostname)
+      .click()
       .parent()
       .find(`datatable-body-cell:nth-child(${this.columnIndex.labels}) .badge`)
       .should(($ele) => {
@@ -167,5 +168,17 @@ export class HostsPageHelper extends PageHelper {
       cy.wait(20000);
       this.expectTableCount('total', 0);
     });
+  }
+
+  checkServiceInstancesExist(hostname: string, instances: string[]) {
+    this.getTableCell(this.columnIndex.hostname, hostname)
+      .parent()
+      .find(`datatable-body-cell:nth-child(${this.columnIndex.services}) .badge`)
+      .should(($ele) => {
+        const serviceInstances = $ele.toArray().map((v) => v.innerText);
+        for (const instance of instances) {
+          expect(serviceInstances).to.include(instance);
+        }
+      });
   }
 }

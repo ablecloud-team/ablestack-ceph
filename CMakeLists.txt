@@ -14,9 +14,11 @@ cmake_policy(SET CMP0065 NEW)
 cmake_policy(SET CMP0074 NEW)
 cmake_policy(SET CMP0075 NEW)
 cmake_policy(SET CMP0093 NEW)
-if(POLICY CMP0127)
-  cmake_policy(SET CMP0127 NEW)
-endif()
+foreach(policy CMP0127 CMP0135)
+  if(POLICY ${policy})
+    cmake_policy(SET ${policy} NEW)
+  endif()
+endforeach()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/modules/")
 
@@ -39,7 +41,15 @@ if(WIN32)
   # the targeted Windows version. The availability of certain functions and
   # structures will depend on it.
   set(WIN32_WINNT "0x0A00" CACHE STRING "Targeted Windows version.")
-  add_definitions(-D_WIN32_WINNT=${WIN32_WINNT})
+  # In order to avoid known winpthread issues, we're using the boost
+  # shared mutex implementation.
+  # https://github.com/msys2/MINGW-packages/issues/3319
+  add_definitions(
+    -D_WIN32_WINNT=${WIN32_WINNT}
+    -DBOOST_THREAD_PROVIDES_GENERIC_SHARED_MUTEX_ON_WIN
+    -DBOOST_THREAD_V2_SHARED_MUTEX
+  )
+  set(Boost_THREADAPI "win32")
 endif()
 
 if(MINGW)
@@ -389,8 +399,10 @@ else()
   set(EXE_LINKER_USE_PIE ${ENABLE_SHARED})
 endif()
 
-# require libcurl with good curl_multi_wait(), see https://tracker.ceph.com/issues/15915
-find_package(CURL 7.32 REQUIRED)
+if(NOT WIN32)
+  # require libcurl with good curl_multi_wait(), see https://tracker.ceph.com/issues/15915
+  find_package(CURL 7.32 REQUIRED)
+endif()
 
 find_package(OpenSSL REQUIRED)
 set(CRYPTO_LIBS OpenSSL::Crypto)
@@ -425,6 +437,7 @@ option(WITH_RADOSGW_KAFKA_ENDPOINT "Rados Gateway's pubsub support for Kafka pus
 option(WITH_RADOSGW_LUA_PACKAGES "Rados Gateway's support for dynamically adding lua packagess" ON)
 option(WITH_RADOSGW_DBSTORE "DBStore backend for Rados Gateway" ON)
 option(WITH_RADOSGW_MOTR "CORTX-Motr backend for Rados Gateway" OFF)
+option(WITH_RADOSGW_DAOS "DAOS backend for RADOS Gateway" OFF)
 option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" ON)
 
 option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)
@@ -623,6 +636,9 @@ if(WITH_RADOSGW AND WITH_RADOSGW_LUA_PACKAGES)
 endif()
 
 set(Boost_USE_MULTITHREADED ON)
+
+CMAKE_DEPENDENT_OPTION(WITH_BOOST_VALGRIND "Boost support for valgrind" OFF
+  "NOT WITH_SYSTEM_BOOST" OFF)
 # require minimally the bundled version
 if(WITH_SYSTEM_BOOST)
   if(ENABLE_SHARED)
@@ -711,9 +727,6 @@ endif()
 
 option(WITH_GRAFANA "install grafana dashboards" OFF)
 add_subdirectory(monitoring/ceph-mixin)
-
-CMAKE_DEPENDENT_OPTION(WITH_BOOST_VALGRIND "Boost support for valgrind" OFF
-  "NOT WITH_SYSTEM_BOOST" OFF)
 
 include(CTags)
 option(CTAG_EXCLUDES "Exclude files/directories when running ctag.")
