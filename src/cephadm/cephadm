@@ -41,6 +41,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import urlopen, Request
 from pathlib import Path
 
+import chardet
+
 FuncT = TypeVar('FuncT', bound=Callable)
 
 # Default container images -----------------------------------------------------
@@ -8251,7 +8253,10 @@ def read_file(path_list, file_name=''):
         else:
             file_path = path
         if os.path.exists(file_path):
-            with open(file_path, 'r') as f:
+            rawdata = open(path, 'rb').read()
+            result = chardet.detect(rawdata)
+            enc = result['encoding']
+            with open(file_path, 'r', encoding=enc) as f:
                 try:
                     content = f.read().strip()
                 except OSError:
