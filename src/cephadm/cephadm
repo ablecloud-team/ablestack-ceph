@@ -8253,7 +8253,7 @@ def read_file(path_list, file_name=''):
         else:
             file_path = path
         if os.path.exists(file_path):
-            rawdata = open(path, 'rb').read()
+            rawdata = open(file_path, 'rb').read()
             result = chardet.detect(rawdata)
             enc = result['encoding']
             with open(file_path, 'r', encoding=enc) as f:
