@@ -150,6 +150,7 @@ class CherryPyConfig(object):
             'tools.json_in.on': True,
             'tools.json_in.force': True,
             'tools.plugin_hooks_filter_request.on': True,
+            'tools.sessions.on': True,
         }
 
         if use_ssl:

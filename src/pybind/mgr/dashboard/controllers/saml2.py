@@ -90,6 +90,11 @@ class Saml2(BaseController, ControllerAuthMixin):
         Saml2._check_python_saml()
         req = Saml2._build_req(self._request, {})
         auth = OneLogin_Saml2_Auth(req, mgr.SSO_DB.saml2.onelogin_settings)
+
+        # login user session
+        cherrypy.session['samlNameId'] = auth.get_nameid()
+        cherrypy.session['samlSessionIndex'] = auth.get_session_index()
+
         raise cherrypy.HTTPRedirect(auth.login())
 
     @Endpoint(json_response=False, version=None)
@@ -97,7 +102,18 @@ class Saml2(BaseController, ControllerAuthMixin):
         Saml2._check_python_saml()
         req = Saml2._build_req(self._request, {})
         auth = OneLogin_Saml2_Auth(req, mgr.SSO_DB.saml2.onelogin_settings)
-        raise cherrypy.HTTPRedirect(auth.logout())
+
+        # login user session
+        name_id = cherrypy.session.get('samlNameId')
+        session_index = cherrypy.session.get('samlSessionIndex')
+        #settings = mgr.SSO_DB.saml2.onelogin_settings.copy()
+        #settings['security']['logoutRequestSigned'] = False
+        #settings['security']['logoutResponseSigned'] = False
+        #settings['sp']['singleLogoutService']['binding'] = 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST'
+        #settings['idp']['singleLogoutService']['binding'] = 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST'
+        #auth = OneLogin_Saml2_Auth(req, settings)
+
+        raise cherrypy.HTTPRedirect(auth.logout(name_id=name_id, session_index=session_index))
 
     @Endpoint(json_response=False, version=None)
     def logout(self, **kwargs):
